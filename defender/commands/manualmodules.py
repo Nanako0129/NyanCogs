@@ -2,7 +2,7 @@
 Defender - Protects your community with automod features and
            empowers the staff and users you trust with
            advanced moderation tools
-Copyright (C) 2020  Twentysix (https://github.com/Twentysix26/)
+Copyright (C) 2020-2021  Twentysix (https://github.com/Twentysix26/)
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -361,7 +361,7 @@ class ManualModules(MixinMeta, metaclass=CompositeMetaClass):  # type: ignore
                                      fields=EMBED_FIELDS,
                                      jump_to=msg)
 
-        await modlog.create_case(
+        await self.create_modlog_case(
             self.bot,
             guild,
             ctx.message.created_at,
@@ -381,7 +381,7 @@ class ManualModules(MixinMeta, metaclass=CompositeMetaClass):  # type: ignore
     async def silence(self, ctx: commands.Context, rank: int):
         """Enables server wide message autodeletion for the specified rank (and below)
 
-        Only applicable to Ranks 2-4. 0 will disable this."""
+        Passing 0 will disable this."""
         guild = ctx.guild
         channel = ctx.channel
         EMBED_TITLE = "🔇 • Silence"
@@ -426,13 +426,9 @@ class ManualModules(MixinMeta, metaclass=CompositeMetaClass):  # type: ignore
 
         if rank != 0:
             try:
-                if Rank(rank) == Rank.Rank1:
-                    await ctx.send("Rank 1 cannot be silenced.")
-                    return
                 Rank(rank)
             except:
-                await ctx.send("Not a valid rank. Must be 2-4.")
-                return
+                return await ctx.send("Not a valid rank. Must be 1-4.")
         await self.config.guild(ctx.guild).silence_rank.set(rank)
         if rank:
             await self.send_notification(guild, "This module has been enabled. "

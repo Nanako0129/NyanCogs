@@ -2,7 +2,7 @@
 Defender - Protects your community with automod features and
            empowers the staff and users you trust with
            advanced moderation tools
-Copyright (C) 2020  Twentysix (https://github.com/Twentysix26/)
+Copyright (C) 2020-2021  Twentysix (https://github.com/Twentysix26/)
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -23,6 +23,7 @@ from .enums import Rank, EmergencyModules
 from .core.warden.enums import Event as WardenEvent
 from .core.warden.rule import WardenRule
 from typing import List
+import datetime
 import discord
 import asyncio
 
@@ -58,7 +59,7 @@ class MixinMeta(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    async def is_role_privileged(self, role: discord.Role, issuers_top_role: discord.Role=None) -> bool:
+    def is_role_privileged(self, role: discord.Role, issuers_top_role: discord.Role=None) -> bool:
         raise NotImplementedError()
 
     @abstractmethod
@@ -107,12 +108,18 @@ class MixinMeta(ABC):
         raise NotImplementedError()
 
     @abstractmethod
+    async def create_modlog_case(self, bot, guild, created_at, action_type, user, moderator=None, reason=None,
+                                 until=None, channel=None, last_known_username=None):
+        raise NotImplementedError()
+
+    @abstractmethod
     async def send_notification(self, destination: discord.abc.Messageable, description: str, *,
                                 title: str=None, fields: list=[], footer: str=None,
                                 thumbnail: str=None,
                                 ping=False, file: discord.File=None, react: str=None,
                                 jump_to: discord.Message=None,
-                                allow_everyone_ping=False, force_text_only=False)->Optional[discord.Message]:
+                                allow_everyone_ping=False, force_text_only=False, heat_key: str=None,
+                                no_repeat_for: datetime.timedelta=None)->Optional[discord.Message]:
         raise NotImplementedError()
 
     @abstractmethod

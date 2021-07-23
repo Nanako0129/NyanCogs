@@ -2,7 +2,7 @@
 Defender - Protects your community with automod features and
            empowers the staff and users you trust with
            advanced moderation tools
-Copyright (C) 2020  Twentysix (https://github.com/Twentysix26/)
+Copyright (C) 2020-2021  Twentysix (https://github.com/Twentysix26/)
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -28,17 +28,16 @@ class Event(enum.Enum):
     Periodic = "periodic"
 
 class Action(enum.Enum):
-    Dm = "send-dm" #DM an arbitrary user. Must provide name/id + content
-    DmUser = "dm-user" # DMs user in context
     NotifyStaff = "notify-staff"
     NotifyStaffAndPing = "notify-staff-and-ping"
     NotifyStaffWithEmbed = "notify-staff-with-embed"
     BanAndDelete = "ban-user-and-delete" # Ban user in context and delete X days
     Kick = "kick-user" # Kick user in context
     Softban = "softban-user" # Softban user in context
+    PunishUser = "punish-user" # Assign the punish role to the user
+    PunishUserWithMessage = "punish-user-with-message" # Assign the punish role to the user and send the set message
     Modlog = "send-mod-log" # Send modlog case of last expel action + reason
     DeleteUserMessage = "delete-user-message" # Delete message in context
-    SendInChannel = "send-in-channel" # Send message to channel in context
     SetChannelSlowmode = "set-channel-slowmode" # 0 - 6h
     AddRolesToUser = "add-roles-to-user" # Adds roles to user in context
     RemoveRolesFromUser = "remove-roles-from-user" # Remove roles from user in context
@@ -46,7 +45,6 @@ class Action(enum.Enum):
     SetUserNickname = "set-user-nickname" # Changes nickname of user in context
     NoOp = "no-op" # Does nothing. For testing purpose.
     SendToMonitor = "send-to-monitor" # Posts a message to [p]defender monitor
-    SendToChannel = "send-to-channel" # Sends a message to an arbitrary channel
     AddUserHeatpoint = "add-user-heatpoint"
     AddUserHeatpoints = "add-user-heatpoints"
     AddChannelHeatpoint = "add-channel-heatpoint"
@@ -58,6 +56,20 @@ class Action(enum.Enum):
     EmptyCustomHeat = "empty-custom-heat"
     IssueCommand = "issue-command"
     DeleteLastMessageSentAfter = "delete-last-message-sent-after"
+    SendMessage = "send-message" # Send a message to an arbitrary destination with an optional embed
+    GetUserInfo = "get-user-info" # Get info of an arbitrary user
+    Exit = "exit" # Stops processing the rule
+    VarAssign = "var-assign" # Assigns a string to a variable
+    VarAssignRandom = "var-assign-random" # Assigns a random string to a variable
+    VarReplace = "var-replace" # Replace var's str with substr
+    VarSlice = "var-slice" # Slice a var
+    VarSplit = "var-split" # Splits a string into substrings
+    VarTransform = "var-transform" # Perform a variety of operations on the var
+    ## Deprecated actions ##
+    Dm = "send-dm" #DM an arbitrary user. Must provide name/id + content
+    DmUser = "dm-user" # DMs user in context
+    SendInChannel = "send-in-channel" # Send message to channel in context
+    SendToChannel = "send-to-channel" # Sends a message to an arbitrary channel
 
 class Condition(enum.Enum):
     UserIdMatchesAny = "user-id-matches-any"
@@ -87,14 +99,20 @@ class Condition(enum.Enum):
     MessageHasMTCharacters = "message-has-more-than-characters"
     UserIsRank = "user-is-rank"
     IsStaff = "is-staff"
+    IsHelper = "is-helper"
     UserHeatIs = "user-heat-is"
     ChannelHeatIs = "channel-heat-is"
     UserHeatMoreThan = "user-heat-more-than"
     ChannelHeatMoreThan = "channel-heat-more-than"
     CustomHeatIs = "custom-heat-is"
     CustomHeatMoreThan = "custom-heat-more-than"
+    Compare = "compare"
 
 class ConditionBlock(enum.Enum):
     IfAll = "if-all"
     IfAny = "if-any"
     IfNot = "if-not"
+
+class ConditionalActionBlock(enum.Enum):
+    IfTrue = "if-true"
+    IfFalse = "if-false"

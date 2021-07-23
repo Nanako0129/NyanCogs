@@ -2,7 +2,7 @@
 Defender - Protects your community with automod features and
            empowers the staff and users you trust with
            advanced moderation tools
-Copyright (C) 2020  Twentysix (https://github.com/Twentysix26/)
+Copyright (C) 2020-2021  Twentysix (https://github.com/Twentysix26/)
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -129,6 +129,8 @@ class Events(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
             if rank_ca and rank >= rank_ca:
                 try:
                     await self.comment_analysis(message)
+                except asyncio.TimeoutError:
+                    self.send_to_monitor(guild, "[CommentAnalysis] Failed to query the API: timeout.")
                 except discord.Forbidden as e:
                     self.send_to_monitor(guild, "[CommentAnalysis] Failed to take action on "
                                                 f"user {author.id}. Please check my permissions.")
@@ -202,6 +204,8 @@ class Events(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
             if rank_ca and rank >= rank_ca:
                 try:
                     await self.comment_analysis(message)
+                except asyncio.TimeoutError:
+                    self.send_to_monitor(guild, "[CommentAnalysis] Failed to query the API: timeout.")
                 except discord.Forbidden as e:
                     self.send_to_monitor(guild, "[CommentAnalysis] Failed to take action on "
                                                 f"user {author.id}. Please check my permissions.")

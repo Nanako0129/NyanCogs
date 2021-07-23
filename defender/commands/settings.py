@@ -2,7 +2,7 @@
 Defender - Protects your community with automod features and
            empowers the staff and users you trust with
            advanced moderation tools
-Copyright (C) 2020  Twentysix (https://github.com/Twentysix26/)
+Copyright (C) 2020-2021  Twentysix (https://github.com/Twentysix26/)
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -91,6 +91,7 @@ class Settings(MixinMeta, metaclass=CompositeMetaClass):  # type: ignore
         to_copy = conf.copy()
         to_copy.pop("enabled", None)
         enabled = to_copy.pop("notify_channel", None)
+        to_copy.pop("punish_role", None)
         to_copy.pop("notify_role", None)
         to_copy.pop("trusted_roles", None)
         to_copy.pop("helper_roles", None)
@@ -645,7 +646,7 @@ class Settings(MixinMeta, metaclass=CompositeMetaClass):  # type: ignore
         await self.config.guild(ctx.guild).ca_action.set(action)
         if Action(action) == Action.NoAction:
             await ctx.send("Action set. Since you've chosen 'none' I will only delete "
-                           "the invite link and notify the staff about it.")
+                           "the message and notify the staff about it.")
         await ctx.tick()
 
     @caset.command(name="reason")

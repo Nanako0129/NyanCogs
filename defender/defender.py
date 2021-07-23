@@ -2,7 +2,7 @@
 Defender - Protects your community with automod features and
            empowers the staff and users you trust with
            advanced moderation tools
-Copyright (C) 2020  Twentysix (https://github.com/Twentysix26/)
+Copyright (C) 2020-2021  Twentysix (https://github.com/Twentysix26/)
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -20,6 +20,7 @@ from redbot.core import commands, Config
 from collections import Counter, defaultdict
 from redbot.core.utils.chat_formatting import pagify
 from redbot.core.utils import AsyncIter
+from redbot.core import modlog
 from .abc import CompositeMetaClass
 from .core.automodules import AutoModules
 from .commands import Commands
@@ -28,11 +29,12 @@ from .enums import Rank, Action, EmergencyModules, PerspectiveAttributes
 from .exceptions import InvalidRule
 from .core.warden.rule import WardenRule
 from .core.warden.enums import Event as WardenEvent
-from .core.warden.heat import remove_stale_heat
+from .core.warden import heat
 from .core.announcements import get_announcements_text
 from .core.cache import CacheUser
 from .core import cache as df_cache
 from multiprocessing.pool import Pool
+from zlib import crc32
 import datetime
 import discord
 import asyncio
@@ -54,7 +56,6 @@ default_guild_settings = {
     "rank3_min_messages": 50, # Messages threshold that users should reach to be no longer classified as rank 4
     "count_messages": True, # Count users' messages. If disabled, rank4 will be unobtainable
     "announcements_sent": [],
-    "actions_taken": 0, # Stats collection # TODO ?
     "invite_filter_enabled": False,
     "invite_filter_rank": Rank.Rank4.value,
     "invite_filter_action": Action.NoAction.value, # Type of action to take on users that posted filtered invites
@@ -108,6 +109,8 @@ default_owner_settings = {
 
 class Defender(Commands, AutoModules, Events, commands.Cog, metaclass=CompositeMetaClass):
     """Security tools to protect communities"""
+
+    __version__ = "1.6"
 
     def __init__(self, bot):
         self.bot = bot
@@ -297,7 +300,7 @@ class Defender(Commands, AutoModules, Events, commands.Cog, metaclass=CompositeM
             while True:
                 await asyncio.sleep(60 * 60)
                 await df_cache.discard_stale()
-                await remove_stale_heat()
+                await heat.remove_stale_heat()
         except asyncio.CancelledError:
             pass
 
@@ -373,6 +376,8 @@ class Defender(Commands, AutoModules, Events, commands.Cog, metaclass=CompositeM
                 continue
             async for member in AsyncIter(guild.members, steps=2):
                 if member.bot:
+                    continue
+                if member.joined_at is None:
                     continue
                 rank = await self.rank_user(member)
                 if await rule.satisfies_conditions(cog=self, rank=rank, user=member):
@@ -501,8 +506,23 @@ class Defender(Commands, AutoModules, Events, commands.Cog, metaclass=CompositeM
                                 thumbnail: str=None,
                                 ping=False, file: discord.File=None, react: str=None,
                                 jump_to: discord.Message=None,
-                                allow_everyone_ping=False, force_text_only=False)->Optional[discord.Message]:
+                                allow_everyone_ping=False, force_text_only=False, heat_key: str=None,
+                                no_repeat_for: datetime.timedelta=None)->Optional[discord.Message]:
         """Sends a notification to the staff channel if a guild is passed. Embed preference is respected."""
+        if no_repeat_for:
+            if isinstance(destination, discord.Guild):
+                guild = destination
+            else:
+                guild = destination.guild
+
+            if not heat_key: # A custom heat_key can be passed to block dynamic content
+                heat_key = f"{destination.id}-{description}-{fields}"
+                heat_key =  f"core-notif-{crc32(heat_key.encode('utf-8', 'ignore'))}"
+
+            if not heat.get_custom_heat(guild, heat_key) == 0:
+                return
+            heat.increase_custom_heat(guild, heat_key, no_repeat_for)
+
         guild = destination
         is_staff_notification = False
         if isinstance(destination, discord.Guild):
@@ -572,6 +592,28 @@ class Defender(Commands, AutoModules, Events, commands.Cog, metaclass=CompositeM
     def dispatch_event(self, event_name, *args):
         event_name = "x26_defender_" + event_name
         self.bot.dispatch(event_name, *args)
+
+    async def create_modlog_case(self, bot, guild, created_at, action_type, user, moderator=None, reason=None, until=None,
+                                 channel=None, last_known_username=None):
+        mod_id = moderator.id if moderator else "none"
+
+        heat_key = f"core-modlog-{user.id}-{action_type}-{mod_id}"
+        if not heat.get_custom_heat(guild, heat_key) == 0:
+            return
+        heat.increase_custom_heat(guild, heat_key, datetime.timedelta(seconds=15))
+
+        await modlog.create_case(
+            bot,
+            guild,
+            created_at,
+            action_type,
+            user,
+            moderator,
+            reason,
+            until,
+            channel,
+            last_known_username
+        )
 
     async def red_delete_data_for_user(self, requester, user_id):
         # We store only IDs

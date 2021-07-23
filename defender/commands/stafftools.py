@@ -2,7 +2,7 @@
 Defender - Protects your community with automod features and
            empowers the staff and users you trust with
            advanced moderation tools
-Copyright (C) 2020  Twentysix (https://github.com/Twentysix26/)
+Copyright (C) 2020-2021  Twentysix (https://github.com/Twentysix26/)
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -181,15 +181,19 @@ class StaffTools(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
             Rank.Rank3: 0,
             Rank.Rank4: 0,
         }
-        for m in ctx.guild.members:
-            if m.bot:
-                continue
-            rank = await self.rank_user(m)
-            ranks[rank] += 1
+
+        async with ctx.typing():
+            async for m in AsyncIter(ctx.guild.members, steps=2):
+                if m.bot:
+                    continue
+                if m.joined_at is None:
+                    continue
+                rank = await self.rank_user(m)
+                ranks[rank] += 1
         await ctx.send(box(f"Rank1: {ranks[Rank.Rank1]}\nRank2: {ranks[Rank.Rank2]}\n"
-                       f"Rank3: {ranks[Rank.Rank3]}\nRank4: {ranks[Rank.Rank4]}\n\n"
-                       f"For details about each rank see {ctx.prefix}defender status",
-                       lang="yaml"))
+                    f"Rank3: {ranks[Rank.Rank3]}\nRank4: {ranks[Rank.Rank4]}\n\n"
+                    f"For details about each rank see {ctx.prefix}defender status",
+                    lang="yaml"))
 
     @defender.command(name="identify")
     @commands.bot_has_permissions(embed_links=True)
@@ -331,7 +335,7 @@ class StaffTools(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
         except InvalidRule as e:
             return await ctx.send(f"Error parsing the rule: {e}")
         except Exception as e:
-            log.error("Warden - unexpected error during cog load rule parsing", exc_info=e)
+            log.error("Warden - unexpected error during rule parsing", exc_info=e)
             return await ctx.send(f"Something very wrong happened during the rule parsing. Please check its format.")
 
         if WardenEvent.Periodic in new_rule.events:
@@ -508,7 +512,7 @@ class StaffTools(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
                 await ctx.send(f"Error parsing the rule: {e}")
                 continue
             except Exception as e:
-                log.error("Warden - unexpected error during cog load rule parsing", exc_info=e)
+                log.error("Warden - unexpected error during rule parsing", exc_info=e)
                 await ctx.send(f"Something very wrong happened during the rule parsing. Please check its format.")
                 continue
             else:
@@ -591,6 +595,8 @@ class StaffTools(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
             async for m in AsyncIter(ctx.guild.members, steps=2):
                 if m.bot:
                     continue
+                if m.joined_at is None:
+                    continue
                 rank = await self.rank_user(m)
                 if await rule.satisfies_conditions(rank=rank, user=m, cog=self):
                     targets.append(m)
@@ -671,8 +677,8 @@ class StaffTools(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
             await message.add_reaction("✅")
 
 
-    @wardengroup.command(name="debug")
-    async def wardengroupdebug(self, ctx: commands.Context, _id: int, *, event: WardenEvent):
+    @wardengroup.command(name="debug", usage="<id> <event> [rank]")
+    async def wardengroupdebug(self, ctx: commands.Context, _id: int, event: WardenEvent, rank: int=None):
         """Simulate and give a detailed summary of an event
 
         A Warden event must be passed with the proper target ID (user or local message)
@@ -684,13 +690,24 @@ class StaffTools(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
         The heatpoint actions will be "sandboxed", so the newly added heatpoints won't
         have any effect outside this test.
         Remember that Warden evaluates each condition in order and stops at the first failed
-        root condition: the last condition you'll see in a failed rule is where Warden
+        root condition: the last condition that is listed in a failed rule is where Warden
         stopped evaluating them.
+        If a valid Rank is also passed it will be used in place of the target's real
+        rank during the test.
         See the documentation for a full list of Warden events.
 
         Example:
         [p]def warden debug <valid_user_id> on-user-join
-        [p]def warden debug <valid_message_id> on-message"""
+        [p]def warden debug <valid_message_id> on-message
+        [p]def warden debug <valid_message_id> on-message-edit 3"""
+        if rank is not None:
+            try:
+                rank = Rank(rank)
+            except ValueError:
+                await ctx.send("You must provide a valid rank (1-4) or leave it empty "
+                               "to test against the target's real rank.")
+                return
+
         rules = self.get_warden_rules_by_event(ctx.guild, event)
         if not rules:
             return await ctx.send("There are no rules associated with that event.")
@@ -700,18 +717,21 @@ class StaffTools(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
         guild = ctx.guild
 
         if event in (WardenEvent.OnMessage, WardenEvent.OnMessageEdit, WardenEvent.OnMessageDelete):
-            message = await ctx.channel.fetch_message(_id)
-            if message is None:
+            try:
+                message = await ctx.channel.fetch_message(_id)
+            except discord.NotFound:
                 return await ctx.send("I could not retrieve the message. Is it in this channel?")
+            except:
+                return await ctx.send("I failed to retrieve the message.")
             user = message.author
-            rank = await self.rank_user(user)
+            rank = rank or await self.rank_user(user)
         elif event in (WardenEvent.OnUserJoin, WardenEvent.OnUserLeave, WardenEvent.Manual, WardenEvent.Periodic):
             user = ctx.guild.get_member(_id)
             if user is None:
                 return await ctx.send("I could not retrieve the user.")
-            rank = await self.rank_user(user)
+            rank = rank or await self.rank_user(user)
         else:
-            rank = Rank.Rank4
+            rank = Rank.Rank1 # On a user-less event (for now, only on-emergency) rank is not considered
             user = None
 
 
@@ -756,3 +776,27 @@ class StaffTools(MixinMeta, metaclass=CompositeMetaClass): # type: ignore
         else:
             heat.empty_state(ctx.guild, debug=True)
             await message.add_reaction("✅")
+
+    @wardengroup.command(name="find", aliases=["search"])
+    async def wardengroupfind(self, ctx: commands.Context, *, text: str):
+        """Search for text in existing rules"""
+        text = text.lower()
+        all_rules = self.active_warden_rules[ctx.guild.id].copy()
+        all_rules.update(self.invalid_warden_rules[ctx.guild.id].copy())
+        results = []
+        if not all_rules:
+            return await ctx.send("No Warden rules have been added yet.")
+
+        for name, rule in all_rules.items():
+            if text in rule.raw_rule.lower():
+                results.append(name)
+
+        if not results:
+            return await ctx.send("Your search yielded no results.")
+
+        results.sort()
+        results = [inline(r) for r in results]
+        text = "Your search term was found in the following rules:\n" + ", ".join(results)
+
+        for p in pagify(text, delims=[",", " "]):
+            await ctx.send(p)
