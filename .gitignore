@@ -128,3 +128,4 @@ dmypy.json
 # Pyre type checker
 .pyre/
 discordsrv/test/testdb.py
+geysermc/test/test.py

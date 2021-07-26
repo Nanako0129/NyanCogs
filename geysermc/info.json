@@ -1,0 +1,13 @@
+{
+    "author": [
+        "Nyanako (TWTZH0129#0129)"
+    ],
+    "description": "Showing states about the current GlobalAPI skin queue through `https://api.geysermc.org/v1/stats`",
+    "install_msg": "",
+    "short": "GlobalAPI skin queue",
+    "tags": [],
+    "requirements": ["requests~=2.26"],
+    "min_bot_version": "3.4.0",
+    "type": "COG",
+    "end_user_data_statement": ""
+}
