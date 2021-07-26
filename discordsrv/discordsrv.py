@@ -49,7 +49,7 @@ class DiscordSRV(commands.Cog):
         await ctx.send("WIP")
 
     @discordsrv.command(name="linked")
-    async def dsrv_linked(self, ctx: commands.Context, member: discord.member):
+    async def dsrv_linked(self, ctx: commands.Context, member: discord.Member):
         """Get linked account details"""
         is_enabled = await self.config.guild(member.guild).enabled()
         if(is_enabled):
