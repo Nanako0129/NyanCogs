@@ -51,7 +51,7 @@ class Geysermc(commands.Cog):
         else:
             em.color = 16711680
             em.title = "無法從 API 取得資料！"
-        await ctx.send(em)
+        await ctx.send(embed=em)
 
 
     
