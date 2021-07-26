@@ -33,6 +33,11 @@ class Geysermc(commands.Cog):
     @commands.group(aliases=["gsmc"])
     async def geysermc(self, ctx):
         """顯示當前 GlobalAPI Skin 隊列 (Show states about the current GlobalAPI skin queue)"""
+        pass
+
+    @geysermc.command(name="show") 
+    async def show_stats(self, ctx):
+        """顯示當前 GlobalAPI Skin 隊列"""
         rep = requests.get("https://api.geysermc.org/v1/stats")
         em = discord.Embed()
         em.set_footer(text="https://api.geysermc.org/v1/stats", icon_url="https://cdn.discordapp.com/avatars/739572267855511652/548eef27f654909fb56a54bbcdbdff10.png?size=4096")
@@ -46,7 +51,7 @@ class Geysermc(commands.Cog):
         else:
             em.color = 16711680
             em.title = "無法從 API 取得資料！"
-        ctx.send(em)
+        await ctx.send(em)
 
 
     
