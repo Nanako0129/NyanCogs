@@ -1,5 +1,4 @@
 import asyncio
-from asyncio.windows_events import NULL
 import discord
 from redbot.core import commands
 from redbot.core import Config
