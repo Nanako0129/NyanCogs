@@ -6,7 +6,7 @@
     "install_msg": "",
     "short": "",
     "tags": [],
-    "requirements": ["mysql"],
+    "requirements": ["mysql-connector-python"],
     "min_bot_version": "3.4.0",
     "type": "COG",
     "end_user_data_statement": ""
