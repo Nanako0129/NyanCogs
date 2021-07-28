@@ -1,4 +1,5 @@
 import asyncio
+import mysql.connector
 from os import name
 import discord
 from redbot.core import commands
@@ -12,15 +13,26 @@ class DiscordSRV(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=770929133085655060, force_registration=True)
         default_guild = {
-            "enabled": False,
+            "enabled": "False",
             "database":{
-                "db_host": None,
-                "db_user": None,
-                "db_pswd": None,
-                "db_name": None
-            }
+                "host": None,
+                "user": None,
+                "password": None,
+                "database": None
+    }
         }
+        self.config.clear_all_guilds()
         self.config.register_guild(**default_guild)
+
+    @staticmethod
+    async def get_linked(self, member_id: int, db_config: dict):
+        mydb = mysql.connector.connect(**db_config)
+        mycursor = mydb.cursor(dictionary=True)
+        sql = "SELECT * FROM discordsrv_accounts WHERE discord ='{}'".format(member_id)
+        mycursor.execute(sql)
+        myresult = mycursor.fetchall()
+        mydb.close()
+        return myresult
 
     @staticmethod
     async def delete_quietly(message: discord.Message):
@@ -60,14 +72,15 @@ class DiscordSRV(commands.Cog):
     async def dsrv_linked(self, ctx: commands.Context, member: discord.Member):
         """Get linked account details"""
         enabled = await self.config.guild(ctx.guild).get_raw("enabled")
-        if enabled is True :
+        await ctx.send(enabled)
+        if (enabled == "True") :
             await ctx.send("OK!")
-            linked_data = await Database.get_linked(self.config.guild(member.guild).database())
+            linked_data = await self.get_linked(self, member_id=member.id, db_config=await self.config.guild(member.guild).get_raw("database"))
             if (linked_data == []):
                 await ctx.send("NO RESULT!")
             else:
                 await ctx.send(linked_data[0])
-    
+
     @commands.admin()
     @discordsrv.group(name="set")
     async def dsrv_set(self, ctx):
@@ -89,7 +102,7 @@ class DiscordSRV(commands.Cog):
             await ctx.send("Query timed out, nothing changed.")
         
         if result is not None:
-            await self.config.guild(ctx.guild).set_raw("database", "db_host", value=result)
+            await self.config.guild(ctx.guild).set_raw("database", "host", value=result)
             await ctx.send("Database host has been set to {}.".format(result))
     
     @dsrv_set.command(name="port")
@@ -106,7 +119,7 @@ class DiscordSRV(commands.Cog):
             await ctx.send("Query timed out, nothing changed.")
         
         if result is not None:
-            await self.config.guild(ctx.guild).set_raw("database", "db_port", value=result)
+            await self.config.guild(ctx.guild).set_raw("database", "port", value=result)
             await ctx.send("Database port has been set to {}.".format(result))
 
     @dsrv_set.command(name="password", aliases=["pswd", "passwd", "ps"])
@@ -120,7 +133,7 @@ class DiscordSRV(commands.Cog):
             await ctx.send("Query timed out, nothing changed.")
 
         if result is not None:
-            await self.config.guild(ctx.guild).set_raw("database", "db_pswd", value=result)
+            await self.config.guild(ctx.guild).set_raw("database", "password", value=result)
             await ctx.author.send("Database password has been set to {}.".format(result))
             await ctx.tick()
 
@@ -135,5 +148,22 @@ class DiscordSRV(commands.Cog):
             await ctx.send("Query timed out, nothing changed.")
 
         if result is not None:
-            await self.config.guild(ctx.guild).set_raw("database", "db_name", value=result)
+            await self.config.guild(ctx.guild).set_raw("database", "database", value=result)
             await ctx.send("DiscordSRV database's name has been set to {}.".format(result))
+    
+    @dsrv_set.command(name="enable", aliases=["on"])
+    async def dsrv_set_enabled(self, ctx: commands.Context):
+        """enable the fuction"""
+        pred = MessagePredicate.yes_or_no()
+        try:
+            await ctx.send("Are you sure to ENABLE? (Yes to Enable / No to Disable):")
+            await self.bot.wait_for("message", check=pred, timeout=60)
+        except asyncio.TimeoutError:
+            await ctx.send("Query timed out, nothing changed.")
+
+        if pred.result is True:
+            await self.config.guild(ctx.guild).set_raw("enabled", value="True")
+            await ctx.send("DiscordSRV fuction now is ON.")
+        else:
+            await self.config.guild(ctx.guild).set_raw("enabled",value="False")
+            await ctx.send("DiscordSRV fuction now is OFF.")
