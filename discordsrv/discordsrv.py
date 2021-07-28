@@ -150,6 +150,20 @@ class DiscordSRV(commands.Cog):
         if result is not None:
             await self.config.guild(ctx.guild).set_raw("database", "database", value=result)
             await ctx.send("DiscordSRV database's name has been set to {}.".format(result))
+
+    @dsrv_set.command(name="user")
+    async def dsrv_set_user(self, ctx: commands.Context):
+        """set the database login as who"""
+        try:
+            result = await self.send_and_query_response(
+                ctx, "Please input the user name (limit in 16 char):"
+            )
+        except asyncio.TimeoutError:
+            await ctx.send("Query timed out, nothing changed.")
+
+        if result is not None:
+            await self.config.guild(ctx.guild).set_raw("database", "user", value=result)
+            await ctx.send("DiscordSRV login username has been set to {}.".format(result))
     
     @dsrv_set.command(name="enable", aliases=["on"])
     async def dsrv_set_enabled(self, ctx: commands.Context):
