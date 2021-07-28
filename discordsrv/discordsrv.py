@@ -59,8 +59,8 @@ class DiscordSRV(commands.Cog):
     @discordsrv.command(name="linked")
     async def dsrv_linked(self, ctx: commands.Context, member: discord.Member):
         """Get linked account details"""
-        is_enabled = await self.config.guild(member.guild).enabled()
-        if(is_enabled):
+        enabled = await self.config.guild(ctx.guild).get_raw("enabled")
+        if enabled is True :
             await ctx.send("OK!")
             linked_data = await Database.get_linked(self.config.guild(member.guild).database())
             if (linked_data == []):
