@@ -129,3 +129,6 @@ dmypy.json
 .pyre/
 discordsrv/test/testdb.py
 geysermc/test/test.py
+
+#test bot stuff
+NyanCogs_TestBot/
