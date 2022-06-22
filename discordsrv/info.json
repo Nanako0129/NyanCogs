@@ -2,12 +2,13 @@
     "author": [
         "Nyanako (TWTZH0129#0129)"
     ],
-    "description": "",
+    "description": "Connect to DiscordSRV database for showing the Minecraft profile of a player.",
     "install_msg": "",
-    "short": "",
+    "short": "DiscordSRV player finder",
     "tags": [],
-    "requirements": ["mysql-connector-python"],
+    "requirements": ["mysql-connector-python", "requests"],
     "min_bot_version": "3.4.0",
     "type": "COG",
-    "end_user_data_statement": ""
+    "end_user_data_statement": "",
+    "version": "2.0.0"
 }

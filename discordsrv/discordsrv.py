@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 import mysql.connector
 from os import name
 import discord
@@ -7,6 +8,8 @@ from redbot.core import Config
 from redbot.core.commands.commands import Command
 from .core.database import Database
 from redbot.core.utils.predicates import MessagePredicate
+import requests
+import datetime
 
 class DiscordSRV(commands.Cog):
     def __init__(self, bot):
@@ -16,12 +19,12 @@ class DiscordSRV(commands.Cog):
             "enabled": "False",
             "database":{
                 "host": None,
+                "port": None,
                 "user": None,
                 "password": None,
                 "database": None
-    }
+            }
         }
-        self.config.clear_all_guilds()
         self.config.register_guild(**default_guild)
 
     @staticmethod
@@ -61,25 +64,41 @@ class DiscordSRV(commands.Cog):
         await self.delete_quietly(message)
         return message.content
 
+    # https://api.mojang.com/user/profiles/<uuid>/names
+    @staticmethod
+    async def get_name(uuid):
+        url = f"https://api.mojang.com/user/profiles/{uuid}/names"
+        r = requests.get(url)
+        return r.json()[-1]["name"]
+
     @commands.guild_only()
-    @commands.mod()
     @commands.group(aliases=["dsrv"])
     async def discordsrv(self, ctx: commands.Context):
         """WIP"""
-        await ctx.send("> WIP")
 
     @discordsrv.command(name="linked")
     async def dsrv_linked(self, ctx: commands.Context, member: discord.Member):
+        em = discord.Embed()
         """Get linked account details"""
         enabled = await self.config.guild(ctx.guild).get_raw("enabled")
-        await ctx.send(enabled)
         if (enabled == "True") :
-            await ctx.send("OK!")
-            linked_data = await self.get_linked(self, member_id=member.id, db_config=await self.config.guild(member.guild).get_raw("database"))
-            if (linked_data == []):
-                await ctx.send("NO RESULT!")
-            else:
-                await ctx.send(linked_data[0])
+            async with ctx.typing():
+                linked_data = await self.get_linked(self, member_id=member.id, db_config=await self.config.guild(member.guild).get_raw("database"))
+                if (linked_data == []):
+                    await ctx.send("NO RESULT!")
+                else:
+                    mc_name = await self.get_name(linked_data[0]["uuid"])
+                    em.color = member.color
+                    em.description = member.mention
+                    em.add_field(name="Minecraft Name", value="```fix\n"+mc_name+"\n```" , inline=False)
+                    em.add_field(name="UUID", value="```yaml\n"+linked_data[0]["uuid"]+"\n```" , inline=False)
+                    em.set_footer(text=str(linked_data[0]["link"]))
+                    # set em timestamp = now
+                    em.timestamp = datetime.datetime.now()
+                    em.set_author(name=member, icon_url=member.avatar_url)
+                    em.set_thumbnail(url=f"https://cravatar.eu/head/{linked_data[0]['uuid']}/128.png")
+                    em.set_author(name=str(member)+" is linked!", icon_url=member.avatar_url)
+                await ctx.send(embed=em)
 
     @commands.admin()
     @discordsrv.group(name="set")
