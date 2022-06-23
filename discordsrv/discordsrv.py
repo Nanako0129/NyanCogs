@@ -85,7 +85,8 @@ class DiscordSRV(commands.Cog):
             async with ctx.typing():
                 linked_data = await self.get_linked(self, member_id=member.id, db_config=await self.config.guild(member.guild).get_raw("database"))
                 if (linked_data == []):
-                    await ctx.send("NO RESULT!")
+                    em.color = member.color
+                    em.description = member.mention + " 未綁定 Minecraft 帳號！"
                 else:
                     mc_name = await self.get_name(linked_data[0]["uuid"])
                     em.color = member.color
@@ -97,7 +98,7 @@ class DiscordSRV(commands.Cog):
                     em.timestamp = datetime.datetime.now()
                     em.set_author(name=member, icon_url=member.avatar_url)
                     em.set_thumbnail(url=f"https://cravatar.eu/head/{linked_data[0]['uuid']}/128.png")
-                    em.set_author(name=str(member)+" is linked!", icon_url=member.avatar_url)
+                    em.set_author(name=str(member)+" 已綁定 Minecraft 帳號！", icon_url=member.avatar_url)
                 await ctx.send(embed=em)
 
     @commands.admin()
