@@ -95,7 +95,7 @@ class DiscordSRV(commands.Cog):
                     em.add_field(name="UUID", value="```yaml\n"+linked_data[0]["uuid"]+"\n```" , inline=False)
                     em.set_footer(text=str(linked_data[0]["link"]))
                     # set em timestamp = now
-                    em.timestamp = datetime.datetime.now()
+                    em.timestamp = datetime.datetime.utcnow()
                     em.set_author(name=member, icon_url=member.avatar_url)
                     em.set_thumbnail(url=f"https://cravatar.eu/head/{linked_data[0]['uuid']}/128.png")
                     em.set_author(name=str(member)+" 已綁定 Minecraft 帳號！", icon_url=member.avatar_url)
