@@ -90,15 +90,13 @@ class DiscordSRV(commands.Cog):
                 else:
                     mc_name = await self.get_name(linked_data[0]["uuid"])
                     em.color = member.color
-                    em.description = member.mention
+                    em.description = member.mention + " 已綁定 Minecraft 帳號！"
                     em.add_field(name="Minecraft Name", value="```fix\n"+mc_name+"\n```" , inline=False)
                     em.add_field(name="UUID", value="```yaml\n"+linked_data[0]["uuid"]+"\n```" , inline=False)
                     em.set_footer(text=str(linked_data[0]["link"]))
-                    # set em timestamp = now
                     em.timestamp = datetime.datetime.utcnow()
-                    em.set_author(name=member, icon_url=member.avatar_url)
+                    em.set_author(name=member, icon_url=member.avatar_url, url=member.avatar_url)
                     em.set_thumbnail(url=f"https://cravatar.eu/head/{linked_data[0]['uuid']}/128.png")
-                    em.set_author(name=str(member)+" 已綁定 Minecraft 帳號！", icon_url=member.avatar_url)
                 await ctx.send(embed=em)
 
     @commands.admin()
