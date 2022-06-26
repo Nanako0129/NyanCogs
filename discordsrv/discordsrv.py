@@ -110,26 +110,26 @@ class DiscordSRV(commands.Cog):
         """檢查資料庫資訊"""
         em = discord.Embed()
         # check if all the config is set
-        if self.config.guild(ctx.guild).database.host.get() is None:
+        if self.config.guild(ctx.guild).database.host() is None:
             em.add_field(name="資料庫主機", value="未設定", inline=False)
         else:
-            em.add_field(name="資料庫主機", value=self.config.guild(ctx.guild).database.host.get(), inline=False)
-        if self.config.guild(ctx.guild).database.port.get() is None:
+            em.add_field(name="資料庫主機", value=str(self.config.guild(ctx.guild).database.host()), inline=False)
+        if self.config.guild(ctx.guild).database.port() is None:
             em.add_field(name="資料庫埠", value="未設定", inline=False)
         else:
-            em.add_field(name="資料庫埠", value=self.config.guild(ctx.guild).database.port.get(), inline=False)
-        if self.config.guild(ctx.guild).database.user.get() is None:
+            em.add_field(name="資料庫埠", value=str(self.config.guild(ctx.guild).database.port()), inline=False)
+        if self.config.guild(ctx.guild).database.user() is None:
             em.add_field(name="資料庫使用者", value="未設定", inline=False)
         else:
-            em.add_field(name="資料庫使用者", value=self.config.guild(ctx.guild).database.user.get(), inline=False)
-        if self.config.guild(ctx.guild).database.password.get() is None:
+            em.add_field(name="資料庫使用者", value=str(self.config.guild(ctx.guild).database.user()), inline=False)
+        if self.config.guild(ctx.guild).database.password() is None:
             em.add_field(name="資料庫密碼", value="未設定", inline=False)
         else:
             em.add_field(name="資料庫密碼", value="已設定", inline=False)
-        if self.config.guild(ctx.guild).database.database.get() is None:
+        if self.config.guild(ctx.guild).database.database() is None:
             em.add_field(name="資料庫名稱", value="未設定", inline=False)
         else:
-            em.add_field(name="資料庫名稱", value=self.config.guild(ctx.guild).database.database.get(), inline=False)
+            em.add_field(name="資料庫名稱", value=str(self.config.guild(ctx.guild).database.database()), inline=False)
         await ctx.author.send(embed=em)
     @dsrv_set.command(name="host")
     async def dsrv_set_host(self, ctx: commands.Context):
