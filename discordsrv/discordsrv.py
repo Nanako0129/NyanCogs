@@ -111,11 +111,11 @@ class DiscordSRV(commands.Cog):
         em = discord.Embed()
         # check if all the config is set
         check_config = {
-            "host": await self.config.guild(ctx.guild).get_raw("database.host"),
-            "port": await self.config.guild(ctx.guild).get_raw("database.port"),
-            "user": await self.config.guild(ctx.guild).get_raw("database.user"),
-            "password": await self.config.guild(ctx.guild).get_raw("database.password"),
-            "database": await self.config.guild(ctx.guild).get_raw("database.database")
+            "host": await self.config.guild(ctx.guild).get_raw("database", "host"), 
+            "port": await self.config.guild(ctx.guild).get_raw("database", "port"),
+            "user": await self.config.guild(ctx.guild).get_raw("database", "user"),
+            "password": await self.config.guild(ctx.guild).get_raw("database", "password"),
+            "database": await self.config.guild(ctx.guild).get_raw("database", "database")
         }
         for key, value in check_config.items():
             if value is None:
@@ -123,7 +123,7 @@ class DiscordSRV(commands.Cog):
             else:
                 if key == "password":
                     em.add_field(name=key, value="已設定", inline=False)
-                em.add_field(name=key, value=value, inline=False)
+                em.add_field(name=key, value=str(value), inline=False)
         em.set_author(name="檢查資料庫資訊", icon_url=ctx.guild.icon_url)
         await ctx.author.send(embed=em)
     @dsrv_set.command(name="host")
