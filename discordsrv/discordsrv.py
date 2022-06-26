@@ -109,6 +109,7 @@ class DiscordSRV(commands.Cog):
     async def settings(self, ctx: commands.Context):
         """檢查資料庫資訊"""
         em = discord.Embed()
+        em.color = ctx.embed_colour()
         # check if all the config is set
         check_config = {
             "host": await self.config.guild(ctx.guild).get_raw("database", "host"), 
