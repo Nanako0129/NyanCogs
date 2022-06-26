@@ -183,7 +183,7 @@ class DiscordSRV(commands.Cog):
         """set the database name that DiscordSRV using"""
         try:
             result = await self.send_and_query_response(
-                ctx, "Please input the table name (limit in 64 char):"
+                ctx, "Please input the database name (limit in 64 char):"
             )
         except asyncio.TimeoutError:
             await ctx.send("Query timed out, nothing changed.")
