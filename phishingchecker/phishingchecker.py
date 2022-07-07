@@ -57,17 +57,17 @@ class PhishingChecker(commands.Cog):
             domain: str,
             phishing_type: str,
             channel: discord.TextChannel,
-            what_action: str = None
+            what_action
         ):
-        if what_action is "delete":
-            msg_tip = "*The message has been deleted.*"
+        if what_action == "delete":
+            msg_tip = f"~~[Click to jump]({message.jump_url})~~ *The message has been deleted.*"
         else:
-            msg_tip = ""
+            msg_tip = f"[Click to jump]({message.jump_url})"
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.title = "🔎🔗 • Phishing checker"
         embed.description = f"Phishing message detected!\n The following message contained {cf.bold(phishing_type)} link in our checking list.\n" 
         embed.description += f"{cf.box(origin_content)}\n"
-        embed.description += f"[Click to jump]({message.jump_url})" + " {}".format(msg_tip)
+        embed.description += msg_tip
         embed.add_field(name="Username", value=f"`{message.author}`", inline=True)
         embed.add_field(name="ID", value=f"`{message.author.id}`", inline=True)
         embed.add_field(name="Channel", value=f"{message.channel.mention}", inline=True)
