@@ -4,6 +4,6 @@
     "name": "phishingchecker",
     "hidden": false,
     "short": "Detect phishing links, and do some actions.",
-    "description": "Detect phishing links, and do some actions.",
+    "description": "Detect phishing links, and do some actions. Phishing-links checking list is provided by discord-phishing-links (<https://github.com/nikolaischunk/discord-phishing-links>)",
     "min_bot_version": "3.4.0"
 }
