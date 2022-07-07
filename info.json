@@ -1,9 +1,9 @@
 {
     "name": "NyanCogs",
-    "short": "Only for 2D2C",
-    "description": "Only for 2D2C",
+    "short": "NyanCogs for NyanakoBot",
+    "description": "NyanCogs for NyanakoBot",
     "install_msg": "",
     "author": [
-        "Nyanako (TWTZH0129#0129)"
+        "Nanako Tsai (Nyanako#0129)"
     ]
 }
