@@ -1,0 +1,9 @@
+{
+    "author": ["Nanako Tsai(Nyanako#0129)"],
+    "install_msg": "Load the cog with `[p]load phishingchecker`. Then use, `[p]phishingchecker` to get started with it.",
+    "name": "phishingchecker",
+    "hidden": false,
+    "short": "Detect phishing links, and do some actions.",
+    "description": "Detect phishing links, and do some actions.",
+    "min_bot_version": "3.4.0"
+}
