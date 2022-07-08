@@ -180,8 +180,8 @@ class PhishingChecker(commands.Cog):
         else:
             channel = self.bot.get_channel(int(channel)).mention
         embed = discord.Embed(title="Phishing Checker Settings", color=await self.bot.get_embed_color(self))
-        embed.add_field(name="Enabled", value=f"{cf.box(enabled)}", inline=False)
-        embed.add_field(name="Channel", value=f"> {channel}", inline=False)
-        embed.add_field(name="Action", value=f"{cf.box(action)}", inline=False)
-        embed.add_field(name="Always delete", value=f"{cf.box(always_delete)}", inline=False)
+        embed.add_field(name="Enabled", value=f"{cf.inline(enabled)}", inline=True)
+        embed.add_field(name="Channel", value=f"> {channel}", inline=True)
+        embed.add_field(name="Action", value=f"{cf.inline(action)}", inline=True)
+        embed.add_field(name="Always delete", value=f"{cf.inline(always_delete)}", inline=True)
         await ctx.send(embed=embed)
