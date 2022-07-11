@@ -38,13 +38,23 @@ class PhishingChecker(commands.Cog):
     
     @staticmethod
     async def get_unshort_url(self, url: str, unshort_api: str = None):
-        try: 
-            r = requests.get(unshort_api.strip("/")+"/api/?url="+url).json()
-            return r["longUrl"]
-        except Exception:
-            r = requests.get("https://unshort.herokuapp.com/api/?url="+url).json()
-            return r["longUrl"]
-
+        if unshort_api is None:
+            try: 
+                r = requests.get("https://unshort.herokuapp.com/api/?url=" + url, timeout=10).json()
+                return r["longUrl"]
+            except requests.exceptions:
+                return url
+        else:
+            try:
+                r = requests.get(unshort_api.strip("/") + "/api/?url=" + url, timeout=10).json()
+                return r["longUrl"]
+            except requests.exceptions:
+                try:
+                    r = requests.get("https://unshort.herokuapp.com/api/?url=" + url, timeout=10).json()
+                    return r["longUrl"]
+                except requests.exceptions:
+                    return url
+    
     async def check_phishing_info(self, url: str):
         if url.startswith("https://"):
             url = url[8:]
@@ -93,7 +103,7 @@ class PhishingChecker(commands.Cog):
         alaways_delete = await self.config.guild(message.guild).get_raw("always_delete")
         action = await self.config.guild(message.guild).get_raw("action")
         channel_id = await self.config.guild(message.guild).get_raw("send_channel")
-        unshort_api = self.config.guild(message.guild).get_raw("unshort_api")
+        unshort_api = await self.config.guild(message.guild).get_raw("unshort_api")
         for match in URL_RE.finditer(message.content):
             url = match.group(0)
             if unshort_api is not None:
