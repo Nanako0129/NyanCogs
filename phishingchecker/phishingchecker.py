@@ -19,7 +19,8 @@ class PhishingChecker(commands.Cog):
             "enabled": False,
             "send_channel": None,
             "action": None,
-            "always_delete": False
+            "always_delete": False,
+            "unshort_api": None,
         }
         self.config.register_guild(**default_guild)
         self.update_checking_list.start()
@@ -35,7 +36,20 @@ class PhishingChecker(commands.Cog):
         except Exception:
             pass
 
+    async def get_unshort_url(self, message: discord.Message, url: str):
+        if await self.config.guild(message.guild).unshort_api is None:
+            r = requests.get("https://unshort.herokuapp.com/api/?url="+url).json()
+            return r["longUrl"]
+        else:
+            try: 
+                r = requests.get(await self.config.guild(message.guild).unshort_api+url).json()
+                return r["longUrl"]
+            except Exception:
+                r = requests.get("https://unshort.herokuapp.com/api/?url="+url).json()
+                return r["longUrl"]
+
     async def check_phishing_info(self, url: str):
+        url = await self.get_unshort_url(url)
         if url.startswith("https://"):
             url = url[8:]
         elif url.startswith("http://"):
