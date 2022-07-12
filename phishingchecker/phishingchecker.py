@@ -36,16 +36,15 @@ class PhishingChecker(commands.Cog):
         except Exception:
             pass
     
-    @staticmethod
-    async def get_unshort_url(self, url: str):
-        unshortener = UnshortenIt()
-    
     async def check_phishing_info(self, url: str):
         unshortener = UnshortenIt(default_timeout=10)
         try: 
             _url = unshortener.unshorten(url, unshorten_nested=True)
         except Exception:
-            _url = url
+            try:
+                _url = requests.get('https://tinyurl.com/56rf5jad', allow_redirects=False).headers['location']
+            except Exception:
+                _url = url
         url = _url
         if url.startswith("https://"):
             url = url[8:]
@@ -94,12 +93,8 @@ class PhishingChecker(commands.Cog):
         alaways_delete = await self.config.guild(message.guild).get_raw("always_delete")
         action = await self.config.guild(message.guild).get_raw("action")
         channel_id = await self.config.guild(message.guild).get_raw("send_channel")
-        unshort_api = await self.config.guild(message.guild).get_raw("unshort_api")
         for match in URL_RE.finditer(message.content):
             url = match.group(0)
-            if unshort_api is not None:
-                url = await self.get_unshort_url(message, url, unshort_api)
-            url = await self.get_unshort_url(message, url)
             is_phishing, phishing_type, match_domain = await self.check_phishing_info(url)
             if is_phishing:
                 if channel_id != 0:
