@@ -1,5 +1,6 @@
 import requests
 import discord
+from unshortenit import UnshortenIt
 
 from discord.ext import tasks
 
@@ -20,7 +21,6 @@ class PhishingChecker(commands.Cog):
             "send_channel": None,
             "action": None,
             "always_delete": False,
-            "unshort_api": None,
         }
         self.config.register_guild(**default_guild)
         self.update_checking_list.start()
@@ -37,25 +37,16 @@ class PhishingChecker(commands.Cog):
             pass
     
     @staticmethod
-    async def get_unshort_url(self, url: str, unshort_api: str = None):
-        if unshort_api is None:
-            try: 
-                r = requests.get("https://unshort.herokuapp.com/api/?url=" + url, timeout=10).json()
-                return r["longUrl"]
-            except requests.exceptions:
-                return url
-        else:
-            try:
-                r = requests.get(unshort_api.strip("/") + "/api/?url=" + url, timeout=10).json()
-                return r["longUrl"]
-            except requests.exceptions:
-                try:
-                    r = requests.get("https://unshort.herokuapp.com/api/?url=" + url, timeout=10).json()
-                    return r["longUrl"]
-                except requests.exceptions:
-                    return url
+    async def get_unshort_url(self, url: str):
+        unshortener = UnshortenIt()
     
     async def check_phishing_info(self, url: str):
+        unshortener = UnshortenIt(default_timeout=10)
+        try: 
+            _url = unshortener.unshorten(url, unshorten_nested=True)
+        except Exception:
+            _url = url
+        url = _url
         if url.startswith("https://"):
             url = url[8:]
         elif url.startswith("http://"):
