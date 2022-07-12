@@ -42,7 +42,7 @@ class PhishingChecker(commands.Cog):
             _url = unshortener.unshorten(url, unshorten_nested=True)
         except Exception:
             try:
-                _url = requests.get('https://tinyurl.com/56rf5jad', allow_redirects=False).headers['location']
+                _url = requests.get(url, allow_redirects=False).headers['location']
             except Exception:
                 _url = url
         url = _url
