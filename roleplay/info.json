@@ -1,0 +1,9 @@
+{
+  "author" : ["Jintaku", "Nanako Tsai(Nyanako#0129)"],
+  "bot_version": [3,0,0],
+  "install_msg" : "Interact with people using the best GIFs!",
+  "short" : "角色互動",
+  "description" : "Interact with users using anime GIFs",
+  "tags" : ["interaction", "roleplay", "GIF"],
+  "hidden" : false
+}
