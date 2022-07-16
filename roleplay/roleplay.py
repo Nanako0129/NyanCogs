@@ -15,13 +15,11 @@ else:
     console.setLevel(logging.INFO)
 log.addHandler(console)
 
-BaseCog = getattr(commands, "Cog", object)
-
-
-class Roleplay(BaseCog):
+class Roleplay(commands.Cog):
     """透過GIF與成員互動"""
 
-    def __init__(self):
+    def __init__(self, bot):
+        self.bot = bot
         self.config = Config.get_conf(self, identifier=842364413)
         default_global = {
             "hugs": [
