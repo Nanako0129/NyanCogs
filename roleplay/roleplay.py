@@ -405,7 +405,7 @@ class Roleplay(commands.Cog):
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
     async def poke(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
-        """對某個成員做鬼臉！"""
+        """戳戳某個成員！"""
 
         author = ctx.message.author
         images = await self.config.poke()
@@ -415,7 +415,7 @@ class Roleplay(commands.Cog):
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
-        embed.description = f"**{author.mention} 對 {user.mention} 做鬼臉**"
+        embed.description = f"**{author.mention} 戳了 {user.mention}**"
         embed.set_image(url=images[i])
         await ctx.send(content=user.mention if mention else "", embed=embed)
 
