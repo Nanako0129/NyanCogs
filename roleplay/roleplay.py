@@ -21,7 +21,7 @@ async def is_imgur_removed(url):
             return False
         r = requests.get(url, allow_redirects=False)
         try:
-            if r.headers['Location'] is "https://i.imgur.com/removed.png":
+            if r.headers['Location'] == "https://i.imgur.com/removed.png":
                 return True
             else: 
                 return False
