@@ -20,9 +20,12 @@ async def is_imgur_removed(url):
         if "imgur.com" not in url:
             return False
         r = requests.get(url, allow_redirects=False)
-        if r.headers['location'] is "https://i.imgur.com/removed.png":
-            return True
-        else: 
+        try:
+            if r.headers['Location'] is "https://i.imgur.com/removed.png":
+                return True
+            else: 
+                return False
+        except KeyError:
             return False
 
 class Roleplay(commands.Cog):
