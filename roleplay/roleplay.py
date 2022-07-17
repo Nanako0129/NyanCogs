@@ -3,6 +3,7 @@ from redbot.core import commands, Config
 from random import randint
 import aiohttp
 import logging
+import requests
 
 log = logging.getLogger("Roleplay")  # Thanks to Sinbad for the example code for logging
 log.setLevel(logging.DEBUG)
@@ -14,6 +15,15 @@ if logging.getLogger("red").isEnabledFor(logging.DEBUG):
 else:
     console.setLevel(logging.INFO)
 log.addHandler(console)
+
+async def is_imgur_removed(url):
+        if "imgur.com" not in url:
+            return False
+        r = requests.get(url, allow_redirects=False)
+        if r.headers['location'] is "https://i.imgur.com/removed.png":
+            return True
+        else: 
+            return False
 
 class Roleplay(commands.Cog):
     """透過GIF與成員互動"""
@@ -41,14 +51,6 @@ class Roleplay(commands.Cog):
                 "https://media.giphy.com/media/DjczAlIcyK1Co/giphy.gif",
                 "https://media.giphy.com/media/ba92ty7qnNcXu/giphy.gif",
                 "https://media.giphy.com/media/C4gbG94zAjyYE/giphy.gif",
-                "https://i.imgur.com/4Y50gzE.gif",
-                "https://i.imgur.com/OrpyAfa.gif",
-                "https://i.imgur.com/aA8mTuX.gif",
-                "https://i.imgur.com/fm9PHyr.gif",
-                "https://i.imgur.com/tCuAWNW.gif",
-                "https://i.imgur.com/BPMTcq7.gif",
-                "https://i.imgur.com/V1fd9oP.gif",
-                "https://i.imgur.com/OSDidQJ.gif",
                 "https://i.imgur.com/hM1LcZf.gif",
                 "https://i.imgur.com/cRfX87T.gif",
                 "https://cdn.weeb.sh/images/HyNJIaVCb.gif",
@@ -91,15 +93,6 @@ class Roleplay(commands.Cog):
                 "https://cdn.weeb.sh/images/r1A77CZbz.gif",
             ],
             "kiss": [
-                "https://i.imgur.com/WYkVxW2.gif",
-                "https://i.imgur.com/xu104Xp.gif",
-                "https://i.imgur.com/8jcpBO7.gif",
-                "https://i.imgur.com/jmWGYh5.gif",
-                "https://i.imgur.com/Sg8Obai.gif",
-                "https://i.imgur.com/Pr06rra.gif",
-                "https://i.imgur.com/J8xgNpE.gif",
-                "https://i.imgur.com/gtIEfcS.gif",
-                "https://i.imgur.com/j3zdC5g.gif",
                 "https://cdn.weeb.sh/images/r1cB3aOwW.gif",
                 "https://cdn.weeb.sh/images/B1MJ2aODb.gif",
                 "https://cdn.weeb.sh/images/Hy-oQl91z.gif",
@@ -229,7 +222,7 @@ class Roleplay(commands.Cog):
                 "https://media1.tenor.com/images/571da4da1ad526afe744423f7581a452/tenor.gif?itemid=11658244",
                 "https://media1.tenor.com/images/6bde17caa5743a22686e5f7b6e3e23b4/tenor.gif?itemid=13726430",
                 "https://media1.tenor.com/images/fd3616d34ade61e1ac5cd0975c25a917/tenor.gif?itemid=13653906",
-                "https://imgur.com/v7jsPrv",
+                "https://i.imgur.com/v7jsPrv.gif",
             ],
             "tickle": [
                 "https://media1.tenor.com/images/02f62186ccb7fa8a2667f3216cfd7e13/tenor.gif?itemid=13269751",
@@ -259,179 +252,169 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def hugs(self, ctx: commands.Context, *, user: discord.Member):
-        """與某個成員抱抱！"""
+    async def hugs(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+        """擁抱某個成員！"""
 
         author = ctx.message.author
         images = await self.config.hugs()
         nekos = await self.fetch_nekos_life(ctx, "hug")
         images.extend(nekos)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 抱了 {user.mention}**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def cuddle(self, ctx: commands.Context, *, user: discord.Member):
-        """與某個成員蹭蹭！"""
+    async def cuddle(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+        """蹭蹭某個成員！"""
 
         author = ctx.message.author
         images = await self.config.cuddle()
         nekos = await self.fetch_nekos_life(ctx, "cuddle")
         images.extend(nekos)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 蹭蹭 {user.mention}**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "",  embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def kiss(self, ctx: commands.Context, *, user: discord.Member):
-        """與某個成員親親！"""
+    async def kiss(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+        """親吻某個成員！"""
 
         author = ctx.message.author
         images = await self.config.kiss()
         nekos = await self.fetch_nekos_life(ctx, "kiss")
         images.extend(nekos)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 親了 {user.mention}**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def slap(self, ctx: commands.Context, *, user: discord.Member):
+    async def slap(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
         """對某個成員賞巴掌！"""
 
         author = ctx.message.author
         images = await self.config.slap()
         nekos = await self.fetch_nekos_life(ctx, "slap")
         images.extend(nekos)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 打了 {user.mention} 巴掌**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def pat(self, ctx: commands.Context, *, user: discord.Member):
+    async def pat(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
         """對某個成員拍拍！"""
 
         author = ctx.message.author
         images = await self.config.pat()
         nekos = await self.fetch_nekos_life(ctx, "pat")
         images.extend(nekos)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 拍拍 {user.mention}**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def lick(self, ctx: commands.Context, *, user: discord.Member):
+    async def lick(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
         """對某個成員舔舔！"""
 
         author = ctx.message.author
         images = await self.config.lick()
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 舔了 {user.mention}**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def highfive(self, ctx: commands.Context, *, user: discord.Member):
+    async def highfive(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
         """與某個成員擊掌！"""
 
         author = ctx.message.author
         images = await self.config.highfive()
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 向 {user.mention} 擊掌**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def feed(self, ctx: commands.Context, *, user: discord.Member):
+    async def feed(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
         """餵食某個成員！"""
 
         author = ctx.message.author
         images = await self.config.feed()
         nekos = await self.fetch_nekos_life(ctx, "feed")
         images.extend(nekos)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 餵食 {user.mention}**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def tickle(self, ctx: commands.Context, *, user: discord.Member):
+    async def tickle(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
         """搔癢某個成員！"""
 
         author = ctx.message.author
         images = await self.config.tickle()
         nekos = await self.fetch_nekos_life(ctx, "tickle")
         images.extend(nekos)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 搔癢 {user.mention}**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def poke(self, ctx: commands.Context, *, user: discord.Member):
+    async def poke(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
         """對某個成員做鬼臉！"""
 
         author = ctx.message.author
         images = await self.config.poke()
         nekos = await self.fetch_nekos_life(ctx, "poke")
         images.extend(nekos)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
         embed.description = f"**{author.mention} 對 {user.mention} 做鬼臉**"
         embed.set_image(url=images[i])
-        await ctx.send(embed=embed)
+        await ctx.send(content=user.mention if mention else "", embed=embed)
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
@@ -442,8 +425,7 @@ class Roleplay(commands.Cog):
         images = await self.config.smug()
         smug = await self.fetch_nekos_life(ctx, "smug")
         images.extend(smug)
-        mn = len(images)
-        i = randint(0, mn - 1)
+        i = self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -464,3 +446,12 @@ class Roleplay(commands.Cog):
 
         if content["data"]["status"]["code"] == 200:
             return content["data"]["response"]["urls"]
+    
+    @staticmethod
+    async def randimg(urls: list):
+        while True:
+            i = randint(0, len(urls) - 1)
+            if await is_imgur_removed(urls[i]):
+                continue
+            else:
+                return i
