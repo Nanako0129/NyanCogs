@@ -88,7 +88,11 @@ class PhishingChecker(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if not await self.config.guild(message.guild).get_raw("enabled") and message.author.bot and message.guild is None:
+        if message.guild is None:
+            return
+        if message.author.bot:
+            return
+        if not await self.config.guild(message.guild).get_raw("enabled"):
             return
         alaways_delete = await self.config.guild(message.guild).get_raw("always_delete")
         action = await self.config.guild(message.guild).get_raw("action")
