@@ -252,7 +252,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def hugs(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def hugs(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """擁抱某個成員！"""
 
         author = ctx.message.author
@@ -269,7 +269,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def cuddle(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def cuddle(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """蹭蹭某個成員！"""
 
         author = ctx.message.author
@@ -286,7 +286,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def kiss(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def kiss(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """親吻某個成員！"""
 
         author = ctx.message.author
@@ -303,7 +303,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def slap(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def slap(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """對某個成員賞巴掌！"""
 
         author = ctx.message.author
@@ -320,7 +320,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def pat(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def pat(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """對某個成員拍拍！"""
 
         author = ctx.message.author
@@ -337,7 +337,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def lick(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def lick(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """對某個成員舔舔！"""
 
         author = ctx.message.author
@@ -352,7 +352,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def highfive(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def highfive(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """與某個成員擊掌！"""
 
         author = ctx.message.author
@@ -367,7 +367,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def feed(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def feed(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """餵食某個成員！"""
 
         author = ctx.message.author
@@ -384,7 +384,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def tickle(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def tickle(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """搔癢某個成員！"""
 
         author = ctx.message.author
@@ -401,7 +401,7 @@ class Roleplay(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(embed_links=True)
-    async def poke(self, ctx: commands.Context, *, user: discord.Member, mention: bool = False):
+    async def poke(self, ctx: commands.Context, user: discord.Member, mention: bool = False):
         """對某個成員做鬼臉！"""
 
         author = ctx.message.author
