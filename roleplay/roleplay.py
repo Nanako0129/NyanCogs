@@ -259,7 +259,7 @@ class Roleplay(commands.Cog):
         images = await self.config.hugs()
         nekos = await self.fetch_nekos_life(ctx, "hug")
         images.extend(nekos)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -276,7 +276,7 @@ class Roleplay(commands.Cog):
         images = await self.config.cuddle()
         nekos = await self.fetch_nekos_life(ctx, "cuddle")
         images.extend(nekos)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -293,7 +293,7 @@ class Roleplay(commands.Cog):
         images = await self.config.kiss()
         nekos = await self.fetch_nekos_life(ctx, "kiss")
         images.extend(nekos)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -310,7 +310,7 @@ class Roleplay(commands.Cog):
         images = await self.config.slap()
         nekos = await self.fetch_nekos_life(ctx, "slap")
         images.extend(nekos)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -327,7 +327,7 @@ class Roleplay(commands.Cog):
         images = await self.config.pat()
         nekos = await self.fetch_nekos_life(ctx, "pat")
         images.extend(nekos)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -342,7 +342,7 @@ class Roleplay(commands.Cog):
 
         author = ctx.message.author
         images = await self.config.lick()
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -357,7 +357,7 @@ class Roleplay(commands.Cog):
 
         author = ctx.message.author
         images = await self.config.highfive()
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -374,7 +374,7 @@ class Roleplay(commands.Cog):
         images = await self.config.feed()
         nekos = await self.fetch_nekos_life(ctx, "feed")
         images.extend(nekos)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -391,7 +391,7 @@ class Roleplay(commands.Cog):
         images = await self.config.tickle()
         nekos = await self.fetch_nekos_life(ctx, "tickle")
         images.extend(nekos)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -408,7 +408,7 @@ class Roleplay(commands.Cog):
         images = await self.config.poke()
         nekos = await self.fetch_nekos_life(ctx, "poke")
         images.extend(nekos)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
@@ -425,7 +425,7 @@ class Roleplay(commands.Cog):
         images = await self.config.smug()
         smug = await self.fetch_nekos_life(ctx, "smug")
         images.extend(smug)
-        i = self.randimg(images)
+        i = await self.randimg(images)
 
         # Build Embed
         embed = discord.Embed(color=await self.bot.get_embed_color(self))
