@@ -527,7 +527,11 @@ def canonical_media_url(
             checked.hostname == "pbs.twimg.com"
             and under("/media/")
             or checked.hostname == "video.twimg.com"
-            and (under("/ext_tw_video/") or under("/amplify_video/"))
+            and (
+                under("/ext_tw_video/")
+                or under("/amplify_video/")
+                or under("/tweet_video/")
+            )
         )
     elif domain_id == DomainId.PIXIV:
         allowed = checked.hostname == "i.pximg.net" and (
@@ -1089,6 +1093,7 @@ class EmbedFixer(commands.Cog):
         self._extract_context_menu_registered = False
         self._session: aiohttp.ClientSession | None = None
         self._s3_lock = asyncio.Lock()
+        self._rotation_lock = asyncio.Lock()
         self._author_inflight: dict[int, set[asyncio.Event]] = {}
         self._pending_records: dict[str, dict[str, Any]] = {}
         self._pending_evictions: set[str] = set()
@@ -1100,6 +1105,8 @@ class EmbedFixer(commands.Cog):
         """Initialize only the runtime state needed by lightweight test doubles."""
         if not hasattr(self, "_s3_lock"):
             self._s3_lock = asyncio.Lock()
+        if not hasattr(self, "_rotation_lock"):
+            self._rotation_lock = asyncio.Lock()
         if not hasattr(self, "_author_inflight"):
             self._author_inflight = {}
         if not hasattr(self, "_pending_records"):
@@ -2364,18 +2371,8 @@ class EmbedFixer(commands.Cog):
         if not expected_urls:
             return False
 
-        def has_expected_embed(message: Any) -> bool:
-            actual = {
-                getattr(embed, "url", None)
-                for embed in (getattr(message, "embeds", None) or [])
-            }
-            return all(
-                value in actual or _markdown_url(value) in actual
-                for value in raw_urls
-            )
-
         embeds = getattr(sent, "embeds", None)
-        if embeds and has_expected_embed(sent):
+        if embeds and self._has_expected_embed(sent, raw_urls):
             return True
         fetch = getattr(getattr(sent, "channel", None), "fetch_message", None)
         if fetch is None:
@@ -2386,10 +2383,23 @@ class EmbedFixer(commands.Cog):
                 latest = await fetch(sent.id)
             except Exception:
                 return False
-            if has_expected_embed(latest):
+            if self._has_expected_embed(latest, raw_urls):
                 return True
             await asyncio.sleep(min(self.confirm_poll, max(0.0, deadline - time.monotonic())))
         return False
+
+    @staticmethod
+    def _has_expected_embed(
+        message: Any,
+        expected_url: str | tuple[str, ...] | list[str] | set[str],
+    ) -> bool:
+        raw_urls = (expected_url,) if isinstance(expected_url, str) else tuple(expected_url)
+        raw_urls = tuple(value for value in raw_urls if isinstance(value, str) and value)
+        actual = {
+            getattr(embed, "url", None)
+            for embed in (getattr(message, "embeds", None) or [])
+        }
+        return bool(raw_urls) and all(value in actual or _markdown_url(value) in actual for value in raw_urls)
 
     @staticmethod
     def _original_link_view(target: FixedTarget, settings: dict[str, Any]) -> discord.ui.View | None:
@@ -2431,7 +2441,13 @@ class EmbedFixer(commands.Cog):
         if view is not None:
             await verified.edit(view=view)
         if emoji is not None:
-            await verified.add_reaction(emoji)
+            try:
+                await verified.add_reaction(emoji)
+            except discord.HTTPException:
+                # Discord rejects unknown/custom emoji names at the API.  The
+                # confirmed replacement remains usable without this optional
+                # delete control; unrelated setup failures stay fatal.
+                pass
         if settings.get("rotate_fix_reaction", False) and record["source_message_id"] is not None:
             await verified.add_reaction(ROTATE_EMOJI)
 
@@ -2899,7 +2915,57 @@ class EmbedFixer(commands.Cog):
             spoiler=candidate.spoiler,
         ), settings)
 
+    def _rotation_targets(
+        self,
+        source: Any,
+        record: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> tuple[Candidate, FixMethod, FixMethod, FixedTarget, FixedTarget] | None:
+        candidates = extract_candidates(getattr(source, "content", ""))
+        target_index = record["target_index"]
+        if target_index >= len(candidates):
+            return None
+        candidate = candidates[target_index]
+        domain_id = int(candidate.domain.id)
+        disabled = _normalize_ids(settings.get("disabled_domains", []))
+        enabled = _normalize_ids(settings.get("enabled_domains", []))
+        if (
+            domain_id != record["domain_id"]
+            or domain_id in disabled
+            or not candidate.domain.enabled_by_default
+            and domain_id not in enabled
+        ):
+            return None
+        skipped = set(candidate.website.skip_method_ids or [])
+        methods = [
+            method
+            for method in candidate.domain.fix_methods
+            if method.id not in skipped
+        ]
+        current = next(
+            (method for method in methods if method.id == record["method_id"]),
+            None,
+        )
+        if current is None or len(methods) < 2:
+            return None
+        next_method = methods[(methods.index(current) + 1) % len(methods)]
+        old_target = self._target_for_method(candidate, current, settings)
+        new_target = self._target_for_method(candidate, next_method, settings)
+        if old_target is None or new_target is None:
+            return None
+        return candidate, current, next_method, old_target, new_target
+
     async def _rotate_record(
+        self,
+        payload: Any,
+        record: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> None:
+        self._ensure_s3_runtime()
+        async with self._rotation_lock:
+            await self._rotate_record_transaction(payload, record, settings)
+
+    async def _rotate_record_transaction(
         self,
         payload: Any,
         record: dict[str, Any],
@@ -2923,31 +2989,48 @@ class EmbedFixer(commands.Cog):
         reactor = getattr(payload, "member", None) or discord.Object(id=payload.user_id)
         try:
             source = await self._fetch_source(record)
-            if source is None:
+            source_snapshot = self._source_snapshot(source) if source is not None else None
+            rotation = (
+                self._rotation_targets(source, record, settings)
+                if source is not None
+                else None
+            )
+            if source_snapshot is None or rotation is None:
                 return
-            candidates = extract_candidates(getattr(source, "content", ""))
-            if record["target_index"] >= len(candidates):
-                return
-            candidate = candidates[record["target_index"]]
-            domain_id = int(candidate.domain.id)
-            disabled = _normalize_ids(settings.get("disabled_domains", []))
-            enabled = _normalize_ids(settings.get("enabled_domains", []))
-            if (
-                domain_id != record["domain_id"]
-                or domain_id in disabled
-                or not candidate.domain.enabled_by_default and domain_id not in enabled
-            ):
-                return
-            skipped = set(candidate.website.skip_method_ids or [])
-            methods = [method for method in candidate.domain.fix_methods if method.id not in skipped]
-            current = next((method for method in methods if method.id == record["method_id"]), None)
-            if current is None or len(methods) < 2:
-                return
-            next_method = methods[(methods.index(current) + 1) % len(methods)]
-            old_target = self._target_for_method(candidate, current, settings)
-            new_target = self._target_for_method(candidate, next_method, settings)
-            if old_target is None or new_target is None:
-                return
+            _candidate, _current, next_method, old_target, new_target = rotation
+
+            # Snapshot and identity checks are short and locked; editing and
+            # provider polling below deliberately stay outside the S3 lock.
+            async with self._s3_lock:
+                records = await self._replacement_records()
+                current_settings = await self._guild_settings_from_id(record["guild_id"])
+                current_source = await self._fetch_source(record)
+                current_replacement = await self._fetch_bot_message(
+                    record["guild_id"],
+                    record["channel_id"],
+                    payload.message_id,
+                    source_message_id=record["source_message_id"],
+                )
+                current_rotation = (
+                    self._rotation_targets(current_source, record, current_settings)
+                    if current_source is not None
+                    else None
+                )
+                if (
+                    records.get(str(payload.message_id)) != record
+                    or current_settings != settings
+                    or current_source is None
+                    or self._source_snapshot(current_source) != source_snapshot
+                    or current_rotation is None
+                    or current_rotation[2].id != next_method.id
+                    or current_replacement is None
+                    or not self._has_expected_embed(
+                        current_replacement,
+                        current_rotation[3].fixed_url,
+                    )
+                ):
+                    return
+                replacement = current_replacement
             old_embed_urls = tuple(
                 url
                 for embed in (getattr(replacement, "embeds", None) or [])
@@ -2959,7 +3042,8 @@ class EmbedFixer(commands.Cog):
             old_view = getattr(replacement, "view", None)
             if old_view is None and getattr(replacement, "components", None):
                 old_view = discord.ui.View.from_message(replacement, timeout=None)
-            rollback = False
+
+            committed = False
             try:
                 await replacement.edit(
                     content=format_fixed(new_target),
@@ -2967,49 +3051,110 @@ class EmbedFixer(commands.Cog):
                 )
                 if not await self._confirm_embed(replacement, new_target.fixed_url):
                     raise RuntimeError("rotated provider did not embed")
-                if await self._fetch_source(record) is None:
-                    raise RuntimeError("source changed during rotation")
-                records = await self._replacement_records()
-                if records.get(str(payload.message_id)) != record:
-                    raise RuntimeError("replacement authority changed")
-                updated = copy.deepcopy(records)
-                updated[str(payload.message_id)]["method_id"] = next_method.id
-                try:
-                    await self._set_replacement_records(updated)
-                except Exception:
-                    current_records = await self._replacement_records()
-                    if current_records.get(str(payload.message_id)) != updated[str(payload.message_id)]:
-                        raise
-            except Exception:
-                try:
-                    await replacement.edit(content=old_content, view=old_view)
-                    rollback = await self._confirm_embed(replacement, old_embed_urls)
-                except Exception:
-                    rollback = False
-                if not rollback:
-                    deleted = await self._delete_bot_message(
+                async with self._s3_lock:
+                    records = await self._replacement_records()
+                    current_settings = await self._guild_settings_from_id(record["guild_id"])
+                    current_source = await self._fetch_source(record)
+                    current_rotation = (
+                        self._rotation_targets(current_source, record, current_settings)
+                        if current_source is not None
+                        else None
+                    )
+                    current_replacement = await self._fetch_bot_message(
                         record["guild_id"],
                         record["channel_id"],
                         payload.message_id,
                         source_message_id=record["source_message_id"],
                     )
-                    inert = deleted
-                    if not deleted:
-                        inert = True
-                        try:
-                            await replacement.edit(view=None)
-                        except Exception:
-                            inert = False
-                        try:
-                            await replacement.clear_reactions()
-                        except Exception:
-                            inert = False
-                    if inert:
-                        await self._remove_records({payload.message_id})
-                    else:
-                        log.warning(
-                            "embedfixer retained replacement authority after rotation cleanup failed"
+                    if (
+                        records.get(str(payload.message_id)) != record
+                        or current_settings != settings
+                        or current_source is None
+                        or self._source_snapshot(current_source) != source_snapshot
+                        or current_rotation is None
+                        or current_rotation[2].id != next_method.id
+                        or current_replacement is None
+                        or not self._has_expected_embed(
+                            current_replacement,
+                            new_target.fixed_url,
                         )
+                    ):
+                        raise RuntimeError("rotation state changed")
+                    updated = copy.deepcopy(records)
+                    updated[str(payload.message_id)]["method_id"] = next_method.id
+                    try:
+                        await self._set_replacement_records(updated)
+                    except Exception:
+                        current_records = await self._replacement_records()
+                        if current_records.get(str(payload.message_id)) != updated[str(payload.message_id)]:
+                            raise
+                    committed = True
+            except Exception:
+                async with self._s3_lock:
+                    current_records = await self._replacement_records()
+                    current_record = current_records.get(str(payload.message_id))
+                    if current_record != record:
+                        return
+                try:
+                    await replacement.edit(content=old_content, view=old_view)
+                    rollback = await self._confirm_embed(replacement, old_embed_urls)
+                except Exception:
+                    rollback = False
+                cleanup_record: dict[str, Any] | None = None
+                async with self._s3_lock:
+                    current_records = await self._replacement_records()
+                    current_record = current_records.get(str(payload.message_id))
+                    if current_record == record:
+                        if not rollback:
+                            cleanup_record = record
+                    else:
+                        # A different authority may be in-flight; the stale
+                        # transaction must not roll it back or clean it up.
+                        cleanup_record = None
+                if cleanup_record is not None:
+                    async with self._s3_lock:
+                        records = await self._replacement_records()
+                        if records.get(str(payload.message_id)) != cleanup_record:
+                            cleanup_record = None
+                        else:
+                            cleanup_message = await self._fetch_bot_message(
+                                cleanup_record["guild_id"],
+                                cleanup_record["channel_id"],
+                                payload.message_id,
+                                source_message_id=cleanup_record["source_message_id"],
+                            )
+                            records = await self._replacement_records()
+                            if records.get(str(payload.message_id)) != cleanup_record:
+                                cleanup_record = None
+                            else:
+                                deleted = await self._delete_bot_message(
+                                    cleanup_record["guild_id"],
+                                    cleanup_record["channel_id"],
+                                    payload.message_id,
+                                    source_message_id=cleanup_record["source_message_id"],
+                                    channel_hint=getattr(cleanup_message, "channel", None),
+                                )
+                                inert = deleted
+                                if not deleted and cleanup_message is not None:
+                                    inert = True
+                                    try:
+                                        await cleanup_message.edit(view=None)
+                                    except Exception:
+                                        inert = False
+                                    try:
+                                        await cleanup_message.clear_reactions()
+                                    except Exception:
+                                        inert = False
+                                if inert:
+                                    records = await self._replacement_records()
+                                    if records.get(str(payload.message_id)) == cleanup_record:
+                                        await self._remove_records({payload.message_id})
+                                else:
+                                    log.warning(
+                                        "embedfixer retained replacement authority after rotation cleanup failed"
+                                    )
+            if committed:
+                return
         finally:
             try:
                 await replacement.remove_reaction(ROTATE_EMOJI, reactor)
@@ -3096,6 +3241,9 @@ class EmbedFixer(commands.Cog):
         bot_id = getattr(getattr(self.bot, "user", None), "id", None)
         if payload.user_id == bot_id:
             return
+        rotate = False
+        rotation_record: dict[str, Any] | None = None
+        rotation_settings: dict[str, Any] | None = None
         async with self._s3_lock:
             records = await self._replacement_records()
             record = records.get(str(payload.message_id))
@@ -3109,9 +3257,10 @@ class EmbedFixer(commands.Cog):
             emoji = str(payload.emoji)
             delete_emoji = settings.get("delete_msg_emoji", "❌")
             if emoji == ROTATE_EMOJI and settings.get("rotate_fix_reaction", False):
-                await self._rotate_record(payload, record, settings)
-                return
-            if emoji == delete_emoji:
+                rotate = True
+                rotation_record = copy.deepcopy(record)
+                rotation_settings = copy.deepcopy(settings)
+            elif emoji == delete_emoji:
                 if (
                     not settings.get("disable_delete_reaction", False)
                     and payload.user_id == record["author_id"]
@@ -3124,10 +3273,11 @@ class EmbedFixer(commands.Cog):
                 ):
                     await self._remove_records({payload.message_id})
                 return
-            if emoji == ROTATE_EMOJI:
-                await self._rotate_record(payload, record, settings)
-                return
-            await self._notify_author(payload, record)
+            else:
+                await self._notify_author(payload, record)
+        if rotate and rotation_record is not None and rotation_settings is not None:
+            await self._rotate_record(payload, rotation_record, rotation_settings)
+            return
 
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
