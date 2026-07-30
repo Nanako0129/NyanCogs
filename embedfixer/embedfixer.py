@@ -3650,9 +3650,7 @@ class EmbedFixer(commands.Cog):
         finally:
             self._discard_author(author_id, token)
 
-    @commands.hybrid_group(name="embedfixer", aliases=["ef"], invoke_without_command=True)
-    async def embedfixer_group(self, ctx: commands.Context) -> None:
-        """Show or change EmbedFixer settings."""
+    async def _send_settings(self, ctx: commands.Context) -> None:
         async with self._s3_lock:
             user = await self._scope_values(self.config.user(ctx.author), DEFAULT_USER_SETTINGS)
             guild = (
@@ -3690,6 +3688,21 @@ class EmbedFixer(commands.Cog):
         if getattr(ctx, "interaction", None) is not None:
             kwargs["ephemeral"] = True
         await ctx.send(**kwargs)
+
+    @commands.hybrid_group(name="embedfixer", aliases=["ef"], invoke_without_command=True)
+    async def embedfixer_group(self, ctx: commands.Context) -> None:
+        """Show or change EmbedFixer settings."""
+        await self._send_settings(ctx)
+
+    @embedfixer_group.command(name="settings", with_app_command=False)
+    async def embedfixer_settings(self, ctx: commands.Context) -> None:
+        """Show the current EmbedFixer settings."""
+        await self._send_settings(ctx)
+
+    @embedfixer_group.command(name="help", with_app_command=False)
+    async def embedfixer_help(self, ctx: commands.Context) -> None:
+        """Show every EmbedFixer setting command."""
+        await ctx.send_help(ctx.command.parent)
 
     @embedfixer_group.command(name="ignoreme")
     async def embedfixer_ignoreme(self, ctx: commands.Context, state: bool | None = None) -> None:
@@ -3747,6 +3760,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_enable(self, ctx: commands.Context, state: bool) -> None:
+        """Enable or disable automatic embed fixing in this server."""
         async with self._s3_lock:
             await self.config.guild(ctx.guild).enabled.set(state)
             await ctx.tick()
@@ -3755,6 +3769,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_mode(self, ctx: commands.Context, mode: str) -> None:
+        """Choose how fixed links are sent in this server."""
         mode = mode.casefold()
         if mode not in FIX_MODES:
             await self._plain(ctx, "Mode must be delete_and_resend, reply, or resend.", ephemeral=True)
@@ -3767,6 +3782,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_deletecontrols(self, ctx: commands.Context, state: bool) -> None:
+        """Enable or disable author delete controls."""
         async with self._s3_lock:
             await self.config.guild(ctx.guild).disable_delete_reaction.set(not state)
             await ctx.tick()
@@ -3775,6 +3791,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_deleteemoji(self, ctx: commands.Context, emoji: str) -> None:
+        """Choose the reaction used for author delete controls."""
         if emoji == ROTATE_EMOJI:
             await self._plain(ctx, "Delete emoji cannot be the rotate emoji.", ephemeral=True)
             return
@@ -3789,6 +3806,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_rotate(self, ctx: commands.Context, state: bool) -> None:
+        """Enable or disable provider rotation controls."""
         async with self._s3_lock:
             await self.config.guild(ctx.guild).rotate_fix_reaction.set(state)
             await ctx.tick()
@@ -3797,6 +3815,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_reactiontimeout(self, ctx: commands.Context, value: str) -> None:
+        """Set when delete reactions are removed, or turn it off."""
         if value.casefold() == "off":
             timeout = None
         else:
@@ -3815,6 +3834,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_originallink(self, ctx: commands.Context, state: bool) -> None:
+        """Show or hide the original-link button."""
         async with self._s3_lock:
             await self.config.guild(ctx.guild).show_original_link_btn.set(state)
             await ctx.tick()
@@ -3823,6 +3843,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_domain(self, ctx: commands.Context, domain_name: str, state: str) -> None:
+        """Enable, disable, or reset fixing for a social platform."""
         domain = _resolve_domain(domain_name)
         state = state.casefold()
         if domain is None or state not in {"default", "enable", "disable"}:
@@ -3854,6 +3875,7 @@ class EmbedFixer(commands.Cog):
         domain_name: str,
         provider: str = "default",
     ) -> None:
+        """Choose the fix provider for a social platform."""
         domain = _resolve_domain(domain_name)
         if domain is None:
             await self._plain(ctx, "Unknown domain.", ephemeral=True)
@@ -3883,6 +3905,7 @@ class EmbedFixer(commands.Cog):
         state: str,
         channel: discord.TextChannel | None = None,
     ) -> None:
+        """Allow, block, or reset embed fixing in a channel."""
         state = state.casefold()
         channel = channel or ctx.channel
         if state not in {"allow", "block", "clear"} or getattr(channel, "id", None) is None:
@@ -3953,6 +3976,7 @@ class EmbedFixer(commands.Cog):
         action: str,
         channel: discord.TextChannel | None = None,
     ) -> None:
+        """Add or remove a media extraction channel."""
         await self._update_channel_setting(
             ctx,
             setting="extract_media_channels",
@@ -3969,6 +3993,7 @@ class EmbedFixer(commands.Cog):
         action: str,
         channel: discord.TextChannel | None = None,
     ) -> None:
+        """Add or remove a channel that shows post content."""
         await self._update_channel_setting(
             ctx,
             setting="show_post_content_channels",
@@ -3985,6 +4010,7 @@ class EmbedFixer(commands.Cog):
         action: str,
         channel: discord.TextChannel | None = None,
     ) -> None:
+        """Add or remove a channel exempt from automatic spoilers."""
         await self._update_channel_setting(
             ctx,
             setting="disable_image_spoilers",
@@ -4001,6 +4027,7 @@ class EmbedFixer(commands.Cog):
         action: str,
         channel: discord.TextChannel | None = None,
     ) -> None:
+        """Send fixed posts to a target channel, or clear it."""
         action = action.casefold()
         if action not in {"set", "clear"}:
             await self._plain(ctx, "Action must be set or clear.", ephemeral=True)
@@ -4032,6 +4059,7 @@ class EmbedFixer(commands.Cog):
         ctx: commands.Context,
         language: str,
     ) -> None:
+        """Set the post translation language, or disable translation."""
         if language.casefold() in {"clear", "disable", "none", "off"}:
             normalized = None
         else:
@@ -4060,6 +4088,7 @@ class EmbedFixer(commands.Cog):
         ctx: commands.Context,
         state: bool,
     ) -> None:
+        """Allow or deny fixing messages sent by bots."""
         async with self._s3_lock:
             await self.config.guild(ctx.guild).bot_visibility.set(state)
             await ctx.tick()
@@ -4073,6 +4102,7 @@ class EmbedFixer(commands.Cog):
         action: str,
         role: discord.Role | None = None,
     ) -> None:
+        """Add or remove a role allowed to use automatic fixing."""
         action = action.casefold()
         if action not in {"add", "remove", "clear"} or (action != "clear" and role is None):
             await self._plain(ctx, "Action must be add, remove, or clear.", ephemeral=True)
@@ -4098,6 +4128,7 @@ class EmbedFixer(commands.Cog):
         member: discord.Member,
         state: bool,
     ) -> None:
+        """Ignore or restore automatic fixing for a member."""
         async with self._s3_lock:
             scope = self.config.guild(ctx.guild)
             ignored = _normalize_ids(await _value(scope, "ignored_users", []))
@@ -4112,6 +4143,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_reset(self, ctx: commands.Context) -> None:
+        """Reset every server setting to its default."""
         async with self._s3_lock:
             await self.config.guild(ctx.guild).set(copy.deepcopy(DEFAULT_GUILD_SETTINGS))
             await ctx.tick()
@@ -4120,6 +4152,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_export(self, ctx: commands.Context) -> None:
+        """Export portable server settings as JSON."""
         async with self._s3_lock:
             settings = await self._scope_values(self.config.guild(ctx.guild), DEFAULT_GUILD_SETTINGS)
             payload = json.dumps(_export_payload(settings), ensure_ascii=False, indent=2).encode("utf-8")
@@ -4139,6 +4172,7 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_import(self, ctx: commands.Context, attachment: discord.Attachment) -> None:
+        """Import portable server settings from a JSON attachment."""
         if attachment.size > MAX_IMPORT_BYTES:
             await self._plain(ctx, "Invalid settings file.", ephemeral=True)
             return
