@@ -3707,6 +3707,35 @@ class SettingsTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_settings_and_help_subcommands_are_routed(self):
+        self.assertTrue(
+            all(command.short_doc for command in EmbedFixer.embedfixer_group.commands)
+        )
+
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            cog = _s3_cog(config, channel)
+            settings_ctx = SimpleNamespace(
+                author=SimpleNamespace(id=22),
+                guild=channel.guild,
+                interaction=None,
+                embed_colour=AsyncMock(return_value=discord.Colour.blurple()),
+                send=AsyncMock(),
+            )
+            await EmbedFixer.embedfixer_settings.callback(cog, settings_ctx)
+            self.assertIsInstance(settings_ctx.send.await_args.kwargs["embed"], discord.Embed)
+
+            parent = EmbedFixer.embedfixer_group
+            help_ctx = SimpleNamespace(
+                command=SimpleNamespace(parent=parent),
+                send_help=AsyncMock(),
+            )
+            await EmbedFixer.embedfixer_help.callback(cog, help_ctx)
+            help_ctx.send_help.assert_awaited_once_with(parent)
+
+        asyncio.run(scenario())
+
     def test_upstream_import_roundtrip_and_legacy_normalization(self):
         payload = {
             "guild_settings": {
