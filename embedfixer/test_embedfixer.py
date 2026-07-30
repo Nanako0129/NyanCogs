@@ -130,7 +130,7 @@ class ProviderInventoryTests(unittest.TestCase):
         targets = fixed_targets("https://x.com/alice/status/1")
         self.assertEqual(len(targets), 1)
         rendered = format_fixed(targets[0])
-        self.assertEqual(rendered, "[Tweet](https://fixupx.com/alice/status/1) • [@alice](https://x.com/alice) • [FxTwitter](https://fixupx.com/alice/status/1)")
+        self.assertEqual(rendered, "[Tweet](https://fixupx.com/alice/status/1) • [@alice](<https://x.com/alice>) • [FxTwitter](https://fixupx.com/alice/status/1)")
         better = fixed_targets("https://x.com/alice/status/1", provider_choices={"1": 2})[0]
         self.assertIn("[vxTwitter](https://fixvx.com/alice/status/1)", format_fixed(better))
         bluesky = fixed_targets("https://bsky.app/profile/alice/post/1", provider_choices={"9": 14})[0]
@@ -3640,8 +3640,9 @@ class SecurityS4Tests(unittest.TestCase):
         source = (Path(__file__).parent / "embedfixer.py").read_text(
             encoding="utf-8"
         )
-        for forbidden in ("import tempfile", "import zipfile", "ffmpeg", "discord.Embed("):
+        for forbidden in ("import tempfile", "import zipfile", "ffmpeg"):
             self.assertNotIn(forbidden, source)
+        self.assertEqual(source.count("discord.Embed("), 1)
         provider_source = "\n".join(
             inspect.getsource(method)
             for method in (
@@ -3674,6 +3675,38 @@ class SecurityS4Tests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_settings_overview_uses_embed(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            config.guilds[9] = copy.deepcopy(DEFAULT_GUILD_SETTINGS)
+            config.guilds[9]["fix_mode"] = "reply"
+            config.users[22] = copy.deepcopy(DEFAULT_USER_SETTINGS)
+            config.users[22]["fix_mode"] = "resend"
+            cog = _s3_cog(config, channel)
+            ctx = SimpleNamespace(
+                author=SimpleNamespace(id=22),
+                guild=channel.guild,
+                interaction=None,
+                embed_colour=AsyncMock(return_value=discord.Colour.blurple()),
+                send=AsyncMock(),
+            )
+
+            await EmbedFixer.embedfixer_group.callback(cog, ctx)
+
+            ctx.send.assert_awaited_once()
+            kwargs = ctx.send.await_args.kwargs
+            self.assertNotIn("content", kwargs)
+            self.assertIsInstance(kwargs["embed"], discord.Embed)
+            self.assertEqual(kwargs["embed"].title, "EmbedFixer Settings")
+            fields = {field.name: field.value for field in kwargs["embed"].fields}
+            self.assertEqual(fields["Cog status"], "✅ Enabled")
+            self.assertEqual(fields["Guild mode"], "`reply`")
+            self.assertEqual(fields["Your mode"], "`resend`")
+            self.assertEqual(fields["Automatic fixing"], "✅ Enabled")
+
+        asyncio.run(scenario())
+
     def test_upstream_import_roundtrip_and_legacy_normalization(self):
         payload = {
             "guild_settings": {
