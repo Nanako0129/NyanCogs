@@ -1,0 +1,19 @@
+{
+    "name": "EmbedFixer",
+    "author": [
+        "Nyanako",
+        "seriaati (upstream embed-fixer)"
+    ],
+    "short": "Post safe fixed links for social embeds.",
+    "description": "Automatically or manually posts provider-fixed links under the bot identity, supports Red-native guild and user settings, and suppresses the original embed only after Discord confirms each replacement.",
+    "install_msg": "Load with `[p]load embedfixer`, grant Manage Messages and Embed Links where it runs, then use `[p]help embedfixer`.",
+    "tags": [
+        "embeds",
+        "links",
+        "utility"
+    ],
+    "min_bot_version": "3.5.24",
+    "min_python_version": [3, 11, 0],
+    "requirements": [],
+    "end_user_data_statement": "This cog stores per-guild and per-user settings and a global replacement ownership map whose keys are replacement message IDs and whose values contain guild, channel, author, optional source message IDs, optional source edit timestamps, target indexes, domain and method IDs, and creation timestamps. If a Config write is interrupted after a replacement is sent, the same minimal record may be kept temporarily in memory so ownership controls remain available; a later successful write persists it. These records authorize replacement controls and generic reaction notifications; they never contain message content, full URLs, or provider responses. When media extraction is requested, bounded provider metadata, media URLs, and optional sanitized text are processed transiently and are never stored or cached; full source and media URLs are never logged. Records are capped at 1,000 per guild and 10,000 globally: a guild evicts only its own oldest records when over its cap, while a full global cap rejects new records without evicting another guild. Confirmed replacement-message deletion removes its record; source messages are never deleted. Red's user data deletion removes that user's settings, ownership records, and notification throttles."
+}
