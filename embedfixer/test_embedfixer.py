@@ -10,7 +10,7 @@ import json
 import socket
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -21,6 +21,7 @@ from .embedfixer import (
     DEFAULT_GLOBAL_SETTINGS,
     DEFAULT_GUILD_SETTINGS,
     DEFAULT_USER_SETTINGS,
+    DISCORD_MESSAGE_CHARS,
     EmbedFixer,
     MediaCandidate,
     MetadataResolver,
@@ -140,6 +141,30 @@ class ProviderInventoryTests(unittest.TestCase):
         self.assertEqual(fixed_targets("https://youtube.com/watch?v=abc"), [])
         self.assertEqual(DEFAULT_GUILD_SETTINGS["schema_version"], 1)
         self.assertEqual(DEFAULT_USER_SETTINGS["schema_version"], 1)
+
+    def test_ordinary_rows_reject_only_overlong_fixed_targets(self) -> None:
+        short_url = f"https://x.com/{'a' * 850}/status/1"
+        short_target = fixed_targets(short_url)[0]
+        self.assertLessEqual(len(format_fixed(short_target)), DISCORD_MESSAGE_CHARS)
+        self.assertEqual(len(EmbedFixer._targets(short_url, DEFAULT_GUILD_SETTINGS)), 1)
+
+        long_url = f"https://x.com/{'a' * 1000}/status/1"
+        long_target = fixed_targets(long_url)[0]
+        self.assertGreater(len(format_fixed(long_target)), DISCORD_MESSAGE_CHARS)
+        self.assertEqual(EmbedFixer._targets(long_url, DEFAULT_GUILD_SETTINGS), [])
+
+    def test_source_domain_matching_normalizes_host_but_not_path_case(self) -> None:
+        twitter = next(domain for domain in DOMAINS if domain.id == DomainId.TWITTER)
+        pixiv = next(domain for domain in DOMAINS if domain.id == DomainId.PIXIV)
+        self.assertIs(
+            source_domain_for("HTTPS://X.COM/alice/status/1#fragment"),
+            twitter,
+        )
+        self.assertIs(
+            source_domain_for("hTtPs://PIXIV.NET/artworks/123"),
+            pixiv,
+        )
+        self.assertIsNone(source_domain_for("https://pixiv.net/ARTWORKS/123"))
 
 
 class _Sent:
@@ -884,6 +909,60 @@ class SecurityS3Tests(unittest.TestCase):
         asyncio.run(scenario("persist"))
         asyncio.run(scenario("controls"))
 
+    def test_controls_run_without_s3_lock_and_settings_mutation_cleans_up(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            cog = _s3_cog(config, channel)
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            replacement = None
+            original_send = channel.send
+
+            async def send(*args, **kwargs):
+                nonlocal replacement
+                replacement = await original_send(*args, **kwargs)
+                original_edit = replacement.edit
+
+                async def edit(**edit_kwargs):
+                    entered.set()
+                    await release.wait()
+                    return await original_edit(**edit_kwargs)
+
+                replacement.edit = edit
+                return replacement
+
+            channel.send = send
+            task = asyncio.create_task(
+                cog._process(
+                    source,
+                    fixed_targets(source.content),
+                    guild=source.guild,
+                    author=source.author,
+                    channel=channel,
+                    guild_settings=copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                )
+            )
+            await entered.wait()
+            acquired = asyncio.Event()
+
+            async def probe_lock():
+                async with cog._s3_lock:
+                    acquired.set()
+
+            probe = asyncio.create_task(probe_lock())
+            await acquired.wait()
+            config.guilds[9]["fix_mode"] = "reply"
+            release.set()
+            self.assertFalse(await task)
+            await probe
+            self.assertEqual(config.global_data["replacement_records"], {})
+            self.assertEqual(source.edits, [])
+            self.assertTrue(replacement.deleted)
+
+        asyncio.run(scenario())
+
     def test_final_revalidation_refetches_after_config_reads(self):
         async def scenario():
             config = _TestConfig()
@@ -1505,6 +1584,72 @@ class SecurityS3Tests(unittest.TestCase):
             self.assertTrue(all(task.done() for task in tasks))
             self.assertEqual(cog._notify_pairs, {})
             self.assertEqual(cog._notify_recipients, {})
+
+        asyncio.run(scenario())
+
+    def test_sr04_cog_load_restores_remaining_expired_and_policy_checked_timeouts(self):
+        async def scenario():
+            now = datetime.now(timezone.utc)
+
+            async def loaded(record, settings):
+                config = _TestConfig()
+                key = str(record[0]) if isinstance(record, tuple) else "100"
+                value = record[1] if isinstance(record, tuple) else record
+                config.global_data["replacement_records"] = {key: value}
+                config.guilds[9] = copy.deepcopy(settings)
+                cog = _s3_cog(config, _Channel())
+                await cog.cog_load()
+                return config, cog, key
+
+            settings = copy.deepcopy(DEFAULT_GUILD_SETTINGS)
+            settings["remove_delete_reaction_after"] = 60
+            _, cog, key = await loaded(
+                _record(
+                    100,
+                    source_message_id=None,
+                    created_at=(now - timedelta(seconds=5)).isoformat(),
+                ),
+                settings,
+            )
+            self.assertIn(100, cog._reaction_tasks)
+            remaining_task = cog._reaction_tasks[100]
+            await cog.cog_unload()
+            self.assertTrue(remaining_task.cancelled())
+            self.assertNotIn(100, cog._reaction_tasks)
+
+            expired_config, expired_cog, _ = await loaded(
+                _record(
+                    101,
+                    source_message_id=None,
+                    created_at=(now - timedelta(seconds=120)).isoformat(),
+                ),
+                settings,
+            )
+            expired_task = expired_cog._reaction_tasks[101]
+            await expired_task
+            self.assertTrue(expired_task.done())
+            await expired_cog.cog_unload()
+            self.assertIn("101", expired_config.global_data["replacement_records"])
+
+            disabled = copy.deepcopy(settings)
+            disabled["disable_delete_reaction"] = True
+            _, disabled_cog, _ = await loaded(_record(102, source_message_id=None), disabled)
+            self.assertNotIn(102, disabled_cog._reaction_tasks)
+            await disabled_cog.cog_unload()
+
+            changed_config, changed_cog, _ = await loaded(
+                _record(
+                    103,
+                    source_message_id=None,
+                    created_at=(now - timedelta(seconds=120)).isoformat(),
+                ),
+                settings,
+            )
+            changed_config.guilds[9]["disable_delete_reaction"] = True
+            changed_task = changed_cog._reaction_tasks[103]
+            await changed_task
+            self.assertTrue(changed_task.done())
+            await changed_cog.cog_unload()
 
         asyncio.run(scenario())
 
@@ -3679,9 +3824,19 @@ class SettingsTests(unittest.TestCase):
         class Scope:
             def __init__(self):
                 self.writes = []
+                self.current = {
+                    **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                    "enabled": False,
+                    "ignored_users": [42],
+                    "provider_choices": {"1": 2},
+                }
+
+            async def all(self):
+                return copy.deepcopy(self.current)
 
             async def set(self, value):
                 self.writes.append(value)
+                self.current = copy.deepcopy(value)
 
         scope = Scope()
         cog = EmbedFixer.__new__(EmbedFixer)
@@ -3691,12 +3846,21 @@ class SettingsTests(unittest.TestCase):
             guild=object(),
             interaction=None,
             tick=lambda: asyncio.sleep(0),
+            send=lambda *_args, **_kwargs: asyncio.sleep(0),
         )
         asyncio.run(
             EmbedFixer.embedfixer_import.callback(cog, ctx, Attachment())
         )
         self.assertEqual(len(scope.writes), 1)
         self.assertEqual(scope.writes[0]["provider_choices"], {})
+        self.assertFalse(scope.writes[0]["enabled"])
+        self.assertEqual(scope.writes[0]["ignored_users"], [42])
+
+        payload = {"guild_settings": {"unknown": True}, "fix_methods": []}
+        asyncio.run(
+            EmbedFixer.embedfixer_import.callback(cog, ctx, Attachment())
+        )
+        self.assertEqual(len(scope.writes), 1)
 
     def test_context_menu_lifecycle_removes_only_owned_command(self):
         class Tree:

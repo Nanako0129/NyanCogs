@@ -1157,37 +1157,76 @@ class EmbedFixer(commands.Cog):
                 trust_env=False,
             )
         tree = getattr(self.bot, "tree", None)
-        if tree is None:
-            return
         menus = (
             ("_context_menu", "_context_menu_registered"),
             ("_extract_context_menu", "_extract_context_menu_registered"),
         )
         try:
-            for menu_name, state_name in menus:
-                menu = getattr(self, menu_name, None)
-                if menu is None:
-                    continue
-                current = tree.get_command(
-                    menu.name,
-                    type=discord.AppCommandType.message,
-                )
-                if current is menu:
-                    setattr(self, state_name, True)
-                elif current is not None:
-                    log.warning(
-                        "EmbedFixer context menus were not registered because a name is already in use"
+            if tree is not None:
+                menu_conflict = False
+                for menu_name, state_name in menus:
+                    menu = getattr(self, menu_name, None)
+                    if menu is None:
+                        continue
+                    current = tree.get_command(
+                        menu.name,
+                        type=discord.AppCommandType.message,
                     )
-                    return
-            for menu_name, state_name in menus:
-                menu = getattr(self, menu_name, None)
-                if menu is None or getattr(self, state_name, False):
-                    continue
-                setattr(self, state_name, True)
-                tree.add_command(menu)
+                    if current is menu:
+                        setattr(self, state_name, True)
+                    elif current is not None:
+                        log.warning(
+                            "EmbedFixer context menus were not registered because a name is already in use"
+                        )
+                        menu_conflict = True
+                        break
+                if not menu_conflict:
+                    for menu_name, state_name in menus:
+                        menu = getattr(self, menu_name, None)
+                        if menu is None or getattr(self, state_name, False):
+                            continue
+                        setattr(self, state_name, True)
+                        tree.add_command(menu)
+            await self._restore_reaction_timeouts()
         except Exception:
             await self.cog_unload()
             raise
+
+    async def _restore_reaction_timeouts(self) -> None:
+        self._ensure_s3_runtime()
+        async with self._s3_lock:
+            records = await self._stored_replacement_records()
+            restored = 0
+            guild_counts: dict[int, int] = {}
+            now = datetime.now(timezone.utc)
+            for message_id, record in records.items():
+                if restored >= MAX_GLOBAL_RECORDS:
+                    break
+                guild_id = record["guild_id"]
+                if guild_counts.get(guild_id, 0) >= MAX_GUILD_RECORDS:
+                    continue
+                settings = await self._guild_settings_from_id(guild_id)
+                timeout = settings.get("remove_delete_reaction_after")
+                if (
+                    settings.get("disable_delete_reaction", False)
+                    or isinstance(timeout, bool)
+                    or not isinstance(timeout, int)
+                    or not 0 <= timeout <= 86400
+                ):
+                    continue
+                try:
+                    created_at = datetime.fromisoformat(record["created_at"])
+                except (TypeError, ValueError):
+                    continue
+                remaining = max(0.0, timeout - (now - created_at).total_seconds())
+                self._track_reaction_timeout(
+                    int(message_id),
+                    record,
+                    settings,
+                    delay=remaining,
+                )
+                restored += 1
+                guild_counts[guild_id] = guild_counts.get(guild_id, 0) + 1
 
     async def cog_unload(self) -> None:
         self._ensure_s3_runtime()
@@ -1475,15 +1514,17 @@ class EmbedFixer(commands.Cog):
 
     @staticmethod
     def _targets(content: str, guild_settings: dict[str, Any]) -> list[FixedTarget]:
-        return [
-            _translate_target(target, guild_settings)
-            for target in fixed_targets(
-                content,
-                provider_choices=guild_settings.get("provider_choices", {}),
-                disabled_domains=guild_settings.get("disabled_domains", []),
-                enabled_domains=guild_settings.get("enabled_domains", []),
-            )
-        ]
+        targets: list[FixedTarget] = []
+        for target in fixed_targets(
+            content,
+            provider_choices=guild_settings.get("provider_choices", {}),
+            disabled_domains=guild_settings.get("disabled_domains", []),
+            enabled_domains=guild_settings.get("enabled_domains", []),
+        ):
+            translated = _translate_target(target, guild_settings)
+            if len(format_fixed(translated)) <= DISCORD_MESSAGE_CHARS:
+                targets.append(translated)
+        return targets
 
     async def _metadata_json(self, url: str) -> Any | None:
         session = getattr(self, "_session", None)
@@ -2469,6 +2510,8 @@ class EmbedFixer(commands.Cog):
         message_id: int,
         record: dict[str, Any],
         settings: dict[str, Any],
+        *,
+        delay: float | None = None,
     ) -> None:
         self._ensure_s3_runtime()
         previous = self._reaction_tasks.pop(message_id, None)
@@ -2482,13 +2525,15 @@ class EmbedFixer(commands.Cog):
             or not 0 <= timeout <= 86400
         ):
             return
-        emoji = settings.get("delete_msg_emoji", "❌")
-        if not isinstance(emoji, str) or not emoji:
+        try:
+            emoji = _validated_delete_emoji(settings.get("delete_msg_emoji", "❌"))
+        except ValueError:
             return
+        sleep_for = timeout if delay is None else min(timeout, max(0.0, delay))
 
         async def expire() -> None:
             try:
-                await asyncio.sleep(timeout)
+                await asyncio.sleep(sleep_for)
                 async with self._s3_lock:
                     records = await self._replacement_records()
                     current = records.get(str(message_id))
@@ -2772,6 +2817,28 @@ class EmbedFixer(commands.Cog):
                     validated_destination,
                 )
 
+            async def suppress_original() -> bool:
+                if not may_suppress or message is None:
+                    return True
+                if (
+                    not persistent_context
+                    and expected_source is not None
+                    and await self._refetch_snapshot(message, expected_source) is None
+                ):
+                    await cleanup()
+                    return False
+                try:
+                    # Suppression is the only mutation allowed on the original message.
+                    await message.edit(suppress=True)
+                except Exception as error:
+                    if (
+                        self._definitive_rejection(error)
+                        and await self._refetch_unsuppressed(message) is True
+                    ):
+                        await cleanup()
+                    return False
+                return True
+
             try:
                 # Sending and provider preview polling intentionally happen without _s3_lock.
                 for target in targets:
@@ -2805,6 +2872,7 @@ class EmbedFixer(commands.Cog):
                     await cleanup()
                 return confirmed_count > 0 if not persistent_context and message is None else False
 
+            persisted_records: dict[str, dict[str, Any]] = {}
             async with self._s3_lock:
                 try:
                     validation = await revalidate()
@@ -2845,41 +2913,73 @@ class EmbedFixer(commands.Cog):
                             await cleanup()
                             return False
                         settings = validation[3]
-                        by_id = {int(message_id): record for message_id, record in records.items()}
-                        for replacement, target in sorted(
-                            zip(sent, targets, strict=True),
-                            key=lambda item: item[0].id,
+                        persisted_records = copy.deepcopy(records)
+                except asyncio.CancelledError:
+                    await cleanup()
+                    raise
+                except Exception:
+                    await cleanup()
+                    return False if message is not None or persistent_context else confirmed_count > 0
+
+            if persistent_context:
+                by_id = {
+                    int(message_id): record
+                    for message_id, record in persisted_records.items()
+                }
+                try:
+                    for replacement, target in sorted(
+                        zip(sent, targets, strict=True),
+                        key=lambda item: item[0].id,
+                    ):
+                        await self._add_controls(
+                            replacement,
+                            target,
+                            by_id[replacement.id],
+                            settings,
+                        )
+                except asyncio.CancelledError:
+                    async with self._s3_lock:
+                        await cleanup()
+                    raise
+                except Exception:
+                    async with self._s3_lock:
+                        await cleanup()
+                    return False if message is not None or persistent_context else confirmed_count > 0
+
+                async with self._s3_lock:
+                    try:
+                        validation = await revalidate()
+                        current_records = await self._replacement_records()
+                        if validation is None or any(
+                            current_records.get(message_id) != record
+                            for message_id, record in persisted_records.items()
                         ):
-                            await self._add_controls(
-                                replacement,
-                                target,
-                                by_id[replacement.id],
-                                settings,
-                            )
+                            await cleanup()
+                            return False
+                        settings = validation[3]
                         for replacement in sorted(sent, key=lambda item: item.id):
                             self._track_reaction_timeout(
                                 replacement.id,
                                 by_id[replacement.id],
                                 settings,
                             )
-
                         if await revalidate() is None:
                             await cleanup()
                             return False
+                        return await suppress_original()
+                    except asyncio.CancelledError:
+                        await cleanup()
+                        raise
+                    except Exception:
+                        await cleanup()
+                        return False if message is not None or persistent_context else confirmed_count > 0
 
-                    if not may_suppress or message is None:
-                        return True
-                    if not persistent_context and expected_source is not None and await self._refetch_snapshot(message, expected_source) is None:
+            async with self._s3_lock:
+                try:
+                    if await revalidate() is None:
                         await cleanup()
                         return False
-                    try:
-                        # Suppression is the only mutation allowed on the original message.
-                        await message.edit(suppress=True)
-                    except Exception as error:
-                        if self._definitive_rejection(error) and await self._refetch_unsuppressed(message) is True:
-                            await cleanup()
-                        return False
-                    return True
+                    return await suppress_original()
                 except asyncio.CancelledError:
                     await cleanup()
                     raise
@@ -4039,7 +4139,14 @@ class EmbedFixer(commands.Cog):
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, KeyError):
                 await self._plain(ctx, "Invalid settings file.", ephemeral=True)
                 return
-            await self.config.guild(ctx.guild).set(validated)
+            scope = self.config.guild(ctx.guild)
+            current = await self._scope_values(scope, DEFAULT_GUILD_SETTINGS)
+            current = _normalize_legacy_settings(current)[0]
+            merged = copy.deepcopy(current)
+            for name in PORTABLE_GUILD_SETTINGS:
+                merged[name] = copy.deepcopy(validated[name])
+            merged["provider_choices"] = copy.deepcopy(validated["provider_choices"])
+            await scope.set(merged)
             await ctx.tick()
 
     @commands.Cog.listener()

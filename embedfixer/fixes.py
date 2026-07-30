@@ -637,7 +637,9 @@ def source_domain_for(url: str) -> Domain | None:
         parsed = urlsplit(clean_query(url))
         # Website rules operate on the URL without a fragment; upstream
         # matching otherwise treats a fragment as trailing text.
-        candidate = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
+        candidate = urlunsplit(
+            (parsed.scheme.casefold(), host, parsed.path, parsed.query, "")
+        )
         if any(site.match(candidate) for site in domain.websites):
             return domain
     return None
