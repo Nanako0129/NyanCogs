@@ -78,7 +78,7 @@ _ESCAPE_LABEL_RE = re.compile(r"([\\\[\]()<>`])")
 _TEXT_URL_RE = re.compile(r"https?://[^\s<>]+")
 _TRANSLATION_RE = re.compile(r"[A-Za-z]{2}", re.ASCII)
 _TWITTER_SOURCE_RE = re.compile(
-    r"/([A-Za-z0-9_]{1,15})/status/([0-9]{1,20})(?:/photo/[1-9])?/?",
+    r"/([A-Za-z0-9_]{1,15})/status/([0-9]{1,20})(?:/(?:photo(?:/[1-9])?|video/[0-9]+))?/?",
     re.ASCII,
 )
 _PIXIV_SOURCE_RE = re.compile(
@@ -912,8 +912,7 @@ def _validated_import(payload: Any) -> dict[str, Any]:
         elif name == "translate_target_lang":
             value = _normalize_translation(value, strict=True)
         elif name == "delete_msg_emoji":
-            if not isinstance(value, str) or not value or len(value) > MAX_SETTING_STRING:
-                raise ValueError("invalid emoji")
+            value = _validated_delete_emoji(value)
         elif name == "funnel_target_channel":
             if value is not None:
                 value = _strict_int(value)
@@ -1047,6 +1046,14 @@ def _normalize_ids(value: Any) -> set[int]:
         except (TypeError, ValueError):
             continue
     return normalized
+
+
+def _validated_delete_emoji(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > MAX_SETTING_STRING:
+        raise ValueError("invalid emoji")
+    if value == ROTATE_EMOJI:
+        raise ValueError("delete emoji is reserved for rotation")
+    return value
 
 
 def _is_suppressed(message: Any) -> bool | None:
@@ -1229,6 +1236,40 @@ class EmbedFixer(commands.Cog):
                 await self.config.user_from_id(user_id).clear()
             except Exception as error:
                 failure = error
+            all_guilds = getattr(self.config, "all_guilds", None)
+            guild_data: dict[Any, Any] = {}
+            if callable(all_guilds):
+                try:
+                    loaded = await all_guilds()
+                    if isinstance(loaded, dict):
+                        guild_data = loaded
+                except Exception as error:
+                    failure = failure or error
+            else:
+                for guild in getattr(self.bot, "guilds", ()) or ():
+                    guild_id = _snowflake(getattr(guild, "id", None))
+                    if guild_id is None:
+                        continue
+                    try:
+                        scope = self._guild_scope_from_id(guild_id)
+                        values = await self._scope_values(scope, DEFAULT_GUILD_SETTINGS)
+                        guild_data[guild_id] = values
+                    except Exception as error:
+                        failure = failure or error
+            for raw_guild_id, raw_settings in guild_data.items():
+                guild_id = _snowflake(raw_guild_id)
+                if guild_id is None or not isinstance(raw_settings, dict):
+                    continue
+                ignored = _normalize_ids(raw_settings.get("ignored_users", []))
+                if user_id not in ignored:
+                    continue
+                updated = copy.deepcopy(raw_settings)
+                ignored.discard(user_id)
+                updated["ignored_users"] = sorted(ignored)
+                try:
+                    await self._guild_scope_from_id(guild_id).set(updated)
+                except Exception as error:
+                    failure = failure or error
             if owned_ids:
                 try:
                     await self._set_replacement_records(
@@ -1314,6 +1355,8 @@ class EmbedFixer(commands.Cog):
             return None
         bot_id = getattr(getattr(self.bot, "user", None), "id", None)
         if source is not None and getattr(author, "id", None) == bot_id:
+            return None
+        if source is not None and _is_suppressed(source) is True:
             return None
         if guild is None:
             if getattr(author, "bot", False):
@@ -1848,6 +1891,7 @@ class EmbedFixer(commands.Cog):
             snapshot.guild_settings,
         )
 
+        process_args: dict[str, Any] | None = None
         async with self._s3_lock:
             if token is not None and token.is_set():
                 return False
@@ -1892,19 +1936,23 @@ class EmbedFixer(commands.Cog):
                 or tuple(targets_now) != snapshot.targets
             ):
                 return False
-            return await self._process(
-                fresh,
-                prepared,
-                mode=self._mode(guild_settings, user_settings),
-                sender=destination.send if funnel else None,
-                guild=fresh_guild,
-                author=fresh_author,
-                channel=fresh_channel,
-                destination=destination,
-                guild_settings=guild_settings,
-                token=token,
-                _locked=True,
-            )
+            process_args = {
+                "message": fresh,
+                "targets": prepared,
+                "mode": self._mode(guild_settings, user_settings),
+                "sender": destination.send if funnel else None,
+                "guild": fresh_guild,
+                "author": fresh_author,
+                "channel": fresh_channel,
+                "destination": destination,
+                "guild_settings": guild_settings,
+                "user_settings": user_settings,
+                "token": token,
+                "source_snapshot": snapshot.source,
+            }
+        if process_args is None:
+            return False
+        return await self._process(**process_args)
 
     async def _process_extraction_without_source(
         self,
@@ -1915,6 +1963,7 @@ class EmbedFixer(commands.Cog):
         content: str,
         token: asyncio.Event | None,
     ) -> bool:
+        process_args: dict[str, Any] | None = None
         async with self._s3_lock:
             if token is not None and token.is_set():
                 return False
@@ -1984,20 +2033,23 @@ class EmbedFixer(commands.Cog):
                 != targets
             ):
                 return False
-            return await self._process(
-                None,
-                prepared,
-                mode=self._mode(guild_settings, user_settings),
-                may_suppress=False,
-                sender=destination.send,
-                guild=guild,
-                author=author,
-                channel=channel,
-                destination=destination,
-                guild_settings=guild_settings,
-                token=token,
-                _locked=True,
-            )
+            process_args = {
+                "message": None,
+                "targets": prepared,
+                "mode": self._mode(guild_settings, user_settings),
+                "may_suppress": False,
+                "sender": destination.send,
+                "guild": guild,
+                "author": author,
+                "channel": channel,
+                "destination": destination,
+                "guild_settings": guild_settings,
+                "user_settings": user_settings,
+                "token": token,
+            }
+        if process_args is None:
+            return False
+        return await self._process(**process_args)
 
     async def _stored_replacement_records(self) -> dict[str, dict[str, Any]]:
         raw = await _value(getattr(self, "config", None), "replacement_records", {})
@@ -2369,13 +2421,16 @@ class EmbedFixer(commands.Cog):
         )
         if verified is None:
             raise RuntimeError("replacement identity could not be verified")
+        emoji: str | None = None
+        if not settings.get("disable_delete_reaction", False):
+            try:
+                emoji = _validated_delete_emoji(settings.get("delete_msg_emoji", "❌"))
+            except ValueError as error:
+                raise RuntimeError("invalid delete emoji") from error
         view = self._original_link_view(target, settings)
         if view is not None:
             await verified.edit(view=view)
-        if not settings.get("disable_delete_reaction", False):
-            emoji = settings.get("delete_msg_emoji", "❌")
-            if not isinstance(emoji, str) or not emoji or len(emoji) > MAX_SETTING_STRING:
-                raise RuntimeError("invalid delete emoji")
+        if emoji is not None:
             await verified.add_reaction(emoji)
         if settings.get("rotate_fix_reaction", False) and record["source_message_id"] is not None:
             await verified.add_reaction(ROTATE_EMOJI)
@@ -2535,10 +2590,13 @@ class EmbedFixer(commands.Cog):
         channel: Any = None,
         destination: Any = None,
         guild_settings: dict[str, Any] | None = None,
+        user_settings: dict[str, Any] | None = None,
         token: asyncio.Event | None = None,
+        source_snapshot: tuple[int, int, int, int, str, str | None] | None = None,
         _locked: bool = False,
     ) -> bool:
         self._ensure_s3_runtime()
+        del _locked
         guild = guild or getattr(message, "guild", None)
         author = author or getattr(message, "author", None)
         channel = channel or getattr(message, "channel", None)
@@ -2547,11 +2605,7 @@ class EmbedFixer(commands.Cog):
         owned_token = token is None and author_id is not None
         if owned_token:
             token = self._register_author(author_id)
-
         async def run() -> bool:
-            sent: list[Any] = []
-            confirmed_count = 0
-            persisted_ids: set[int] = set()
             persistent_context = all(
                 value is not None
                 for value in (
@@ -2560,7 +2614,120 @@ class EmbedFixer(commands.Cog):
                     _snowflake(getattr(channel, "id", None)),
                 )
             )
+            expected_source = source_snapshot
+            if message is not None and expected_source is None:
+                expected_source = self._source_snapshot(message)
+            if message is not None and persistent_context and expected_source is None:
+                return False
+            expected_destination = self._destination_snapshot(destination)
+            if persistent_context and expected_destination is None:
+                return False
+            expected_guild_settings = copy.deepcopy(guild_settings) if guild_settings is not None else None
+            expected_user_settings = copy.deepcopy(user_settings) if user_settings is not None else None
+            sent: list[Any] = []
+            confirmed_count = 0
+            persisted_ids: set[int] = set()
+
+            async def cleanup() -> None:
+                if message is None and not persistent_context:
+                    return
+                if persisted_ids:
+                    await self._cleanup_persisted_replacements(message, sent, persisted_ids)
+                else:
+                    await self._cleanup_replacements(message, sent)
+
+            async def revalidate() -> tuple[Any, Any, Any, dict[str, Any], Any] | None:
+                if token is not None and (
+                    token.is_set()
+                    or token not in self._author_inflight.get(author_id, ())
+                ):
+                    return None
+                lookup_source = message
+                if message is not None and expected_source is not None:
+                    lookup_source = await self._refetch_snapshot(message, expected_source)
+                    if lookup_source is None:
+                        return None
+                lookup_guild = (
+                    getattr(lookup_source, "guild", None) or guild
+                    if message is not None
+                    else guild
+                )
+                lookup_author = (
+                    getattr(lookup_source, "author", None) or author
+                    if message is not None
+                    else author
+                )
+                lookup_channel = (
+                    getattr(lookup_source, "channel", None) or channel
+                    if message is not None
+                    else channel
+                )
+                settings = guild_settings or copy.deepcopy(DEFAULT_GUILD_SETTINGS)
+                if expected_guild_settings is not None or expected_user_settings is not None:
+                    current = await self._context_settings(
+                        guild=lookup_guild,
+                        author=lookup_author,
+                        channel=lookup_channel,
+                        source=lookup_source if message is not None else None,
+                        manage_messages=message is not None,
+                    )
+                    if current is None:
+                        return None
+                    current_guild, current_user = current
+                    if (
+                        expected_guild_settings is not None
+                        and current_guild != expected_guild_settings
+                    ) or (
+                        expected_user_settings is not None
+                        and current_user != expected_user_settings
+                    ):
+                        return None
+                    settings = current_guild
+                source_for_validation = lookup_source
+                if message is not None and expected_source is not None:
+                    source_for_validation = await self._refetch_snapshot(message, expected_source)
+                    if source_for_validation is None:
+                        return None
+                if message is not None and _is_suppressed(source_for_validation) is True:
+                    return None
+                validation_guild = (
+                    getattr(source_for_validation, "guild", None) or guild
+                    if message is not None
+                    else guild
+                )
+                validation_author = (
+                    getattr(source_for_validation, "author", None) or author
+                    if message is not None
+                    else author
+                )
+                validation_channel = (
+                    getattr(source_for_validation, "channel", None) or channel
+                    if message is not None
+                    else channel
+                )
+                validated_destination = destination
+                if expected_destination is not None and expected_user_settings is not None:
+                    resolved = self._destination_for(
+                        guild=validation_guild,
+                        source_channel=validation_channel,
+                        guild_settings=settings,
+                    )
+                    if (
+                        resolved is None
+                        or self._destination_snapshot(resolved[0]) != expected_destination
+                    ):
+                        return None
+                    validated_destination = resolved[0]
+                return (
+                    validation_guild,
+                    validation_author,
+                    validation_channel,
+                    settings,
+                    validated_destination,
+                )
+
             try:
+                # Sending and provider preview polling intentionally happen without _s3_lock.
                 for target in targets:
                     send = sender
                     kwargs: dict[str, Any] = {"allowed_mentions": discord.AllowedMentions.none()}
@@ -2570,6 +2737,8 @@ class EmbedFixer(commands.Cog):
                     if send is None and message is not None:
                         send = message.channel.send
                     if send is None:
+                        async with self._s3_lock:
+                            await cleanup()
                         return False
                     replacement = await send(
                         target.content if target.content is not None else format_fixed(target),
@@ -2577,85 +2746,102 @@ class EmbedFixer(commands.Cog):
                     )
                     sent.append(replacement)
                     if not await self._confirm_embed(replacement, target.fixed_url):
-                        if message is not None or persistent_context:
-                            await self._cleanup_replacements(message, sent)
+                        async with self._s3_lock:
+                            await cleanup()
                         return confirmed_count > 0 if not persistent_context and message is None else False
                     confirmed_count += 1
-
-                records = self._record_batch(
-                    message,
-                    sent,
-                    targets,
-                    guild=guild,
-                    author=author,
-                    channel=channel,
-                    destination=destination,
-                )
-                if persistent_context:
-                    if len(records) != len(sent) or token is not None and token.is_set():
-                        await self._cleanup_replacements(message, sent)
-                        return False
-                    persisted, _victims = await self._persist_replacements(
-                        records,
-                        token,
-                        persisted_ids,
-                    )
-                    if not persisted:
-                        await self._cleanup_replacements(message, sent)
-                        return False
-                    settings = guild_settings or copy.deepcopy(DEFAULT_GUILD_SETTINGS)
-                    by_id = {int(message_id): record for message_id, record in records.items()}
-                    for replacement, target in sorted(
-                        zip(sent, targets, strict=True),
-                        key=lambda item: item[0].id,
-                    ):
-                        await self._add_controls(
-                            replacement,
-                            target,
-                            by_id[replacement.id],
-                            settings,
-                        )
-                    for replacement in sorted(sent, key=lambda item: item.id):
-                        self._track_reaction_timeout(
-                            replacement.id,
-                            by_id[replacement.id],
-                            settings,
-                        )
-
-                if not may_suppress or message is None:
-                    return True
-                try:
-                    # Suppression is the only mutation allowed on the original message.
-                    await message.edit(suppress=True)
-                except Exception as error:
-                    if self._definitive_rejection(error) and await self._refetch_unsuppressed(message) is True:
-                        if persisted_ids:
-                            await self._cleanup_persisted_replacements(message, sent, persisted_ids)
-                        else:
-                            await self._cleanup_replacements(message, sent)
-                    return False
-                return True
             except asyncio.CancelledError:
-                if message is None or await self._refetch_unsuppressed(message) is True:
-                    if persisted_ids:
-                        await self._cleanup_persisted_replacements(message, sent, persisted_ids)
-                    else:
-                        await self._cleanup_replacements(message, sent)
+                async with self._s3_lock:
+                    await cleanup()
                 raise
             except Exception:
-                if message is not None or persistent_context:
-                    if persisted_ids:
-                        await self._cleanup_persisted_replacements(message, sent, persisted_ids)
-                    else:
-                        await self._cleanup_replacements(message, sent)
-                    return False
-                return confirmed_count > 0
+                async with self._s3_lock:
+                    await cleanup()
+                return confirmed_count > 0 if not persistent_context and message is None else False
 
-        try:
-            if _locked:
-                return await run()
             async with self._s3_lock:
-                return await run()
+                try:
+                    validation = await revalidate()
+                    if validation is None:
+                        await cleanup()
+                        return False
+                    (
+                        validation_guild,
+                        validation_author,
+                        validation_channel,
+                        settings,
+                        validated_destination,
+                    ) = validation
+
+                    records = self._record_batch(
+                        message,
+                        sent,
+                        targets,
+                        guild=validation_guild,
+                        author=validation_author,
+                        channel=validation_channel,
+                        destination=validated_destination,
+                    )
+                    if persistent_context:
+                        if len(records) != len(sent):
+                            await cleanup()
+                            return False
+                        persisted, _victims = await self._persist_replacements(
+                            records,
+                            token,
+                            persisted_ids,
+                        )
+                        if not persisted:
+                            await cleanup()
+                            return False
+                        validation = await revalidate()
+                        if validation is None:
+                            await cleanup()
+                            return False
+                        settings = validation[3]
+                        by_id = {int(message_id): record for message_id, record in records.items()}
+                        for replacement, target in sorted(
+                            zip(sent, targets, strict=True),
+                            key=lambda item: item[0].id,
+                        ):
+                            await self._add_controls(
+                                replacement,
+                                target,
+                                by_id[replacement.id],
+                                settings,
+                            )
+                        for replacement in sorted(sent, key=lambda item: item.id):
+                            self._track_reaction_timeout(
+                                replacement.id,
+                                by_id[replacement.id],
+                                settings,
+                            )
+
+                        if await revalidate() is None:
+                            await cleanup()
+                            return False
+
+                    if not may_suppress or message is None:
+                        return True
+                    if not persistent_context and expected_source is not None and await self._refetch_snapshot(message, expected_source) is None:
+                        await cleanup()
+                        return False
+                    try:
+                        # Suppression is the only mutation allowed on the original message.
+                        await message.edit(suppress=True)
+                    except Exception as error:
+                        if self._definitive_rejection(error) and await self._refetch_unsuppressed(message) is True:
+                            await cleanup()
+                        return False
+                    return True
+                except asyncio.CancelledError:
+                    await cleanup()
+                    raise
+                except Exception:
+                    await cleanup()
+                    return False if message is not None or persistent_context else confirmed_count > 0
+        try:
+            return await run()
         finally:
             if owned_token:
                 self._discard_author(author_id, token)
@@ -2922,10 +3108,12 @@ class EmbedFixer(commands.Cog):
             settings = await self._guild_settings_from_id(record["guild_id"])
             emoji = str(payload.emoji)
             delete_emoji = settings.get("delete_msg_emoji", "❌")
+            if emoji == ROTATE_EMOJI and settings.get("rotate_fix_reaction", False):
+                await self._rotate_record(payload, record, settings)
+                return
             if emoji == delete_emoji:
                 if (
-                    settings.get("enabled", True)
-                    and not settings.get("disable_delete_reaction", False)
+                    not settings.get("disable_delete_reaction", False)
                     and payload.user_id == record["author_id"]
                     and await self._delete_bot_message(
                         record["guild_id"],
@@ -3010,6 +3198,7 @@ class EmbedFixer(commands.Cog):
                     await self._plain(ctx, "Embed fixing is not available here.", ephemeral=True)
                     return
                 destination, funnel = resolved
+                source_snapshot = self._source_snapshot(source) if source is not None else None
                 targets = self._targets(link[:MAX_MESSAGE_CHARS], guild_settings)
                 if not targets:
                     await self._plain(ctx, "No supported links found.", ephemeral=True)
@@ -3025,24 +3214,25 @@ class EmbedFixer(commands.Cog):
                         sender = ctx.send if mode == "reply" else ctx.channel.send
                 elif guild is None:
                     sender = None
-                success = await self._process(
-                    source,
-                    targets,
-                    mode=mode,
-                    may_suppress=source is not None and guild is not None,
-                    sender=sender,
-                    guild=guild,
-                    author=author,
-                    channel=channel,
-                    destination=destination,
-                    guild_settings=guild_settings,
-                    token=token,
-                    _locked=True,
-                )
-                if deferred:
-                    await self._plain(ctx, "Fixed." if success else "The embed could not be fixed.", ephemeral=True)
-                elif not success:
-                    await self._plain(ctx, "The embed could not be fixed.", ephemeral=True)
+            success = await self._process(
+                source,
+                targets,
+                mode=mode,
+                may_suppress=source is not None and guild is not None,
+                sender=sender,
+                guild=guild,
+                author=author,
+                channel=channel,
+                destination=destination,
+                guild_settings=guild_settings,
+                user_settings=user_settings,
+                token=token,
+                source_snapshot=source_snapshot,
+            )
+            if deferred:
+                await self._plain(ctx, "Fixed." if success else "The embed could not be fixed.", ephemeral=True)
+            elif not success:
+                await self._plain(ctx, "The embed could not be fixed.", ephemeral=True)
         finally:
             self._discard_author(author_id, token)
 
@@ -3119,23 +3309,25 @@ class EmbedFixer(commands.Cog):
                 if not targets:
                     await interaction.followup.send("No supported links found.", ephemeral=True)
                     return
-                success = await self._process(
-                    message,
-                    targets,
-                    mode=self._mode(guild_settings, user_settings),
-                    sender=destination.send if funnel else None,
-                    guild=guild,
-                    author=author,
-                    channel=channel,
-                    destination=destination,
-                    guild_settings=guild_settings,
-                    token=token,
-                    _locked=True,
-                )
-                await interaction.followup.send(
-                    "Fixed." if success else "The embed could not be fixed.",
-                    ephemeral=True,
-                )
+                source_snapshot = self._source_snapshot(message)
+            success = await self._process(
+                message,
+                targets,
+                mode=self._mode(guild_settings, user_settings),
+                sender=destination.send if funnel else None,
+                guild=guild,
+                author=author,
+                channel=channel,
+                destination=destination,
+                guild_settings=guild_settings,
+                user_settings=user_settings,
+                token=token,
+                source_snapshot=source_snapshot,
+            )
+            await interaction.followup.send(
+                "Fixed." if success else "The embed could not be fixed.",
+                ephemeral=True,
+            )
         finally:
             self._discard_author(author_id, token)
 
@@ -3261,6 +3453,9 @@ class EmbedFixer(commands.Cog):
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def embedfixer_deleteemoji(self, ctx: commands.Context, emoji: str) -> None:
+        if emoji == ROTATE_EMOJI:
+            await self._plain(ctx, "Delete emoji cannot be the rotate emoji.", ephemeral=True)
+            return
         if not emoji or len(emoji) > MAX_SETTING_STRING:
             await self._plain(ctx, "Delete emoji must be between 1 and 256 characters.", ephemeral=True)
             return
@@ -3694,25 +3889,27 @@ class EmbedFixer(commands.Cog):
                 if resolved is None:
                     return
                 destination, funnel = resolved
+                source_snapshot = self._source_snapshot(message)
                 targets = self._targets(getattr(message, "content", ""), guild_settings)
                 extract = (
                     getattr(channel, "id", None)
                     in _normalize_ids(guild_settings.get("extract_media_channels", []))
                 )
-                if targets and not extract:
-                    await self._process(
-                        message,
-                        targets,
-                        mode=self._mode(guild_settings, user_settings),
-                        sender=destination.send if funnel else None,
-                        guild=guild,
-                        author=author,
-                        channel=channel,
-                        destination=destination,
-                        guild_settings=guild_settings,
-                        token=token,
-                        _locked=True,
-                    )
+            if targets and not extract:
+                await self._process(
+                    message,
+                    targets,
+                    mode=self._mode(guild_settings, user_settings),
+                    sender=destination.send if funnel else None,
+                    guild=guild,
+                    author=author,
+                    channel=channel,
+                    destination=destination,
+                    guild_settings=guild_settings,
+                    user_settings=user_settings,
+                    token=token,
+                    source_snapshot=source_snapshot,
+                )
             if extract:
                 await self._process_extraction(message, token=token)
         finally:

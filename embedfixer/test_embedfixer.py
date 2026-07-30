@@ -31,6 +31,7 @@ from .embedfixer import (
     _metadata_endpoint_allowed,
     _normalize_translation,
     _normalize_legacy_settings,
+    _TWITTER_SOURCE_RE,
     _validated_import,
     canonical_media_url,
     extract_candidates,
@@ -117,6 +118,12 @@ class ProviderInventoryTests(unittest.TestCase):
         self.assertEqual(fixed_targets("(https://x.com/a/status/1)"), plain)
         self.assertEqual(fixed_targets("[https://x.com/a/status/1]"), plain)
         self.assertEqual(fixed_targets("{https://x.com/a/status/1}"), plain)
+
+    def test_twitter_source_suffix_inventory(self) -> None:
+        for suffix in ("", "/photo", "/photo/1", "/video/42"):
+            self.assertIsNotNone(
+                _TWITTER_SOURCE_RE.fullmatch(f"/alice/status/1{suffix}/")
+            )
 
     def test_format_and_default_gates(self) -> None:
         targets = fixed_targets("https://x.com/alice/status/1")
@@ -325,6 +332,9 @@ class _TestConfig:
 
     def guild(self, guild):
         return self.guild_from_id(guild.id)
+
+    async def all_guilds(self):
+        return copy.deepcopy(self.guilds)
 
     def user_from_id(self, user_id):
         return _ConfigScope(
@@ -719,6 +729,246 @@ class SecurityS3Tests(unittest.TestCase):
             await blocked
             self.assertEqual(fetched, [100])
             self.assertNotIn(10, fetched)
+
+        asyncio.run(scenario())
+
+    def test_confirmation_poll_runs_without_global_lock(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            cog = _s3_cog(config, channel)
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def confirm(_replacement, _url):
+                self.assertFalse(cog._s3_lock.locked())
+                entered.set()
+                await release.wait()
+                return True
+
+            cog._confirm_embed = confirm
+            task = asyncio.create_task(cog.on_message(source))
+            await entered.wait()
+            self.assertFalse(cog._s3_lock.locked())
+            release.set()
+            await task
+            self.assertEqual(source.edits, [{"suppress": True}])
+
+        asyncio.run(scenario())
+
+    def test_source_mutation_during_preview_cleans_replacement_and_aborts(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            cog = _s3_cog(config, channel)
+            snapshot = cog._source_snapshot(source)
+
+            async def confirm(_replacement, _url):
+                source.content = "https://x.com/changed/status/2"
+                return True
+
+            cog._confirm_embed = confirm
+            success = await cog._process(
+                source,
+                fixed_targets(source.content),
+                guild=source.guild,
+                author=source.author,
+                channel=channel,
+                destination=channel,
+                guild_settings=copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                user_settings=copy.deepcopy(DEFAULT_USER_SETTINGS),
+                source_snapshot=snapshot,
+            )
+            self.assertFalse(success)
+            self.assertEqual(config.global_data["replacement_records"], {})
+            self.assertTrue(channel.sent[0].deleted)
+            self.assertEqual(source.edits, [])
+
+        asyncio.run(scenario())
+
+    def test_destination_policy_change_during_preview_cleans_replacement(self):
+        async def scenario():
+            config = _TestConfig()
+            source_channel = _Channel()
+            guild = source_channel.guild
+            destination = _text_channel(2, guild)
+            destination.sent = []
+
+            async def send(content, **_kwargs):
+                replacement = _Sent(destination, content)
+                destination.sent.append(replacement)
+                return replacement
+
+            async def fetch_message(message_id):
+                for replacement in destination.sent:
+                    if replacement.id == message_id:
+                        return replacement
+                raise RuntimeError("unknown replacement")
+
+            destination.send = send
+            destination.fetch_message = fetch_message
+            guild.get_channel = lambda channel_id: destination if channel_id == 2 else None
+            source = self._source(source_channel)
+            config.guilds[9] = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "funnel_target_channel": 2,
+            }
+            cog = _s3_cog(config, source_channel)
+
+            async def confirm(_replacement, _url):
+                source_channel.nsfw = True
+                return True
+
+            cog._confirm_embed = confirm
+            await cog.on_message(source)
+            self.assertEqual(config.global_data["replacement_records"], {})
+            self.assertEqual(source.edits, [])
+            self.assertTrue(destination.sent[0].deleted)
+
+        asyncio.run(scenario())
+
+    def test_destination_policy_revalidated_after_persistence_and_controls(self):
+        async def scenario(phase):
+            config = _TestConfig()
+            source_channel = _Channel()
+            guild = source_channel.guild
+            destination = _text_channel(2, guild)
+            destination.sent = []
+
+            async def send(content, **_kwargs):
+                replacement = _Sent(destination, content)
+                destination.sent.append(replacement)
+                return replacement
+
+            async def fetch_message(message_id):
+                for replacement in destination.sent:
+                    if replacement.id == message_id:
+                        return replacement
+                raise RuntimeError("unknown replacement")
+
+            destination.send = send
+            destination.fetch_message = fetch_message
+            guild.get_channel = lambda channel_id: destination if channel_id == 2 else None
+            source = self._source(source_channel)
+            config.guilds[9] = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "funnel_target_channel": 2,
+            }
+            cog = _s3_cog(config, source_channel)
+            if phase == "persist":
+                changed = False
+
+                async def hook(action, key):
+                    nonlocal changed
+                    if not changed and action == "read" and key == "replacement_records":
+                        changed = True
+                        source_channel.nsfw = True
+
+                config.hook = hook
+            else:
+                original_add_controls = cog._add_controls
+
+                async def add_controls(*args, **kwargs):
+                    result = await original_add_controls(*args, **kwargs)
+                    source_channel.nsfw = True
+                    return result
+
+                cog._add_controls = add_controls
+            await cog.on_message(source)
+            self.assertEqual(config.global_data["replacement_records"], {})
+            self.assertEqual(source.edits, [])
+            self.assertTrue(destination.sent[0].deleted)
+
+        asyncio.run(scenario("persist"))
+        asyncio.run(scenario("controls"))
+
+    def test_final_revalidation_refetches_after_config_reads(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            cog = _s3_cog(config, channel)
+            armed = False
+            mutated = False
+
+            async def hook(action, key):
+                nonlocal mutated
+                if armed and not mutated and action == "read" and key == "scope":
+                    mutated = True
+                    source.content = "https://x.com/changed/status/2"
+                    source.edited_at = datetime.now(timezone.utc)
+
+            config.hook = hook
+            original_add_controls = cog._add_controls
+
+            async def add_controls(*args, **kwargs):
+                nonlocal armed
+                result = await original_add_controls(*args, **kwargs)
+                armed = True
+                return result
+
+            cog._add_controls = add_controls
+            await cog.on_message(source)
+            self.assertTrue(mutated)
+            self.assertEqual(config.global_data["replacement_records"], {})
+            self.assertEqual(source.edits, [])
+            self.assertTrue(channel.sent[0].deleted)
+
+        asyncio.run(scenario())
+
+    def test_final_revalidation_rejects_suppressed_source_state(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            cog = _s3_cog(config, channel)
+            armed = False
+            mutated = False
+
+            async def hook(action, key):
+                nonlocal mutated
+                if armed and not mutated and action == "read" and key == "scope":
+                    mutated = True
+                    source.flags.suppress_embeds = True
+
+            config.hook = hook
+            original_add_controls = cog._add_controls
+
+            async def add_controls(*args, **kwargs):
+                nonlocal armed
+                result = await original_add_controls(*args, **kwargs)
+                armed = True
+                return result
+
+            cog._add_controls = add_controls
+            await cog.on_message(source)
+            self.assertTrue(mutated)
+            self.assertIn("100", config.global_data["replacement_records"])
+            self.assertFalse(channel.sent[0].deleted)
+            self.assertEqual(source.edits, [])
+
+        asyncio.run(scenario())
+
+    def test_invalid_delete_emoji_mutates_no_controls(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            target = fixed_targets(source.content)[0]
+            replacement = _Sent(channel, format_fixed(target))
+            channel.sent.append(replacement)
+            _key, record = _record(source_message_id=None)
+            cog = _s3_cog(config, channel)
+            settings = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "delete_msg_emoji": ROTATE_EMOJI,
+            }
+            with self.assertRaisesRegex(RuntimeError, "invalid delete emoji"):
+                await cog._add_controls(replacement, target, record, settings)
+            self.assertEqual(replacement.edits, [])
+            self.assertEqual(replacement.reactions, [])
 
         asyncio.run(scenario())
 
@@ -1216,6 +1466,42 @@ class SecurityS3Tests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_legacy_delete_rotate_collision_prefers_rotation(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            replacement = _Sent(channel, format_fixed(fixed_targets(source.content)[0]))
+            channel.sent.append(replacement)
+            key, record = _record()
+            config.global_data["replacement_records"] = {key: record}
+            config.guilds[9] = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "delete_msg_emoji": ROTATE_EMOJI,
+                "rotate_fix_reaction": True,
+            }
+            cog = _s3_cog(config, channel)
+            calls = []
+
+            async def rotate(payload, received_record, settings):
+                calls.append((payload, received_record, settings))
+
+            cog._rotate_record = rotate
+            payload = SimpleNamespace(
+                user_id=22,
+                guild_id=9,
+                channel_id=1,
+                message_id=100,
+                emoji=ROTATE_EMOJI,
+                member=SimpleNamespace(id=22, bot=False),
+            )
+            await cog.on_raw_reaction_add(payload)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(replacement.deleted)
+            self.assertEqual(config.global_data["replacement_records"][key], record)
+
+        asyncio.run(scenario())
+
     def test_sr06_rotation_source_change_rolls_back_and_rollback_failure_is_inert(self):
         async def scenario():
             config = _TestConfig()
@@ -1443,6 +1729,105 @@ class SecurityS3Tests(unittest.TestCase):
             [(keyword.arg, ast.literal_eval(keyword.value)) for keyword in source_edits[0].keywords],
             [("suppress", True)],
         )
+
+    def test_delete_emoji_reserves_rotate_in_import_and_command(self):
+        with self.assertRaises(ValueError):
+            _validated_import(
+                {
+                    "guild_settings": {"delete_msg_emoji": ROTATE_EMOJI},
+                    "fix_methods": [],
+                }
+            )
+
+        async def command():
+            config = _TestConfig()
+            channel = _Channel()
+            cog = _s3_cog(config, channel)
+            replies = []
+
+            async def send(message, **_kwargs):
+                replies.append(message)
+
+            ctx = SimpleNamespace(
+                guild=channel.guild,
+                interaction=None,
+                send=send,
+                tick=lambda: asyncio.sleep(0),
+            )
+            await EmbedFixer.embedfixer_deleteemoji.callback(cog, ctx, ROTATE_EMOJI)
+            self.assertNotIn(9, config.guilds)
+            self.assertTrue(replies)
+
+        asyncio.run(command())
+
+    def test_user_deletion_removes_guild_ignored_entries_without_other_changes(self):
+        async def scenario():
+            config = _TestConfig()
+            config.guilds[9] = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "ignored_users": [22, 23],
+                "enabled": False,
+            }
+            config.guilds[8] = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "ignored_users": [22],
+                "fix_mode": "reply",
+            }
+            channel = _Channel()
+            cog = _s3_cog(config, channel)
+            await cog.red_delete_data_for_user(requester="owner", user_id=22)
+            self.assertEqual(config.guilds[9]["ignored_users"], [23])
+            self.assertFalse(config.guilds[9]["enabled"])
+            self.assertEqual(config.guilds[8]["ignored_users"], [])
+            self.assertEqual(config.guilds[8]["fix_mode"], "reply")
+
+        asyncio.run(scenario())
+
+    def test_context_fix_rejects_already_suppressed_source(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            source.flags.suppress_embeds = True
+            cog = _s3_cog(config, channel)
+            self.assertIsNone(
+                await cog._context_settings(
+                    guild=source.guild,
+                    author=source.author,
+                    channel=channel,
+                    source=source,
+                    manage_messages=True,
+                )
+            )
+
+        asyncio.run(scenario())
+
+    def test_delete_reaction_works_when_guild_disabled(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            replacement = _Sent(channel, format_fixed(fixed_targets(source.content)[0]))
+            channel.sent.append(replacement)
+            key, record = _record()
+            config.global_data["replacement_records"] = {key: record}
+            config.guilds[9] = copy.deepcopy(DEFAULT_GUILD_SETTINGS)
+            config.guilds[9]["enabled"] = False
+            cog = _s3_cog(config, channel)
+            await cog.on_raw_reaction_add(
+                SimpleNamespace(
+                    user_id=22,
+                    guild_id=9,
+                    channel_id=1,
+                    message_id=100,
+                    emoji="❌",
+                    member=SimpleNamespace(id=22, bot=False),
+                )
+            )
+            self.assertTrue(replacement.deleted)
+            self.assertEqual(config.global_data["replacement_records"], {})
+
+        asyncio.run(scenario())
 
 
 class SecurityS4Tests(unittest.TestCase):
