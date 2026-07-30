@@ -1480,16 +1480,69 @@ class SecurityS3Tests(unittest.TestCase):
             config.guilds[9]["remove_delete_reaction_after"] = 0
             cog = _s3_cog(config, channel)
             cog._track_reaction_timeout(100, record, config.guilds[9])
-            await asyncio.gather(*tuple(cog._reaction_tasks))
+            await asyncio.gather(*tuple(cog._reaction_tasks.values()))
             self.assertEqual(replacement.removed_reactions, [("❌", 99)])
             self.assertFalse(replacement.deleted)
             config.guilds[9]["remove_delete_reaction_after"] = 60
             cog._track_reaction_timeout(100, record, config.guilds[9])
-            tasks = tuple(cog._reaction_tasks)
+            previous = cog._reaction_tasks[100]
+            cog._track_reaction_timeout(100, record, config.guilds[9])
+            current = cog._reaction_tasks[100]
+            self.assertIsNot(previous, current)
+            await asyncio.sleep(0)
+            self.assertTrue(previous.cancelled())
+            self.assertIs(cog._reaction_tasks[100], current)
+
+            self.assertTrue(await cog._remove_records({100}))
+            await asyncio.sleep(0)
+            self.assertTrue(current.cancelled())
+            self.assertNotIn(100, cog._reaction_tasks)
+            self.assertNotIn("100", config.global_data["replacement_records"])
+
+            cog._track_reaction_timeout(100, record, config.guilds[9])
+            tasks = tuple(cog._reaction_tasks.values())
             await cog.cog_unload()
             self.assertTrue(all(task.done() for task in tasks))
             self.assertEqual(cog._notify_pairs, {})
             self.assertEqual(cog._notify_recipients, {})
+
+        asyncio.run(scenario())
+
+    def test_sr05_remove_records_reports_stale_storage_after_write_failure(self):
+        async def scenario():
+            config = _TestConfig()
+            key, record = _record(source_message_id=None)
+            config.global_data["replacement_records"] = {key: record}
+            cog = _s3_cog(config, _Channel())
+
+            async def fail_write(action, name):
+                if action == "set" and name == "replacement_records":
+                    raise RuntimeError("storage unavailable")
+
+            config.hook = fail_write
+            self.assertFalse(await cog._remove_records({100}))
+            self.assertIn(key, await cog._stored_replacement_records())
+            self.assertNotIn(key, await cog._replacement_records())
+
+            class CommitThenRaiseValue(_ConfigValue):
+                async def set(self, value):
+                    self.data[self.key] = copy.deepcopy(value)
+                    raise RuntimeError("write acknowledgement lost")
+
+            class CommitThenRaiseConfig(_TestConfig):
+                @property
+                def replacement_records(self):
+                    return CommitThenRaiseValue(
+                        self,
+                        self.global_data,
+                        "replacement_records",
+                    )
+
+            committed = CommitThenRaiseConfig()
+            committed.global_data["replacement_records"] = {key: record}
+            committed_cog = _s3_cog(committed, _Channel())
+            self.assertTrue(await committed_cog._remove_records({100}))
+            self.assertNotIn(key, await committed_cog._stored_replacement_records())
 
         asyncio.run(scenario())
 
@@ -1878,6 +1931,41 @@ class SecurityS3Tests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_sr06_rotation_continues_for_existing_replacement_when_guild_disabled(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            target = fixed_targets(source.content)[0]
+            replacement = _Sent(channel, format_fixed(target))
+            channel.sent.append(replacement)
+            key, record = _record()
+            config.global_data["replacement_records"] = {key: record}
+            settings = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "enabled": False,
+                "rotate_fix_reaction": True,
+            }
+            config.guilds[9] = copy.deepcopy(settings)
+            cog = _s3_cog(config, channel)
+            payload = SimpleNamespace(
+                user_id=22,
+                guild_id=9,
+                channel_id=1,
+                message_id=100,
+                emoji=ROTATE_EMOJI,
+                member=SimpleNamespace(id=22, bot=False),
+            )
+
+            await cog.on_raw_reaction_add(payload)
+            self.assertEqual(
+                config.global_data["replacement_records"][key]["method_id"], 2
+            )
+            self.assertIn("fixvx.com", replacement.content)
+            self.assertFalse(replacement.deleted)
+
+        asyncio.run(scenario())
+
     def test_sr06_rotation_flushes_pending_authority(self):
         async def scenario():
             config = _TestConfig()
@@ -1974,6 +2062,55 @@ class SecurityS3Tests(unittest.TestCase):
                 )
             self.assertIn((100, 77), cog._notify_pairs)
             self.assertEqual(len(cog._notify_recipients[22]), 1)
+
+        asyncio.run(scenario())
+
+    def test_sr07_notification_delivery_runs_without_s3_lock(self):
+        async def scenario():
+            config = _TestConfig()
+            config.users[22] = copy.deepcopy(DEFAULT_USER_SETTINGS)
+            config.users[22]["notify_on_react"] = True
+            channel = _Channel()
+            key, record = _record()
+            config.global_data["replacement_records"] = {key: record}
+            cog = _s3_cog(config, channel)
+            recipient = SimpleNamespace()
+            sent = []
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def send(content, **_kwargs):
+                sent.append(content)
+
+            recipient.send = send
+
+            async def fetch_user(_user_id):
+                entered.set()
+                await release.wait()
+                return recipient
+
+            cog.bot.fetch_user = fetch_user
+            payload = SimpleNamespace(
+                user_id=77,
+                guild_id=9,
+                channel_id=1,
+                message_id=100,
+                emoji="⭐",
+                member=SimpleNamespace(id=77, bot=False),
+            )
+            task = asyncio.create_task(cog.on_raw_reaction_add(payload))
+            await entered.wait()
+            acquired = asyncio.Event()
+
+            async def probe_lock():
+                async with cog._s3_lock:
+                    acquired.set()
+
+            probe = asyncio.create_task(probe_lock())
+            await acquired.wait()
+            release.set()
+            await asyncio.gather(task, probe)
+            self.assertEqual(len(sent), 1)
 
         asyncio.run(scenario())
 
@@ -2114,6 +2251,55 @@ class SecurityS3Tests(unittest.TestCase):
                     channel=channel,
                     source=source,
                     manage_messages=True,
+                )
+            )
+
+        asyncio.run(scenario())
+
+    def test_user_ignore_blocks_automatic_contexts_but_not_manual_guild_or_dm(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            config.users[22] = copy.deepcopy(DEFAULT_USER_SETTINGS)
+            config.users[22]["ignored"] = True
+            cog = _s3_cog(config, channel)
+
+            self.assertIsNone(
+                await cog._context_settings(
+                    guild=channel.guild,
+                    author=source.author,
+                    channel=channel,
+                    source=source,
+                    manage_messages=True,
+                    automatic=True,
+                )
+            )
+            self.assertIsNotNone(
+                await cog._context_settings(
+                    guild=channel.guild,
+                    author=source.author,
+                    channel=channel,
+                    source=source,
+                    manage_messages=True,
+                )
+            )
+
+            self.assertIsNone(
+                await cog._context_settings(
+                    guild=None,
+                    author=source.author,
+                    channel=channel,
+                    manage_messages=False,
+                    automatic=True,
+                )
+            )
+            self.assertIsNotNone(
+                await cog._context_settings(
+                    guild=None,
+                    author=source.author,
+                    channel=channel,
+                    manage_messages=False,
                 )
             )
 
@@ -3065,11 +3251,12 @@ class SecurityS4Tests(unittest.TestCase):
             cog = _s3_cog(config, channel)
             calls = []
 
-            async def extraction(message, *, token, target_content=None):
+            async def extraction(message, *, token, target_content=None, automatic=False):
                 self.assertFalse(cog._s3_lock.locked())
                 self.assertIs(message, source)
                 self.assertIsNone(target_content)
                 self.assertIsNotNone(token)
+                self.assertTrue(automatic)
                 calls.append(True)
                 return True
 

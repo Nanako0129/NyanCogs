@@ -1097,7 +1097,7 @@ class EmbedFixer(commands.Cog):
         self._author_inflight: dict[int, set[asyncio.Event]] = {}
         self._pending_records: dict[str, dict[str, Any]] = {}
         self._pending_evictions: set[str] = set()
-        self._reaction_tasks: set[asyncio.Task[Any]] = set()
+        self._reaction_tasks: dict[int, asyncio.Task[Any]] = {}
         self._notify_pairs: dict[tuple[int, int], float] = {}
         self._notify_recipients: dict[int, list[float]] = {}
 
@@ -1114,7 +1114,7 @@ class EmbedFixer(commands.Cog):
         if not hasattr(self, "_pending_evictions"):
             self._pending_evictions = set()
         if not hasattr(self, "_reaction_tasks"):
-            self._reaction_tasks = set()
+            self._reaction_tasks = {}
         if not hasattr(self, "_notify_pairs"):
             self._notify_pairs = {}
         if not hasattr(self, "_notify_recipients"):
@@ -1207,7 +1207,8 @@ class EmbedFixer(commands.Cog):
         if session is not None and not session.closed:
             await session.close()
         self._session = None
-        tasks = tuple(self._reaction_tasks)
+        tasks = tuple(self._reaction_tasks.values())
+        self._reaction_tasks.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -1239,6 +1240,7 @@ class EmbedFixer(commands.Cog):
                 for message_id, record in records.items()
                 if record["author_id"] == user_id
             }
+            self._cancel_reaction_timeouts(owned_ids)
             try:
                 await self.config.user_from_id(user_id).clear()
             except Exception as error:
@@ -1357,6 +1359,7 @@ class EmbedFixer(commands.Cog):
         channel: Any,
         source: Any = None,
         manage_messages: bool,
+        automatic: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         if author is None:
             return None
@@ -1369,7 +1372,7 @@ class EmbedFixer(commands.Cog):
             if getattr(author, "bot", False):
                 return None
             user = await self._scope_values(self.config.user(author), DEFAULT_USER_SETTINGS)
-            if user.get("ignored"):
+            if automatic and user.get("ignored"):
                 return None
             if not _channel_permission_ok(channel, None, self.bot, manage_messages=False):
                 return None
@@ -1397,7 +1400,7 @@ class EmbedFixer(commands.Cog):
             return None
 
         user_settings = await self._scope_values(self.config.user(author), DEFAULT_USER_SETTINGS)
-        if user_settings.get("ignored"):
+        if automatic and user_settings.get("ignored"):
             return None
         author_id = getattr(author, "id", None)
         if author_id in _normalize_ids(guild_settings.get("ignored_users", [])):
@@ -1847,6 +1850,7 @@ class EmbedFixer(commands.Cog):
         token: asyncio.Event | None,
         target_content: str | None = None,
         metadata_only: bool = False,
+        automatic: bool = False,
     ) -> bool:
         async with self._s3_lock:
             if token is not None and token.is_set():
@@ -1860,6 +1864,7 @@ class EmbedFixer(commands.Cog):
                 channel=channel,
                 source=message,
                 manage_messages=True,
+                automatic=automatic,
             )
             if settings is None or guild is None:
                 return False
@@ -1914,6 +1919,7 @@ class EmbedFixer(commands.Cog):
                 channel=fresh_channel,
                 source=fresh,
                 manage_messages=True,
+                automatic=automatic,
             )
             if settings is None:
                 return False
@@ -1956,6 +1962,7 @@ class EmbedFixer(commands.Cog):
                 "user_settings": user_settings,
                 "token": token,
                 "source_snapshot": snapshot.source,
+                "automatic": automatic,
             }
         if process_args is None:
             return False
@@ -1969,6 +1976,7 @@ class EmbedFixer(commands.Cog):
         channel: Any,
         content: str,
         token: asyncio.Event | None,
+        automatic: bool = False,
     ) -> bool:
         process_args: dict[str, Any] | None = None
         async with self._s3_lock:
@@ -1979,6 +1987,7 @@ class EmbedFixer(commands.Cog):
                 author=author,
                 channel=channel,
                 manage_messages=False,
+                automatic=automatic,
             )
             if settings is None:
                 return False
@@ -2016,6 +2025,7 @@ class EmbedFixer(commands.Cog):
                 author=author,
                 channel=channel,
                 manage_messages=False,
+                automatic=automatic,
             )
             if settings is None:
                 return False
@@ -2053,6 +2063,7 @@ class EmbedFixer(commands.Cog):
                 "guild_settings": guild_settings,
                 "user_settings": user_settings,
                 "token": token,
+                "automatic": automatic,
             }
         if process_args is None:
             return False
@@ -2132,6 +2143,7 @@ class EmbedFixer(commands.Cog):
             updated.pop(str(message_id), None)
             self._pending_records.pop(str(message_id), None)
             self._pending_evictions.add(str(message_id))
+        self._cancel_reaction_timeouts({message_id for message_id, _record in victims})
         updated.update(copy.deepcopy(new_records))
         self._pending_records.update(copy.deepcopy(new_records))
         try:
@@ -2178,6 +2190,7 @@ class EmbedFixer(commands.Cog):
         for message_id in message_ids:
             self._pending_records.pop(str(message_id), None)
             self._pending_evictions.add(str(message_id))
+        self._cancel_reaction_timeouts(message_ids)
         remaining = {
             message_id: record
             for message_id, record in records.items()
@@ -2188,7 +2201,7 @@ class EmbedFixer(commands.Cog):
         try:
             await self._set_replacement_records(remaining)
         except Exception:
-            current = await self._replacement_records()
+            current = await self._stored_replacement_records()
             return all(str(message_id) not in current for message_id in message_ids)
         return True
 
@@ -2457,6 +2470,10 @@ class EmbedFixer(commands.Cog):
         record: dict[str, Any],
         settings: dict[str, Any],
     ) -> None:
+        self._ensure_s3_runtime()
+        previous = self._reaction_tasks.pop(message_id, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
         timeout = settings.get("remove_delete_reaction_after")
         if (
             settings.get("disable_delete_reaction", False)
@@ -2498,8 +2515,19 @@ class EmbedFixer(commands.Cog):
                 log.debug("embedfixer reaction timeout failed", exc_info=True)
 
         task = asyncio.create_task(expire())
-        self._reaction_tasks.add(task)
-        task.add_done_callback(self._reaction_tasks.discard)
+        self._reaction_tasks[message_id] = task
+
+        def remove_completed(completed: asyncio.Task[Any]) -> None:
+            if self._reaction_tasks.get(message_id) is completed:
+                self._reaction_tasks.pop(message_id, None)
+
+        task.add_done_callback(remove_completed)
+
+    def _cancel_reaction_timeouts(self, message_ids: set[int]) -> None:
+        for message_id in message_ids:
+            task = self._reaction_tasks.pop(message_id, None)
+            if task is not None and not task.done() and task is not asyncio.current_task():
+                task.cancel()
 
     def _record_batch(
         self,
@@ -2609,6 +2637,7 @@ class EmbedFixer(commands.Cog):
         user_settings: dict[str, Any] | None = None,
         token: asyncio.Event | None = None,
         source_snapshot: tuple[int, int, int, int, str, str | None] | None = None,
+        automatic: bool = False,
         _locked: bool = False,
     ) -> bool:
         self._ensure_s3_runtime()
@@ -2686,6 +2715,7 @@ class EmbedFixer(commands.Cog):
                         channel=lookup_channel,
                         source=lookup_source if message is not None else None,
                         manage_messages=message is not None,
+                        automatic=automatic,
                     )
                     if current is None:
                         return None
@@ -2972,8 +3002,7 @@ class EmbedFixer(commands.Cog):
         settings: dict[str, Any],
     ) -> None:
         if (
-            not settings.get("enabled", True)
-            or not settings.get("rotate_fix_reaction", False)
+            not settings.get("rotate_fix_reaction", False)
             or payload.user_id != record["author_id"]
             or record["source_message_id"] is None
         ):
@@ -3188,7 +3217,14 @@ class EmbedFixer(commands.Cog):
         self._notify_recipients[recipient_id] = [*history, now]
         return True
 
-    async def _notify_author(self, payload: Any, record: dict[str, Any]) -> None:
+    async def _prepare_notification(
+        self,
+        payload: Any,
+        record: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        record = copy.deepcopy(record)
+        if not _valid_record(str(payload.message_id), record):
+            return None
         member = getattr(payload, "member", None)
         if member is None:
             guild = getattr(self.bot, "get_guild", lambda _guild_id: None)(record["guild_id"])
@@ -3211,7 +3247,10 @@ class EmbedFixer(commands.Cog):
             payload.user_id,
             record["author_id"],
         ):
-            return
+            return None
+        return record
+
+    async def _deliver_notification(self, payload: Any, record: dict[str, Any]) -> None:
         recipient = getattr(self.bot, "get_user", lambda _user_id: None)(record["author_id"])
         if recipient is None:
             fetch_user = getattr(self.bot, "fetch_user", None)
@@ -3235,6 +3274,11 @@ class EmbedFixer(commands.Cog):
         except Exception:
             return
 
+    async def _notify_author(self, payload: Any, record: dict[str, Any]) -> None:
+        prepared = await self._prepare_notification(payload, record)
+        if prepared is not None:
+            await self._deliver_notification(payload, prepared)
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         self._ensure_s3_runtime()
@@ -3244,6 +3288,7 @@ class EmbedFixer(commands.Cog):
         rotate = False
         rotation_record: dict[str, Any] | None = None
         rotation_settings: dict[str, Any] | None = None
+        notification_record: dict[str, Any] | None = None
         async with self._s3_lock:
             records = await self._replacement_records()
             record = records.get(str(payload.message_id))
@@ -3274,7 +3319,9 @@ class EmbedFixer(commands.Cog):
                     await self._remove_records({payload.message_id})
                 return
             else:
-                await self._notify_author(payload, record)
+                notification_record = await self._prepare_notification(payload, record)
+        if notification_record is not None:
+            await self._deliver_notification(payload, notification_record)
         if rotate and rotation_record is not None and rotation_settings is not None:
             await self._rotate_record(payload, rotation_record, rotation_settings)
             return
@@ -4027,6 +4074,7 @@ class EmbedFixer(commands.Cog):
                     channel=channel,
                     source=message,
                     manage_messages=True,
+                    automatic=True,
                 )
                 if settings is None:
                     return
@@ -4059,9 +4107,10 @@ class EmbedFixer(commands.Cog):
                     user_settings=user_settings,
                     token=token,
                     source_snapshot=source_snapshot,
+                    automatic=True,
                 )
             if extract:
-                await self._process_extraction(message, token=token)
+                await self._process_extraction(message, token=token, automatic=True)
         finally:
             self._discard_author(author_id, token)
 
