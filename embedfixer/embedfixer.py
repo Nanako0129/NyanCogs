@@ -757,7 +757,7 @@ def format_fixed(target: FixedTarget) -> str:
     parts = [f"[{_markdown_label(source_label)}]({fixed})"]
     if target.author is not None:
         label, profile = target.author
-        parts.append(f"[{_markdown_label(label)}]({_markdown_url(profile)})")
+        parts.append(f"[{_markdown_label(label)}](<{_markdown_url(profile)}>)")
     parts.append(f"[{_markdown_label(provider_label)}]({fixed})")
     rendered = " • ".join(parts)
     return f"||{rendered}||" if target.spoiler else rendered
@@ -3655,16 +3655,41 @@ class EmbedFixer(commands.Cog):
         """Show or change EmbedFixer settings."""
         async with self._s3_lock:
             user = await self._scope_values(self.config.user(ctx.author), DEFAULT_USER_SETTINGS)
-            if ctx.guild is None:
-                await self._plain(ctx, f"User mode: {user.get('fix_mode') or 'follow'}; ignored: {bool(user.get('ignored'))}.")
-                return
-            guild = await self._scope_values(self.config.guild(ctx.guild), DEFAULT_GUILD_SETTINGS)
-            await self._plain(
-                ctx,
-                f"Enabled: {bool(guild.get('enabled'))}; guild mode: {guild.get('fix_mode')}; "
-                f"user mode: {user.get('fix_mode') or 'follow'}.",
-                ephemeral=True,
+            guild = (
+                await self._scope_values(self.config.guild(ctx.guild), DEFAULT_GUILD_SETTINGS)
+                if ctx.guild is not None
+                else None
             )
+
+        embed = discord.Embed(
+            title="EmbedFixer Settings",
+            colour=await ctx.embed_colour(),
+        )
+        if guild is not None:
+            embed.add_field(
+                name="Cog status",
+                value="✅ Enabled" if guild.get("enabled") else "❌ Disabled",
+                inline=True,
+            )
+            embed.add_field(
+                name="Guild mode",
+                value=f"`{guild.get('fix_mode')}`",
+                inline=True,
+            )
+        user_mode = user.get("fix_mode") or "follow"
+        embed.add_field(name="Your mode", value=f"`{user_mode}`", inline=True)
+        embed.add_field(
+            name="Automatic fixing",
+            value="❌ Ignored" if user.get("ignored") else "✅ Enabled",
+            inline=True,
+        )
+        kwargs: dict[str, Any] = {
+            "embed": embed,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if getattr(ctx, "interaction", None) is not None:
+            kwargs["ephemeral"] = True
+        await ctx.send(**kwargs)
 
     @embedfixer_group.command(name="ignoreme")
     async def embedfixer_ignoreme(self, ctx: commands.Context, state: bool | None = None) -> None:
