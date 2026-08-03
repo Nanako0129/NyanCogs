@@ -682,6 +682,39 @@ class TransactionTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_manual_threads_share_defers_reply_interaction_before_processing(self):
+        async def scenario():
+            channel = _Channel()
+            config = _TestConfig()
+            config.guilds[9] = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "fix_mode": "reply",
+            }
+            cog = _s3_cog(config, channel)
+            ctx = SimpleNamespace(
+                author=SimpleNamespace(id=22, bot=False, roles=[]),
+                channel=channel,
+                guild=channel.guild,
+                interaction=object(),
+                defer=AsyncMock(),
+                send=AsyncMock(),
+            )
+
+            async def process(*_args, **_kwargs):
+                ctx.defer.assert_awaited_once_with(ephemeral=True)
+                return True
+
+            cog._process = process
+            await EmbedFixer.manual_fix.callback(
+                cog,
+                ctx,
+                link="https://threads.com/share/a",
+            )
+            ctx.send.assert_awaited_once()
+            self.assertEqual(ctx.send.await_args.args, ("Fixed.",))
+
+        asyncio.run(scenario())
+
     def test_threads_revalidation_uses_fresh_author_roles_before_send(self):
         async def scenario():
             channel = _Channel()

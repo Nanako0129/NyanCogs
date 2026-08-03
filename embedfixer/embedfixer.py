@@ -3664,7 +3664,15 @@ class EmbedFixer(commands.Cog):
                 sender = destination.send if funnel else None
                 deferred = False
                 if interaction is not None:
-                    if funnel or mode != "reply":
+                    if (
+                        funnel
+                        or mode != "reply"
+                        or any(
+                            target.domain.id == DomainId.THREADS
+                            and _is_threads_share_url(target.original_url)
+                            for target in targets
+                        )
+                    ):
                         await ctx.defer(ephemeral=True)
                         deferred = True
                     if not funnel:
