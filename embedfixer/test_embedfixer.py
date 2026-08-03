@@ -489,7 +489,6 @@ class TransactionTests(unittest.TestCase):
         cog = EmbedFixer.__new__(EmbedFixer)
         cog.bot = SimpleNamespace(user=SimpleNamespace(id=99))
         cog.confirm_timeout = 0.001
-        cog.confirm_poll = 0
         asyncio.run(cog._process(message, fixed_targets(message.content)))
         self.assertEqual(message.edits, [])
         self.assertTrue(channel.sent[0].deleted)
@@ -501,7 +500,6 @@ class TransactionTests(unittest.TestCase):
         cog = EmbedFixer.__new__(EmbedFixer)
         cog.bot = SimpleNamespace(user=SimpleNamespace(id=99))
         cog.confirm_timeout = 0.001
-        cog.confirm_poll = 0
         asyncio.run(cog._process(message, fixed_targets(message.content)))
         self.assertEqual(message.edits, [])
         self.assertTrue(channel.sent[0].deleted)
@@ -535,11 +533,343 @@ class TransactionTests(unittest.TestCase):
         cog = EmbedFixer.__new__(EmbedFixer)
         cog.bot = SimpleNamespace(user=SimpleNamespace(id=99))
         cog.confirm_timeout = 0.001
-        cog.confirm_poll = 0
         asyncio.run(cog._process(message, fixed_targets(message.content)))
         self.assertEqual(message.edits, [])
         self.assertTrue(channel.sent[0].deleted)
         self.assertFalse(message.deleted)
+
+    def test_threads_share_expands_to_canonical_nonrotatable_target(self):
+        async def scenario():
+            source_url = "https://www.threads.com/share/abc"
+            terminal = "https://www.threads.com/@alice/post/post1?utm_source=x"
+            channel = _Channel()
+            source = self._message(channel)
+            source.guild = channel.guild
+            source.content = source_url
+            config = _TestConfig()
+            cog = _s3_cog(config, channel)
+            cog._session = _HTTPSession(
+                {
+                    source_url: _HTTPResponse(status=302, headers={"Location": "/@alice/post/post1?utm_source=x"}),
+                    terminal: _HTTPResponse(status=200),
+                }
+            )
+
+            await cog.on_message(source)
+
+            self.assertEqual(len(channel.sent), 1)
+            replacement = channel.sent[0]
+            self.assertIn(
+                "https://fixthreads.seria.moe/@alice/post/post1",
+                replacement.content,
+            )
+            self.assertNotIn("utm_source", replacement.content)
+            self.assertEqual(replacement.view.children[0].url, source_url)
+            record = next(iter(config.global_data["replacement_records"].values()))
+            self.assertIsNone(record["source_message_id"])
+            self.assertEqual(source.edits, [{"suppress": True}])
+            self.assertTrue(
+                all(kwargs == {"allow_redirects": False} for _url, kwargs in cog._session.calls)
+            )
+
+        asyncio.run(scenario())
+
+    def test_threads_share_rejections_never_send_or_suppress(self):
+        start = "https://threads.com/share/abc"
+        cases = {
+            "off-host": {
+                start: _HTTPResponse(status=302, headers={"Location": "https://evil.example/@a/post/1"}),
+            },
+            "http": {
+                start: _HTTPResponse(status=302, headers={"Location": "http://threads.com/@a/post/1"}),
+            },
+            "userinfo": {
+                start: _HTTPResponse(status=302, headers={"Location": "https://user@threads.com/@a/post/1"}),
+            },
+            "port": {
+                start: _HTTPResponse(status=302, headers={"Location": "https://threads.com:443/@a/post/1"}),
+            },
+            "invalid-terminal": {
+                start: _HTTPResponse(status=302, headers={"Location": "/not-a-thread"}),
+                "https://threads.com/not-a-thread": _HTTPResponse(status=200),
+            },
+            "sixth-redirect": {
+                start: _HTTPResponse(status=302, headers={"Location": "/r1"}),
+                **{
+                    f"https://threads.com/r{index}": _HTTPResponse(
+                        status=302,
+                        headers={"Location": f"/r{index + 1}"},
+                    )
+                    for index in range(1, 6)
+                },
+            },
+        }
+
+        async def scenario(responses):
+            channel = _Channel()
+            source = self._message(channel)
+            source.guild = channel.guild
+            source.content = start
+            cog = _s3_cog(_TestConfig(), channel)
+            cog._session = _HTTPSession(responses)
+            await cog.on_message(source)
+            self.assertEqual(channel.sent, [])
+            self.assertEqual(source.edits, [])
+            self.assertTrue(
+                all(kwargs == {"allow_redirects": False} for _url, kwargs in cog._session.calls)
+            )
+            return len(cog._session.calls)
+
+        for name, responses in cases.items():
+            with self.subTest(name=name):
+                call_count = asyncio.run(scenario(responses))
+                if name == "sixth-redirect":
+                    self.assertEqual(call_count, 6)
+
+    def test_any_threads_share_resolution_failure_aborts_all_targets(self):
+        async def scenario(failure):
+            channel = _Channel()
+            source = self._message(channel)
+            source.guild = channel.guild
+            source.content = (
+                "https://threads.com/share/a "
+                "https://bsky.app/profile/alice/post/1 "
+                "https://threads.com/share/b"
+            )
+            cog = _s3_cog(_TestConfig(), channel)
+
+            async def resolve(url):
+                if url.endswith("/a"):
+                    return "https://threads.com/@alice/post/1"
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+
+            cog._resolve_threads_share = resolve
+            await cog.on_message(source)
+            self.assertEqual(channel.sent, [])
+            self.assertEqual(source.edits, [])
+
+        for name, failure in (("none", None), ("exception", RuntimeError("failed"))):
+            with self.subTest(name=name):
+                asyncio.run(scenario(failure))
+
+    def test_resolved_threads_shares_deduplicate_without_dropping_other_targets(self):
+        async def scenario():
+            channel = _Channel()
+            source = self._message(channel)
+            source.guild = channel.guild
+            source.content = (
+                "https://threads.com/share/a "
+                "https://bsky.app/profile/alice/post/1 "
+                "https://threads.com/share/b"
+            )
+            cog = _s3_cog(_TestConfig(), channel)
+
+            async def resolve(_url):
+                return "https://threads.com/@alice/post/1"
+
+            cog._resolve_threads_share = resolve
+            await cog.on_message(source)
+            self.assertEqual(
+                [message.embeds[0].url for message in channel.sent],
+                [
+                    "https://fixthreads.seria.moe/@alice/post/1",
+                    "https://bskx.app/profile/alice/post/1",
+                ],
+            )
+            self.assertEqual(source.edits, [{"suppress": True}])
+
+        asyncio.run(scenario())
+
+    def test_manual_threads_share_defers_reply_interaction_before_processing(self):
+        async def scenario():
+            channel = _Channel()
+            config = _TestConfig()
+            config.guilds[9] = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "fix_mode": "reply",
+            }
+            cog = _s3_cog(config, channel)
+            ctx = SimpleNamespace(
+                author=SimpleNamespace(id=22, bot=False, roles=[]),
+                channel=channel,
+                guild=channel.guild,
+                interaction=object(),
+                defer=AsyncMock(),
+                send=AsyncMock(),
+            )
+
+            async def process(*_args, **_kwargs):
+                ctx.defer.assert_awaited_once_with(ephemeral=True)
+                return True
+
+            cog._process = process
+            await EmbedFixer.manual_fix.callback(
+                cog,
+                ctx,
+                link="https://threads.com/share/a",
+            )
+            ctx.send.assert_awaited_once()
+            self.assertEqual(ctx.send.await_args.args, ("Fixed.",))
+
+        asyncio.run(scenario())
+
+    def test_threads_revalidation_uses_fresh_author_roles_before_send(self):
+        async def scenario():
+            channel = _Channel()
+            source = self._message(channel)
+            source.guild = channel.guild
+            source.author.roles = [SimpleNamespace(id=42)]
+            source.content = "https://threads.com/share/a"
+            config = _TestConfig()
+            config.guilds[9] = {
+                **copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                "whitelist_role_ids": [42],
+            }
+            cog = _s3_cog(config, channel)
+            fresh = copy.copy(source)
+            fresh.author = SimpleNamespace(bot=False, id=22, roles=[])
+            original_fetch = channel.fetch_message
+
+            async def fetch(message_id):
+                self.assertTrue(cog._s3_lock.locked())
+                if message_id == source.id:
+                    return fresh
+                return await original_fetch(message_id)
+
+            async def resolve(_url):
+                self.assertFalse(cog._s3_lock.locked())
+                return "https://threads.com/@alice/post/1"
+
+            channel.fetch_message = fetch
+            cog._resolve_threads_share = resolve
+            await cog.on_message(source)
+            self.assertEqual(channel.sent, [])
+            self.assertEqual(source.edits, [])
+
+        asyncio.run(scenario())
+
+    def test_exact_embed_event_race_fetch_bound_and_cancellation_cleanup(self):
+        class EventBot:
+            def __init__(self):
+                self.queue = asyncio.Queue()
+                self.registered = asyncio.Event()
+                self.active = 0
+
+            async def wait_for(self, event, *, check):
+                self.assert_event = event
+                self.active += 1
+                self.registered.set()
+                try:
+                    while True:
+                        payload = await self.queue.get()
+                        if check(payload):
+                            return payload
+                finally:
+                    self.active -= 1
+
+        async def event_success():
+            channel = _Channel(embeds=False)
+            target = fixed_targets("https://x.com/a/status/1")[0]
+            sent = _Sent(channel, format_fixed(target), embeds=False)
+            channel.sent.append(sent)
+            fetches = 0
+
+            async def fetch(_message_id):
+                nonlocal fetches
+                fetches += 1
+                return sent
+
+            channel.fetch_message = fetch
+            bot = EventBot()
+            cog = EmbedFixer.__new__(EmbedFixer)
+            cog.bot = bot
+            cog.confirm_timeout = 0.01
+            task = asyncio.create_task(cog._confirm_embed(sent, target.fixed_url))
+            await bot.registered.wait()
+            await bot.queue.put(
+                SimpleNamespace(
+                    message_id=sent.id,
+                    channel_id=channel.id,
+                    data={"embeds": [{"url": target.fixed_url}]},
+                )
+            )
+            self.assertTrue(await task)
+            self.assertEqual(fetches, 1)
+            self.assertEqual(bot.active, 0)
+            self.assertEqual(bot.assert_event, "raw_message_edit")
+
+        async def missed_event_final_fetch():
+            channel = _Channel(embeds=False)
+            target = fixed_targets("https://x.com/a/status/1")[0]
+            sent = _Sent(channel, format_fixed(target), embeds=False)
+            channel.sent.append(sent)
+            fetches = 0
+
+            async def fetch(_message_id):
+                nonlocal fetches
+                fetches += 1
+                return SimpleNamespace(
+                    embeds=(
+                        [SimpleNamespace(url=target.fixed_url)]
+                        if fetches == 2
+                        else []
+                    )
+                )
+
+            channel.fetch_message = fetch
+            bot = EventBot()
+            cog = EmbedFixer.__new__(EmbedFixer)
+            cog.bot = bot
+            cog.confirm_timeout = 0.001
+            task = asyncio.create_task(cog._confirm_embed(sent, target.fixed_url))
+            await bot.registered.wait()
+            await bot.queue.put(
+                SimpleNamespace(
+                    message_id=sent.id + 1,
+                    channel_id=channel.id,
+                    data={"embeds": [{"url": target.fixed_url}]},
+                )
+            )
+            await bot.queue.put(
+                SimpleNamespace(
+                    message_id=sent.id,
+                    channel_id=channel.id,
+                    data={"embeds": [{"url": "https://unrelated.example"}]},
+                )
+            )
+            self.assertTrue(await task)
+            self.assertEqual(fetches, 2)
+            self.assertEqual(bot.active, 0)
+
+        async def cancellation():
+            channel = _Channel(embeds=False)
+            target = fixed_targets("https://x.com/a/status/1")[0]
+            sent = _Sent(channel, format_fixed(target), embeds=False)
+            channel.sent.append(sent)
+            fetch_started = asyncio.Event()
+            release_fetch = asyncio.Event()
+
+            async def fetch(_message_id):
+                fetch_started.set()
+                await release_fetch.wait()
+                return sent
+
+            channel.fetch_message = fetch
+            bot = EventBot()
+            cog = EmbedFixer.__new__(EmbedFixer)
+            cog.bot = bot
+            task = asyncio.create_task(cog._confirm_embed(sent, target.fixed_url))
+            await fetch_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(bot.active, 0)
+
+        asyncio.run(event_success())
+        asyncio.run(missed_event_final_fetch())
+        asyncio.run(cancellation())
 
     def test_indeterminate_suppression_timeout_retains_confirmed_replacement(self):
         channel = _Channel()
@@ -779,6 +1109,68 @@ class SecurityS3Tests(unittest.TestCase):
             release.set()
             await task
             self.assertEqual(source.edits, [{"suppress": True}])
+
+        asyncio.run(scenario())
+
+    def test_threads_resolver_runs_unlocked_and_source_mutation_aborts_send(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            source.content = "https://threads.com/share/abc"
+            cog = _s3_cog(config, channel)
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def resolve(_url):
+                self.assertFalse(cog._s3_lock.locked())
+                entered.set()
+                await release.wait()
+                return "https://threads.com/@alice/post/post1"
+
+            cog._resolve_threads_share = resolve
+            task = asyncio.create_task(
+                cog._process(
+                    source,
+                    fixed_targets(source.content),
+                    guild=source.guild,
+                    author=source.author,
+                    channel=channel,
+                    destination=channel,
+                    guild_settings=copy.deepcopy(DEFAULT_GUILD_SETTINGS),
+                    user_settings=copy.deepcopy(DEFAULT_USER_SETTINGS),
+                    source_snapshot=cog._source_snapshot(source),
+                )
+            )
+            await entered.wait()
+            async with cog._s3_lock:
+                source.content = "https://threads.com/@changed/post/2"
+            release.set()
+            self.assertFalse(await task)
+            self.assertEqual(channel.sent, [])
+            self.assertEqual(source.edits, [])
+
+        asyncio.run(scenario())
+
+    def test_successful_persistent_flow_refetches_source_four_times(self):
+        async def scenario():
+            config = _TestConfig()
+            channel = _Channel()
+            source = self._source(channel)
+            cog = _s3_cog(config, channel)
+            original_fetch = channel.fetch_message
+            source_fetches = 0
+
+            async def fetch(message_id):
+                nonlocal source_fetches
+                if message_id == source.id:
+                    source_fetches += 1
+                return await original_fetch(message_id)
+
+            channel.fetch_message = fetch
+            await cog.on_message(source)
+            self.assertEqual(source.edits, [{"suppress": True}])
+            self.assertEqual(source_fetches, 4)
 
         asyncio.run(scenario())
 
@@ -2598,6 +2990,8 @@ class SecurityS4Tests(unittest.TestCase):
                         443,
                         socket.AF_UNSPEC,
                     )
+                with self.assertRaises(OSError):
+                    await resolver.resolve("threads.com", 443, socket.AF_UNSPEC)
             mixed = [
                 *multicast,
                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443)),
@@ -2626,8 +3020,23 @@ class SecurityS4Tests(unittest.TestCase):
             self.assertTrue(
                 all(item["hostname"] == "www.pixiv.net" for item in resolved)
             )
+            with patch.object(
+                loop,
+                "getaddrinfo",
+                new=AsyncMock(return_value=mixed),
+            ):
+                threads = await resolver.resolve(
+                    "WWW.THREADS.COM",
+                    443,
+                    socket.AF_UNSPEC,
+                )
+            self.assertTrue(
+                all(item["hostname"] == "www.threads.com" for item in threads)
+            )
             with self.assertRaises(OSError):
                 await resolver.resolve("example.com", 443)
+            with self.assertRaises(OSError):
+                await resolver.resolve("threads.com.evil", 443)
 
         asyncio.run(scenario())
 
