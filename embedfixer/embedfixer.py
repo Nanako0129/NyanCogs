@@ -1426,6 +1426,15 @@ class EmbedFixer(commands.Cog):
         settings = await self._scope_values(scope, DEFAULT_GUILD_SETTINGS)
         return _normalize_legacy_settings(settings)[0]
 
+    @staticmethod
+    def _role_allowed(author: Any, guild_settings: dict[str, Any]) -> bool:
+        allowed = _normalize_ids(guild_settings.get("whitelist_role_ids", []))
+        roles = _normalize_ids(
+            getattr(role, "id", role)
+            for role in (getattr(author, "roles", []) or [])
+        )
+        return not allowed or bool(roles.intersection(allowed))
+
     async def _context_settings(
         self,
         *,
@@ -1480,14 +1489,8 @@ class EmbedFixer(commands.Cog):
         author_id = getattr(author, "id", None)
         if author_id in _normalize_ids(guild_settings.get("ignored_users", [])):
             return None
-        role_whitelist = _normalize_ids(guild_settings.get("whitelist_role_ids", []))
-        if role_whitelist:
-            roles = _normalize_ids(
-                getattr(role, "id", role)
-                for role in (getattr(author, "roles", []) or [])
-            )
-            if not roles.intersection(role_whitelist):
-                return None
+        if not self._role_allowed(author, guild_settings):
+            return None
         channel_ids = _normalize_ids([getattr(channel, "id", None)])
         channel_id = next(iter(channel_ids), None)
         enabled_channels = _normalize_ids(guild_settings.get("enable_fix_channels", []))
@@ -2509,7 +2512,7 @@ class EmbedFixer(commands.Cog):
                 return (
                     getattr(payload, "message_id", None) == getattr(sent, "id", None)
                     and getattr(payload, "channel_id", None) == channel_id
-                    and self._has_expected_embed(getattr(payload, "message", None), raw_urls)
+                    and self._has_expected_embed(getattr(payload, "data", None), raw_urls)
                 )
 
             waiter = asyncio.create_task(
@@ -2552,9 +2555,10 @@ class EmbedFixer(commands.Cog):
     ) -> bool:
         raw_urls = (expected_url,) if isinstance(expected_url, str) else tuple(expected_url)
         raw_urls = tuple(value for value in raw_urls if isinstance(value, str) and value)
+        embeds = message.get("embeds", ()) if isinstance(message, dict) else getattr(message, "embeds", ())
         actual = {
-            getattr(embed, "url", None)
-            for embed in (getattr(message, "embeds", None) or [])
+            embed.get("url") if isinstance(embed, dict) else getattr(embed, "url", None)
+            for embed in (embeds or [])
         }
         return bool(raw_urls) and all(value in actual or _markdown_url(value) in actual for value in raw_urls)
 
@@ -2891,6 +2895,8 @@ class EmbedFixer(commands.Cog):
                     if message is not None
                     else author
                 )
+                if not self._role_allowed(validation_author, settings):
+                    return None
                 validation_channel = (
                     getattr(source_for_validation, "channel", None) or channel
                     if message is not None
@@ -2966,7 +2972,7 @@ class EmbedFixer(commands.Cog):
                         else None
                     )
                     if fixed_url is None:
-                        continue
+                        return False
                     # ponytail: share expansion is nonrotatable; re-resolve during rotation if needed.
                     expanded_targets.append(
                         replace(
@@ -2976,7 +2982,12 @@ class EmbedFixer(commands.Cog):
                             nonrotatable=True,
                         )
                     )
-                active_targets = expanded_targets
+                seen_fixed_urls: set[str] = set()
+                active_targets = []
+                for target in expanded_targets:
+                    if target.fixed_url not in seen_fixed_urls:
+                        seen_fixed_urls.add(target.fixed_url)
+                        active_targets.append(target)
                 try:
                     async with self._s3_lock:
                         if await revalidate() is None:
