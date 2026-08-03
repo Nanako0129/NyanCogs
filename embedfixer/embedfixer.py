@@ -15,7 +15,7 @@ import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Final
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 import discord
@@ -42,7 +42,6 @@ MAX_MESSAGE_CHARS: Final[int] = 4000
 MAX_CANDIDATES: Final[int] = 10
 MAX_URL_CHARS: Final[int] = 2048
 CONFIRM_TIMEOUT: Final[float] = 10.0
-CONFIRM_POLL: Final[float] = 0.1
 MAX_IMPORT_BYTES: Final[int] = 1024 * 1024
 MAX_SETTING_ITEMS: Final[int] = 1000
 MAX_SETTING_STRING: Final[int] = 256
@@ -67,6 +66,9 @@ METADATA_REQUEST_TIMEOUT: Final[float] = 5.0
 METADATA_TOTAL_TIMEOUT: Final[float] = 8.0
 METADATA_HOSTS: Final[frozenset[str]] = frozenset(
     {"api.fxtwitter.com", "www.pixiv.net", "bskx.app"}
+)
+RESOLVER_HOSTS: Final[frozenset[str]] = (
+    METADATA_HOSTS | SOURCE_HOSTS[DomainId.THREADS]
 )
 METADATA_DOMAINS: Final[frozenset[DomainId]] = frozenset(
     {DomainId.TWITTER, DomainId.PIXIV, DomainId.BLUESKY}
@@ -216,7 +218,7 @@ class SourceSnapshot:
 
 
 class MetadataResolver(aiohttp.abc.AbstractResolver):
-    """Resolve only fixed metadata hosts and discard every non-global address."""
+    """Resolve only fixed outbound hosts and discard every non-global address."""
 
     async def resolve(
         self,
@@ -225,8 +227,8 @@ class MetadataResolver(aiohttp.abc.AbstractResolver):
         family: int = socket.AF_INET,
     ) -> list[dict[str, Any]]:
         host = host.casefold()
-        if host not in METADATA_HOSTS:
-            raise OSError("metadata host is not allowed")
+        if host not in RESOLVER_HOSTS:
+            raise OSError("outbound host is not allowed")
         infos = await asyncio.get_running_loop().getaddrinfo(
             host,
             port,
@@ -633,6 +635,41 @@ def _website_for(url: str, domain: Domain) -> Website | None:
     parsed = urlsplit(clean_query(url))
     candidate = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
     return next((website for website in domain.websites if website.match(candidate)), None)
+
+
+def _canonical_threads_url(raw: Any) -> str | None:
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or len(raw) > MAX_URL_CHARS
+        or "\\" in raw
+        or any(character.isspace() or character in '<>"|' for character in raw)
+    ):
+        return None
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname
+        if (
+            parsed.scheme.casefold() != "https"
+            or host not in SOURCE_HOSTS[DomainId.THREADS]
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+            or parsed.fragment
+            or parsed.netloc.casefold() != host
+        ):
+            return None
+    except ValueError:
+        return None
+    canonical = urlunsplit(("https", host, parsed.path, parsed.query, ""))
+    return canonical if len(canonical) <= MAX_URL_CHARS else None
+
+
+def _is_threads_share_url(url: str) -> bool:
+    try:
+        return re.fullmatch(r"/share/[\w]+/?", urlsplit(url).path) is not None
+    except ValueError:
+        return False
 
 
 def extract_candidates(content: str) -> list[Candidate]:
@@ -1075,7 +1112,6 @@ class EmbedFixer(commands.Cog):
     __author__ = "Nyanako; adapted from seriaati/embed-fixer"
     __version__ = "1.3.0-s4"
     confirm_timeout = CONFIRM_TIMEOUT
-    confirm_poll = CONFIRM_POLL
 
     def __init__(self, bot: Any):
         super().__init__()
@@ -1525,6 +1561,47 @@ class EmbedFixer(commands.Cog):
             if len(format_fixed(translated)) <= DISCORD_MESSAGE_CHARS:
                 targets.append(translated)
         return targets
+
+    async def _resolve_threads_share(self, url: str) -> str | None:
+        session = getattr(self, "_session", None)
+        current = _canonical_threads_url(url)
+        if (
+            current is None
+            or not _is_threads_share_url(current)
+            or session is None
+            or bool(getattr(session, "closed", False))
+        ):
+            return None
+        try:
+            async with asyncio.timeout(METADATA_REQUEST_TIMEOUT):
+                redirects = 0
+                while True:
+                    async with session.get(current, allow_redirects=False) as response:
+                        if 300 <= response.status < 400:
+                            if redirects == 5:
+                                return None
+                            location = response.headers.get("Location")
+                            if not isinstance(location, str):
+                                return None
+                            current = _canonical_threads_url(urljoin(current, location))
+                            if current is None:
+                                return None
+                            redirects += 1
+                            continue
+                        if not 200 <= response.status < 300:
+                            return None
+                    canonical = clean_query(current)
+                    domain = source_domain_for(canonical)
+                    if (
+                        domain is None
+                        or domain.id != DomainId.THREADS
+                        or _website_for(canonical, domain) is None
+                        or _is_threads_share_url(canonical)
+                    ):
+                        return None
+                    return canonical
+        except Exception:
+            return None
 
     async def _metadata_json(self, url: str) -> Any | None:
         session = getattr(self, "_session", None)
@@ -2416,31 +2493,57 @@ class EmbedFixer(commands.Cog):
         expected_url: str | tuple[str, ...] | list[str] | set[str],
     ) -> bool:
         raw_urls = (expected_url,) if isinstance(expected_url, str) else tuple(expected_url)
-        expected_urls = {
-            variant
-            for value in raw_urls
-            if isinstance(value, str) and value
-            for variant in (value, _markdown_url(value))
-        }
-        if not expected_urls:
+        if not any(isinstance(value, str) and value for value in raw_urls):
             return False
-
-        embeds = getattr(sent, "embeds", None)
-        if embeds and self._has_expected_embed(sent, raw_urls):
+        if self._has_expected_embed(sent, raw_urls):
             return True
         fetch = getattr(getattr(sent, "channel", None), "fetch_message", None)
-        if fetch is None:
+        if not callable(fetch):
             return False
-        deadline = time.monotonic() + self.confirm_timeout
-        while time.monotonic() < deadline:
+
+        channel_id = getattr(getattr(sent, "channel", None), "id", None)
+        wait_for = getattr(getattr(self, "bot", None), "wait_for", None)
+        waiter: asyncio.Task[Any] | None = None
+        if callable(wait_for):
+            def exact_update(payload: Any) -> bool:
+                return (
+                    getattr(payload, "message_id", None) == getattr(sent, "id", None)
+                    and getattr(payload, "channel_id", None) == channel_id
+                    and self._has_expected_embed(getattr(payload, "message", None), raw_urls)
+                )
+
+            waiter = asyncio.create_task(
+                wait_for("raw_message_edit", check=exact_update)
+            )
+
+        async def fetch_matches() -> bool:
             try:
                 latest = await fetch(sent.id)
             except Exception:
                 return False
-            if self._has_expected_embed(latest, raw_urls):
+            return self._has_expected_embed(latest, raw_urls)
+
+        try:
+            if waiter is not None:
+                await asyncio.sleep(0)
+            if await fetch_matches():
                 return True
-            await asyncio.sleep(min(self.confirm_poll, max(0.0, deadline - time.monotonic())))
-        return False
+            if waiter is None:
+                await asyncio.sleep(self.confirm_timeout)
+            else:
+                try:
+                    payload = await asyncio.wait_for(waiter, timeout=self.confirm_timeout)
+                    if exact_update(payload):
+                        return True
+                except TimeoutError:
+                    pass
+                except Exception:
+                    pass
+            return await fetch_matches()
+        finally:
+            if waiter is not None:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
 
     @staticmethod
     def _has_expected_embed(
@@ -2714,6 +2817,7 @@ class EmbedFixer(commands.Cog):
                 return False
             expected_guild_settings = copy.deepcopy(guild_settings) if guild_settings is not None else None
             expected_user_settings = copy.deepcopy(user_settings) if user_settings is not None else None
+            active_targets = list(targets[:MAX_CANDIDATES])
             sent: list[Any] = []
             confirmed_count = 0
             persisted_ids: set[int] = set()
@@ -2733,10 +2837,6 @@ class EmbedFixer(commands.Cog):
                 ):
                     return None
                 lookup_source = message
-                if message is not None and expected_source is not None:
-                    lookup_source = await self._refetch_snapshot(message, expected_source)
-                    if lookup_source is None:
-                        return None
                 lookup_guild = (
                     getattr(lookup_source, "guild", None) or guild
                     if message is not None
@@ -2839,9 +2939,58 @@ class EmbedFixer(commands.Cog):
                     return False
                 return True
 
+            share_indexes = [
+                index
+                for index, target in enumerate(active_targets)
+                if target.domain.id == DomainId.THREADS
+                and _is_threads_share_url(target.original_url)
+            ]
+            if share_indexes:
+                resolved_shares = await asyncio.gather(
+                    *(
+                        self._resolve_threads_share(active_targets[index].original_url)
+                        for index in share_indexes
+                    ),
+                    return_exceptions=True,
+                )
+                resolutions = dict(zip(share_indexes, resolved_shares, strict=True))
+                expanded_targets: list[FixedTarget] = []
+                for index, target in enumerate(active_targets):
+                    if index not in resolutions:
+                        expanded_targets.append(target)
+                        continue
+                    canonical = resolutions[index]
+                    fixed_url = (
+                        apply_fix(canonical, target.method, DomainId.THREADS)
+                        if isinstance(canonical, str)
+                        else None
+                    )
+                    if fixed_url is None:
+                        continue
+                    # ponytail: share expansion is nonrotatable; re-resolve during rotation if needed.
+                    expanded_targets.append(
+                        replace(
+                            target,
+                            fixed_url=fixed_url,
+                            author=author_profile(canonical, target.domain),
+                            nonrotatable=True,
+                        )
+                    )
+                active_targets = expanded_targets
+                try:
+                    async with self._s3_lock:
+                        if await revalidate() is None:
+                            return False
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return False
+                if not active_targets:
+                    return False
+
             try:
-                # Sending and provider preview polling intentionally happen without _s3_lock.
-                for target in targets:
+                # Sending and provider preview confirmation intentionally happen without _s3_lock.
+                for target in active_targets:
                     send = sender
                     kwargs: dict[str, Any] = {"allowed_mentions": discord.AllowedMentions.none()}
                     if send is None and mode == "reply" and message is not None:
@@ -2890,7 +3039,7 @@ class EmbedFixer(commands.Cog):
                     records = self._record_batch(
                         message,
                         sent,
-                        targets,
+                        active_targets,
                         guild=validation_guild,
                         author=validation_author,
                         channel=validation_channel,
@@ -2928,7 +3077,7 @@ class EmbedFixer(commands.Cog):
                 }
                 try:
                     for replacement, target in sorted(
-                        zip(sent, targets, strict=True),
+                        zip(sent, active_targets, strict=True),
                         key=lambda item: item[0].id,
                     ):
                         await self._add_controls(
