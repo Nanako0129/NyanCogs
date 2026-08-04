@@ -540,8 +540,8 @@ class TransactionTests(unittest.TestCase):
 
     def test_threads_share_expands_to_canonical_nonrotatable_target(self):
         async def scenario():
-            source_url = "https://www.threads.com/share/abc"
-            terminal = "https://www.threads.com/@alice/post/post1?utm_source=x"
+            source_url = "https://www.threads.com/share/BAIagmYIGX/"
+            terminal = "https://www.threads.com/@nyanako0129/post/DbiAWVbm4k-?xmt=token&slof=1"
             channel = _Channel()
             source = self._message(channel)
             source.guild = channel.guild
@@ -550,7 +550,12 @@ class TransactionTests(unittest.TestCase):
             cog = _s3_cog(config, channel)
             cog._session = _HTTPSession(
                 {
-                    source_url: _HTTPResponse(status=302, headers={"Location": "/@alice/post/post1?utm_source=x"}),
+                    source_url: _HTTPResponse(
+                        status=302,
+                        headers={
+                            "Location": "/@nyanako0129/post/DbiAWVbm4k-?xmt=token&slof=1"
+                        },
+                    ),
                     terminal: _HTTPResponse(status=200),
                 }
             )
@@ -560,10 +565,11 @@ class TransactionTests(unittest.TestCase):
             self.assertEqual(len(channel.sent), 1)
             replacement = channel.sent[0]
             self.assertIn(
-                "https://fixthreads.seria.moe/@alice/post/post1",
+                "https://fixthreads.seria.moe/@nyanako0129/post/DbiAWVbm4k-",
                 replacement.content,
             )
-            self.assertNotIn("utm_source", replacement.content)
+            self.assertNotIn("xmt", replacement.content)
+            self.assertNotIn("slof", replacement.content)
             self.assertEqual(replacement.view.children[0].url, source_url)
             record = next(iter(config.global_data["replacement_records"].values()))
             self.assertIsNone(record["source_message_id"])
