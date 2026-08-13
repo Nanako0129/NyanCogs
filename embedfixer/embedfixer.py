@@ -667,7 +667,7 @@ def _canonical_threads_url(raw: Any) -> str | None:
 
 def _is_threads_share_url(url: str) -> bool:
     try:
-        return re.fullmatch(r"/share/[\w]+/?", urlsplit(url).path) is not None
+        return re.fullmatch(r"/share/[\w-]+/?", urlsplit(url).path) is not None
     except ValueError:
         return False
 
@@ -1045,15 +1045,6 @@ def _channel_permission_ok(channel: Any, guild: Any, bot: Any, *, manage_message
     if manage_messages:
         required.append("manage_messages")
     return all(bool(getattr(permissions, name, False)) for name in required)
-
-
-def _permission_ok(message: discord.Message, bot: Any) -> bool:
-    return _channel_permission_ok(
-        getattr(message, "channel", None),
-        getattr(message, "guild", None),
-        bot,
-        manage_messages=True,
-    )
 
 
 def _source_permission_ok(channel: Any, guild: Any, bot: Any, *, manage_messages: bool) -> bool:
@@ -1474,7 +1465,10 @@ class EmbedFixer(commands.Cog):
             return None
 
         guild_scope = self.config.guild(guild)
-        guild_settings = await self._scope_values(guild_scope, DEFAULT_GUILD_SETTINGS)
+        guild_settings, user_settings = await asyncio.gather(
+            self._scope_values(guild_scope, DEFAULT_GUILD_SETTINGS),
+            self._scope_values(self.config.user(author), DEFAULT_USER_SETTINGS),
+        )
         guild_settings, changed = _normalize_legacy_settings(guild_settings)
         if changed:
             await guild_scope.set(guild_settings)
@@ -1483,7 +1477,6 @@ class EmbedFixer(commands.Cog):
         if getattr(author, "bot", False) and not guild_settings.get("bot_visibility", False):
             return None
 
-        user_settings = await self._scope_values(self.config.user(author), DEFAULT_USER_SETTINGS)
         if automatic and user_settings.get("ignored"):
             return None
         author_id = getattr(author, "id", None)
@@ -1598,7 +1591,6 @@ class EmbedFixer(commands.Cog):
                     if (
                         domain is None
                         or domain.id != DomainId.THREADS
-                        or _website_for(canonical, domain) is None
                         or _is_threads_share_url(canonical)
                     ):
                         return None
@@ -2535,11 +2527,8 @@ class EmbedFixer(commands.Cog):
                 await asyncio.sleep(self.confirm_timeout)
             else:
                 try:
-                    payload = await asyncio.wait_for(waiter, timeout=self.confirm_timeout)
-                    if exact_update(payload):
-                        return True
-                except TimeoutError:
-                    pass
+                    await asyncio.wait_for(waiter, timeout=self.confirm_timeout)
+                    return True
                 except Exception:
                     pass
             return await fetch_matches()
@@ -2966,11 +2955,9 @@ class EmbedFixer(commands.Cog):
                         expanded_targets.append(target)
                         continue
                     canonical = resolutions[index]
-                    fixed_url = (
-                        apply_fix(canonical, target.method, DomainId.THREADS)
-                        if isinstance(canonical, str)
-                        else None
-                    )
+                    if not isinstance(canonical, str):
+                        return False
+                    fixed_url = apply_fix(canonical, target.method, DomainId.THREADS)
                     if fixed_url is None:
                         return False
                     # ponytail: share expansion is nonrotatable; re-resolve during rotation if needed.
@@ -2996,9 +2983,6 @@ class EmbedFixer(commands.Cog):
                     raise
                 except Exception:
                     return False
-                if not active_targets:
-                    return False
-
             try:
                 # Sending and provider preview confirmation intentionally happen without _s3_lock.
                 for target in active_targets:
