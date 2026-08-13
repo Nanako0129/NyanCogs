@@ -539,8 +539,7 @@ class TransactionTests(unittest.TestCase):
 
     def test_threads_share_expands_to_canonical_nonrotatable_target(self):
         async def scenario():
-            source_url = "https://www.threads.com/share/_7urr-KCVx/"
-            terminal = "https://www.threads.com/@nyanako0129/post/DbiAWVbm4k-?xmt=token&slof=1"
+            source_url = "https://www.threads.com/share/BBL3p-ZGWJ/"
             channel = _Channel()
             source = self._message(channel)
             source.guild = channel.guild
@@ -552,10 +551,9 @@ class TransactionTests(unittest.TestCase):
                     source_url: _HTTPResponse(
                         status=302,
                         headers={
-                            "Location": "/@nyanako0129/post/DbiAWVbm4k-?xmt=token&slof=1"
+                            "Location": "/@omgnowihavefish/post/Db9vXy_GujS?xmt=token&slof=1"
                         },
                     ),
-                    terminal: _HTTPResponse(status=200),
                 }
             )
 
@@ -564,7 +562,7 @@ class TransactionTests(unittest.TestCase):
             self.assertEqual(len(channel.sent), 1)
             replacement = channel.sent[0]
             self.assertIn(
-                "https://fixthreads.seria.moe/@nyanako0129/post/DbiAWVbm4k-",
+                "https://fixthreads.seria.moe/@omgnowihavefish/post/Db9vXy_GujS",
                 replacement.content,
             )
             self.assertNotIn("xmt", replacement.content)
@@ -573,8 +571,9 @@ class TransactionTests(unittest.TestCase):
             record = next(iter(config.global_data["replacement_records"].values()))
             self.assertIsNone(record["source_message_id"])
             self.assertEqual(source.edits, [{"suppress": True}])
-            self.assertTrue(
-                all(kwargs == {"allow_redirects": False} for _url, kwargs in cog._session.calls)
+            self.assertEqual(
+                cog._session.calls,
+                [(source_url, {"allow_redirects": False})],
             )
 
         asyncio.run(scenario())

@@ -1583,18 +1583,18 @@ class EmbedFixer(commands.Cog):
                             if current is None:
                                 return None
                             redirects += 1
+                            canonical = clean_query(current)
+                            domain = source_domain_for(canonical)
+                            if (
+                                domain is not None
+                                and domain.id == DomainId.THREADS
+                                and not _is_threads_share_url(canonical)
+                            ):
+                                return canonical
                             continue
                         if not 200 <= response.status < 300:
                             return None
-                    canonical = clean_query(current)
-                    domain = source_domain_for(canonical)
-                    if (
-                        domain is None
-                        or domain.id != DomainId.THREADS
-                        or _is_threads_share_url(canonical)
-                    ):
-                        return None
-                    return canonical
+                    return None
         except Exception:
             return None
 
