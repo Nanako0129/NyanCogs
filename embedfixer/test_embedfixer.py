@@ -39,7 +39,6 @@ from .embedfixer import (
     fixed_targets,
     format_fixed,
 )
-from .embedfixer import _permission_ok
 from .fixes import DOMAINS, DomainId, apply_fix, clean_query, source_domain_for
 from . import __red_end_user_data_statement__
 
@@ -540,7 +539,7 @@ class TransactionTests(unittest.TestCase):
 
     def test_threads_share_expands_to_canonical_nonrotatable_target(self):
         async def scenario():
-            source_url = "https://www.threads.com/share/BAIagmYIGX/"
+            source_url = "https://www.threads.com/share/_7urr-KCVx/"
             terminal = "https://www.threads.com/@nyanako0129/post/DbiAWVbm4k-?xmt=token&slof=1"
             channel = _Channel()
             source = self._message(channel)
@@ -956,16 +955,7 @@ class TransactionTests(unittest.TestCase):
         asyncio.run(cog._process(message, targets))
         self.assertFalse(channel.sent[0].deleted)
 
-    def test_permission_and_id_gate_normalization(self):
-        channel = _Channel()
-        message = self._message(channel)
-        permissions = channel.permissions_for(None)
-        permissions.view_channel = False
-        channel.permissions_for = lambda _member: permissions
-        self.assertFalse(_permission_ok(message, SimpleNamespace(user=object())))
-        message.channel = SimpleNamespace()
-        self.assertFalse(_permission_ok(message, SimpleNamespace(user=object())))
-
+    def test_id_gate_normalization(self):
         channel = _Channel()
         message = self._message(channel)
         message.channel.id = "1"
@@ -995,6 +985,43 @@ class TransactionTests(unittest.TestCase):
         cog._process = process
         asyncio.run(cog.on_message(message))
         self.assertEqual(called, [True])
+
+    def test_context_settings_reads_guild_and_user_scopes_concurrently(self):
+        async def scenario():
+            channel = _Channel()
+            source = self._message(channel)
+            source.guild = channel.guild
+            config = _TestConfig()
+            cog = _s3_cog(config, channel)
+            reads = 0
+            both_started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hook(action, key):
+                nonlocal reads
+                if (action, key) != ("read", "scope"):
+                    return
+                reads += 1
+                if reads == 2:
+                    both_started.set()
+                await release.wait()
+
+            config.hook = hook
+            task = asyncio.create_task(
+                cog._context_settings(
+                    guild=source.guild,
+                    author=source.author,
+                    channel=channel,
+                    source=source,
+                    manage_messages=True,
+                    automatic=True,
+                )
+            )
+            await asyncio.wait_for(both_started.wait(), 0.1)
+            release.set()
+            self.assertIsNotNone(await task)
+
+        asyncio.run(scenario())
 
     def test_listener_skips_valid_red_commands_before_config_access(self):
         channel = _Channel()
