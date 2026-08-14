@@ -58,7 +58,13 @@ class TestConfiguration(unittest.TestCase):
         self.assertEqual(GUILD_DEFAULTS["enabled"], False)
         self.assertEqual(GUILD_DEFAULTS["auto_message_count"], 100)
         self.assertEqual(GUILD_DEFAULTS["new_messages_required"], 20)
+        self.assertEqual(GUILD_DEFAULTS["request_timeout_seconds"], 600)
         self.assertFalse({"api_key", "prompt", "response", "messages"} & set(GUILD_DEFAULTS))
+
+    def test_request_timeout_supports_long_running_agents(self) -> None:
+        self.assertEqual(ChannelSummary._parse_setting_value("request_timeout_seconds", "3600"), 3_600)
+        with self.assertRaisesRegex(ValueError, "between 15 and 3600"):
+            ChannelSummary._parse_setting_value("request_timeout_seconds", "3601")
 
     def test_profile_and_origin_validation(self) -> None:
         raw = {
@@ -210,13 +216,23 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
             ("api.example", 443),
         ])
 
-    async def test_request_timeout_includes_dns_resolution(self) -> None:
+    async def test_dns_resolution_uses_short_connection_timeout(self) -> None:
         cog = object.__new__(ChannelSummary)
         cog.get_api_key = AsyncMock(return_value="secret")
-        cog._resolve_profile = AsyncMock(side_effect=asyncio.TimeoutError)
+        cog._resolve_profile = AsyncMock(
+            return_value=("example.com", 443, (("8.8.8.8", socket.AF_INET),))
+        )
 
-        with self.assertRaises(SummaryError) as caught:
-            await cog.request_provider(profile("generic_chat"), {}, timeout_seconds=15)
+        async def expire_resolution(awaitable, *, timeout):
+            await awaitable
+            self.assertEqual(timeout, 15)
+            raise asyncio.TimeoutError
+
+        with (
+            patch("channelsummary.channelsummary.asyncio.wait_for", side_effect=expire_resolution),
+            self.assertRaises(SummaryError) as caught,
+        ):
+            await cog.request_provider(profile("generic_chat"), {}, timeout_seconds=3_600)
 
         self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_TIMEOUT)
 
@@ -1144,6 +1160,8 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
     def test_slash_command_defers_before_channel_history_scans(self) -> None:
         source = inspect.getsource(ChannelSummary._execute_summary)
         self.assertLess(source.index("await ctx.defer()"), source.index("await self._snapshot_message("))
+        self.assertIn("progress = await ctx.channel.send(", source)
+        self.assertNotIn("interaction.edit_original_response", source)
         self.assertLess(source.index("正在讀取訊息"), source.index("await self._snapshot_message("))
         self.assertLess(source.index("補齊話題脈絡"), source.index("await self._run_agent("))
         self.assertLess(source.index("await self._base_messages("), source.index("await self._run_agent("))
