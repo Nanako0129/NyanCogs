@@ -1,0 +1,12 @@
+{
+    "name": "ChannelSummary",
+    "author": ["Nyanako"],
+    "short": "Create bounded, attributed channel summaries with an LLM agent.",
+    "description": "Summarizes an explicit current-channel message range, preserves validated speaker mentions, and can use bounded channel-history and provider-native web-search tools.",
+    "install_msg": "Load with `[p]load channelsummary`, configure owner provider profiles with `[p]summary provider`, then use `/summary settings` in each server. Read the displayed privacy notice before enabling it.",
+    "tags": ["summary", "llm", "utility"],
+    "min_bot_version": "3.5.24",
+    "min_python_version": [3, 11, 0],
+    "requirements": [],
+    "end_user_data_statement": "This cog stores global non-secret provider profile metadata, per-guild summary settings, and per-channel successful-summary checkpoint message IDs and timestamps. It does not store API keys, message content, prompts, model responses, web searches, or summaries. API keys are stored only by Red's shared API token system. When a summary is requested, selected Discord message text, stable user and message IDs, timestamps, reply metadata, attachment URLs, embed metadata, and agent-generated web queries may be sent transiently to the selected external provider and its search backend. Their retention policies apply. HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP provider, API keys and selected Discord data traverse the LAN unencrypted; use HTTP only on a trusted LAN. The cog has no per-user stored data, so user-data deletion is a no-op."
+}
