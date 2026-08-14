@@ -58,7 +58,13 @@ class TestConfiguration(unittest.TestCase):
         self.assertEqual(GUILD_DEFAULTS["enabled"], False)
         self.assertEqual(GUILD_DEFAULTS["auto_message_count"], 100)
         self.assertEqual(GUILD_DEFAULTS["new_messages_required"], 20)
+        self.assertEqual(GUILD_DEFAULTS["request_timeout_seconds"], 600)
         self.assertFalse({"api_key", "prompt", "response", "messages"} & set(GUILD_DEFAULTS))
+
+    def test_request_timeout_supports_long_running_agents(self) -> None:
+        self.assertEqual(ChannelSummary._parse_setting_value("request_timeout_seconds", "3600"), 3_600)
+        with self.assertRaisesRegex(ValueError, "between 15 and 3600"):
+            ChannelSummary._parse_setting_value("request_timeout_seconds", "3601")
 
     def test_profile_and_origin_validation(self) -> None:
         raw = {

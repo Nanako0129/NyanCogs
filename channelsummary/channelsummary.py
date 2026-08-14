@@ -61,7 +61,7 @@ GUILD_DEFAULTS: dict[str, Any] = {
     "web_enabled": True,
     "web_max_tool_calls": 5,
     "web_max_results": 5,
-    "request_timeout_seconds": 90,
+    "request_timeout_seconds": 600,
     "user_cooldown_seconds": 120,
     "guild_attempts_per_hour": 20,
     "guild_concurrency": 2,
@@ -85,7 +85,7 @@ SETTING_RULES: dict[str, tuple[type, Any, Any] | tuple[type, set[Any]]] = {
     "web_enabled": (bool, None, None),
     "web_max_tool_calls": (int, 0, 15),
     "web_max_results": (int, 0, 15),
-    "request_timeout_seconds": (int, 15, 180),
+    "request_timeout_seconds": (int, 15, 3_600),
     "user_cooldown_seconds": (int, 0, 3_600),
     "guild_attempts_per_hour": (int, 1, 200),
     "guild_concurrency": (int, 1, 5),
@@ -2133,7 +2133,7 @@ class ChannelSummary(commands.Cog):
                 "`max_distinct_messages` 1–1000\n"
                 "`max_input_chars` 10000–250000 · `max_output_tokens` 256–6000\n"
                 "`web_max_tool_calls` 0–15 · `web_max_results` 0–15 · "
-                "`request_timeout_seconds` 15–180\n"
+                "`request_timeout_seconds` 15–3600\n"
                 "`user_cooldown_seconds` 0–3600 · `guild_attempts_per_hour` 1–200 · "
                 "`guild_concurrency` 1–5 · `new_messages_required` 0–500\n\n"
                 "`[p]summaryset reset <key|all>` · "
