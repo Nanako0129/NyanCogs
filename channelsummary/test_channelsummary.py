@@ -1150,6 +1150,8 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
     def test_slash_command_defers_before_channel_history_scans(self) -> None:
         source = inspect.getsource(ChannelSummary._execute_summary)
         self.assertLess(source.index("await ctx.defer()"), source.index("await self._snapshot_message("))
+        self.assertIn("progress = await ctx.channel.send(", source)
+        self.assertNotIn("interaction.edit_original_response", source)
         self.assertLess(source.index("正在讀取訊息"), source.index("await self._snapshot_message("))
         self.assertLess(source.index("補齊話題脈絡"), source.index("await self._run_agent("))
         self.assertLess(source.index("await self._base_messages("), source.index("await self._run_agent("))

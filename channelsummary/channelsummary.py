@@ -1571,14 +1571,14 @@ class ChannelSummary(commands.Cog):
             interaction = getattr(ctx, "interaction", None)
             if interaction is not None:
                 await ctx.defer()
-                progress = await interaction.edit_original_response(
-                    content="⏳ 正在讀取訊息…",
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                progress = await ctx.send(
-                    "⏳ 正在讀取訊息…", allowed_mentions=discord.AllowedMentions.none()
-                )
+            progress = await ctx.channel.send(
+                "⏳ 正在讀取訊息…", allowed_mentions=discord.AllowedMentions.none()
+            )
+            if interaction is not None:
+                try:
+                    await interaction.delete_original_response()
+                except discord.HTTPException:
+                    pass
 
             async def update_progress(content: str) -> None:
                 try:
