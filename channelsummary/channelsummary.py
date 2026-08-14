@@ -470,7 +470,13 @@ def _public_citation(raw: Mapping[str, Any]) -> Citation:
         raise SummaryError(ErrorCode.RESPONSE_INVALID)
     url = citation.get("url")
     title = citation.get("title", "Source")
-    if not isinstance(url, str) or not isinstance(title, str) or len(url) > 2_048 or len(title) > 256:
+    if (
+        not isinstance(url, str)
+        or not isinstance(title, str)
+        or len(url) > 2_048
+        or len(title) > 256
+        or any(not char.isprintable() or char.isspace() or char in "()[]<>\\" for char in url)
+    ):
         raise SummaryError(ErrorCode.RESPONSE_INVALID)
     parts = urlsplit(url)
     if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
@@ -1187,16 +1193,21 @@ class ChannelSummary(commands.Cog):
         before = discord.Object(id=snapshot.id + 1)
         include_bots = bool(settings["include_bots"])
         maximum = int(settings["max_distinct_messages"])
+
+        def add_within(message: discord.Message, limit: int) -> bool:
+            if message.id not in state.messages and len(state.messages) >= limit:
+                return False
+            state.messages[message.id] = message
+            return len(state.messages) < limit
+
         if mode == "auto":
-            wanted = int(value or settings["auto_message_count"])
+            wanted = int(settings["auto_message_count"] if value is None else value)
             if not 1 <= wanted <= min(500, maximum):
                 raise commands.UserFeedbackCheckFailure("Auto count must fit the configured message limit.")
             async for message in channel.history(limit=max(0, 1_000 - state.inspected), before=before):
                 state.inspected += 1
-                if is_eligible(message, include_bots, invocation_id):
-                    state.messages[message.id] = message
-                    if len(state.messages) >= wanted:
-                        break
+                if is_eligible(message, include_bots, invocation_id) and not add_within(message, wanted):
+                    break
         elif mode == "from":
             start_id = int(value)
             state.hard_start_id = start_id
@@ -1207,10 +1218,8 @@ class ChannelSummary(commands.Cog):
                 limit=max(0, 1_000 - state.inspected), before=before, after=after, oldest_first=True
             ):
                 state.inspected += 1
-                if is_eligible(message, include_bots, invocation_id):
-                    state.messages[message.id] = message
-                    if len(state.messages) >= maximum:
-                        break
+                if is_eligible(message, include_bots, invocation_id) and not add_within(message, maximum):
+                    break
             if start_id not in state.messages:
                 raise commands.UserFeedbackCheckFailure("The start message is unavailable or not eligible.")
         elif mode == "time":
@@ -1222,10 +1231,8 @@ class ChannelSummary(commands.Cog):
                 limit=max(0, 1_000 - state.inspected), before=before, after=cutoff, oldest_first=True
             ):
                 state.inspected += 1
-                if is_eligible(message, include_bots, invocation_id):
-                    state.messages[message.id] = message
-                    if len(state.messages) >= maximum:
-                        break
+                if is_eligible(message, include_bots, invocation_id) and not add_within(message, maximum):
+                    break
         else:
             raise ValueError(mode)
         if not state.messages:
@@ -1833,7 +1840,18 @@ class ChannelSummary(commands.Cog):
         if key == "all":
             await self.config.guild(ctx.guild).clear()
         elif key in GUILD_DEFAULTS and key not in {"enabled", "disclosure_version"}:
-            await self.config.guild(ctx.guild).set_raw(key, value=GUILD_DEFAULTS[key])
+            default = GUILD_DEFAULTS[key]
+            if key in {"provider_profile", "model"}:
+                updated = await self.config.guild(ctx.guild).all()
+                updated.update({key: default, "enabled": False, "disclosure_version": 0})
+                await self.config.guild(ctx.guild).set(updated)
+            else:
+                value = str(default).lower() if isinstance(default, bool) else str(default)
+                try:
+                    await self.apply_settings_values(ctx.guild, {key: value})
+                except (SummaryError, ValueError) as error:
+                    await self._send_plain(ctx, str(error))
+                    return
         else:
             await self._send_plain(ctx, "Unknown or protected setting key.")
             return

@@ -5,11 +5,13 @@ from __future__ import annotations
 import inspect
 import socket
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock, patch
+
+from redbot.core import commands
 
 from .channelsummary import (
     CHANNEL_DEFAULTS,
@@ -286,6 +288,26 @@ class TestPayloads(unittest.TestCase):
 
 
 class TestResponseBoundary(unittest.TestCase):
+    @staticmethod
+    def citation_response(dialect: str, url: str) -> dict:
+        annotation = {"type": "url_citation", "url": url, "title": "source"}
+        if dialect == "generic_chat":
+            return {
+                "choices": [
+                    {"message": {"role": "assistant", "content": "x", "annotations": [annotation]}}
+                ]
+            }
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "id": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "x", "annotations": [annotation]}],
+                }
+            ]
+        }
+
     def test_responses_fixture_normalizes_and_discards_reasoning(self) -> None:
         raw = {
             "model": "gpt-5.6",
@@ -335,6 +357,21 @@ class TestResponseBoundary(unittest.TestCase):
         }
         result = normalize_response("generic_chat", raw)
         self.assertEqual(result.function_calls[0].call_id, "call_1")
+
+    def test_citation_controls_and_whitespace_fail_closed_in_both_dialects(self) -> None:
+        for dialect in ("openai_responses", "generic_chat"):
+            for control in ("\x00", "\x01", "\x07", "\x1b", "\x7f", " ", "\t", "\n", "\u00a0"):
+                with self.subTest(dialect=dialect, control=ord(control)), self.assertRaises(
+                    SummaryError
+                ) as caught:
+                    normalize_response(
+                        dialect, self.citation_response(dialect, f"https://example.com/{control}")
+                    )
+                self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
+            encoded = normalize_response(
+                dialect, self.citation_response(dialect, "https://example.com/%00%29")
+            )
+            self.assertEqual(encoded.citations[0].url, "https://example.com/%00%29")
 
     def test_unknown_duplicate_and_unsafe_citation_fail_closed(self) -> None:
         fixtures = [
@@ -411,6 +448,28 @@ class TestResponseBoundary(unittest.TestCase):
                                 "text": "x",
                                 "annotations": [
                                     {"type": "url_citation", "url": "https://intranet/admin", "title": "x"}
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "markdown-url",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "x",
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://example.com/) [More](https://evil.example",
+                                        "title": "x",
+                                    }
                                 ],
                             }
                         ],
@@ -586,6 +645,23 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(str(self.messages[0].id), result)
         self.assertIn(str(self.messages[1].id), result)
+
+    async def test_base_range_rejects_zero_and_never_exceeds_one_message(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        settings = dict(GUILD_DEFAULTS)
+        settings["max_distinct_messages"] = 1
+        with self.assertRaises(commands.UserFeedbackCheckFailure):
+            await cog._base_messages(
+                self.channel, self.messages[-1], settings, "auto", 0, None, 0
+            )
+        with self.assertRaises(commands.UserFeedbackCheckFailure):
+            await cog._base_messages(
+                self.channel, self.messages[-1], settings, "from", self.messages[0].id, None, 0
+            )
+        state = await cog._base_messages(
+            self.channel, self.messages[-1], settings, "time", timedelta(hours=1), None, 0
+        )
+        self.assertEqual(set(state.messages), {self.messages[-1].id})
 
     async def test_agent_tool_round_then_structured_final(self) -> None:
         cog = object.__new__(ChannelSummary)
@@ -791,6 +867,32 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         invalid_scope.enabled.set.assert_awaited_once_with(False)
         invalid_scope.disclosure_version.set.assert_awaited_once_with(0)
         valid_scope.enabled.set.assert_not_awaited()
+
+    async def test_single_setting_reset_preserves_configuration_invariants(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        scope = MagicMock()
+        scope.all = AsyncMock(
+            return_value={**GUILD_DEFAULTS, "enabled": True, "disclosure_version": 1, "provider_profile": "main"}
+        )
+        scope.set = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        cog.apply_settings_values = AsyncMock(side_effect=ValueError("invalid default"))
+        cog._send_plain = AsyncMock()
+        ctx = MagicMock()
+        ctx.author.guild_permissions.manage_messages = True
+        ctx.tick = AsyncMock()
+
+        await ChannelSummary.settings_reset.callback(cog, ctx, "provider_profile")
+        saved = scope.set.await_args.args[0]
+        self.assertEqual(saved["provider_profile"], "")
+        self.assertFalse(saved["enabled"])
+        self.assertEqual(saved["disclosure_version"], 0)
+
+        await ChannelSummary.settings_reset.callback(cog, ctx, "web_enabled")
+        cog.apply_settings_values.assert_awaited_once_with(ctx.guild, {"web_enabled": "true"})
+        cog._send_plain.assert_awaited_once_with(ctx, "invalid default")
+        self.assertEqual(ctx.tick.await_count, 1)
 
 
 class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
