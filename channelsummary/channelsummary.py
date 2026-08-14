@@ -31,6 +31,7 @@ SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 SAFE_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
 MAX_RESPONSE_BYTES = 2_097_152
 MAX_REQUEST_BYTES = 1_048_576
+MAX_PROVIDER_PROFILES = 25
 DISCLOSURE_VERSION = 1
 
 DIALECT_PATHS = {
@@ -745,6 +746,12 @@ def validate_tool_arguments(raw: str) -> dict[str, Any]:
         or not 1 <= args["limit"] <= 100
     ):
         raise SummaryError(ErrorCode.RESPONSE_INVALID)
+    try:
+        for key in ("start_unix", "end_unix"):
+            if args[key]:
+                datetime.fromtimestamp(args[key], UTC)
+    except (OverflowError, OSError, ValueError):
+        raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
     return args
 
 
@@ -945,7 +952,7 @@ class ProfileSelect(discord.ui.Select):
                     default=name == selected,
                     description=f"{item.dialect} · web {'yes' if item.web_kind else 'no'}",
                 )
-                for name, item in sorted(profiles.items())
+                for name, item in sorted(profiles.items())[:MAX_PROVIDER_PROFILES]
             ],
         )
 
@@ -1513,6 +1520,8 @@ class ChannelSummary(commands.Cog):
         if channel_lock.locked():
             raise commands.UserFeedbackCheckFailure("A summary is already running in this channel.")
         async with channel_lock:
+            if getattr(ctx, "interaction", None) is not None:
+                await ctx.defer()
             snapshot, initial_inspected = await self._snapshot_message(
                 ctx.channel,
                 include_bots=bool(settings["include_bots"]),
@@ -1528,8 +1537,6 @@ class ChannelSummary(commands.Cog):
                     f"This channel needs {settings['new_messages_required']} new human messages after its last successful summary."
                 )
             self._reserve_user_attempt(ctx.guild.id, ctx.author.id, int(settings["user_cooldown_seconds"]))
-            if getattr(ctx, "interaction", None) is not None:
-                await ctx.defer()
             state = await self._base_messages(
                 ctx.channel,
                 snapshot,
@@ -1878,9 +1885,13 @@ class ChannelSummary(commands.Cog):
         if ctx.invoked_subcommand is None:
             await ctx.invoke(self.provider_list)
 
-    async def _disable_guilds_using_profile(self, name: str) -> None:
+    async def _disable_guilds_using_profile(
+        self, name: str, *, valid_models: Sequence[str] | None = None
+    ) -> None:
         for guild_id, settings in (await self.config.all_guilds()).items():
-            if settings.get("provider_profile") == name:
+            if settings.get("provider_profile") == name and (
+                valid_models is None or settings.get("model") not in valid_models
+            ):
                 scope = self.config.guild_from_id(int(guild_id))
                 await scope.enabled.set(False)
                 await scope.disclosure_version.set(0)
@@ -1925,6 +1936,9 @@ class ChannelSummary(commands.Cog):
         item = validate_profile(name, raw)
         profiles = await self.config.profiles()
         previous = profiles.get(item.name)
+        if previous is None and len(profiles) >= MAX_PROVIDER_PROFILES:
+            await self._send_plain(ctx, f"At most {MAX_PROVIDER_PROFILES} provider profiles may be configured.")
+            return
         profiles[item.name] = {
             "dialect": item.dialect,
             "origin": item.origin,
@@ -1970,6 +1984,7 @@ class ChannelSummary(commands.Cog):
         item = validate_profile(name, candidate)
         profiles[item.name] = candidate
         await self.config.profiles.set(profiles)
+        await self._disable_guilds_using_profile(item.name, valid_models=item.models)
         await ctx.tick()
 
     @summary_provider.command(name="key")

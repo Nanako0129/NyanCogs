@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import socket
 import unittest
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock, patch
 from .channelsummary import (
     CHANNEL_DEFAULTS,
     GUILD_DEFAULTS,
+    MAX_PROVIDER_PROFILES,
     MAX_RESPONSE_BYTES,
     ErrorCode,
     AgentSummary,
@@ -522,6 +524,12 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             '"start_unix":0,"end_unix":0,"limit":10}'
         )
         self.assertEqual(args["limit"], 10)
+        with self.assertRaises(SummaryError) as caught:
+            validate_tool_arguments(
+                '{"query":"","author_id":"","before_message_id":"","after_message_id":"",'
+                '"start_unix":100000000000000000000,"end_unix":0,"limit":10}'
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
 
     def test_summary_schema_rejects_forged_sources_and_unconfirms_bad_opener(self) -> None:
         raw = {
@@ -741,10 +749,83 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Enable / accept disclosure", labels)
         self.assertIn("Disable", labels)
 
+    def test_settings_profile_select_never_exceeds_discord_limit(self) -> None:
+        profiles = {
+            f"profile-{index}": ProviderProfile(
+                f"profile-{index}", "generic_chat", "https://example.com", "service", ("model",)
+            )
+            for index in range(MAX_PROVIDER_PROFILES + 1)
+        }
+        view = SettingsView(MagicMock(), 42, profiles, GUILD_DEFAULTS)
+        selector = next(
+            child
+            for child in view.children
+            if getattr(child, "placeholder", None) == "Select provider profile"
+        )
+        self.assertEqual(len(selector.options), MAX_PROVIDER_PROFILES)
+
+    def test_slash_command_defers_before_channel_history_scans(self) -> None:
+        source = inspect.getsource(ChannelSummary._execute_summary)
+        self.assertLess(source.index("await ctx.defer()"), source.index("await self._snapshot_message("))
+
+    async def test_model_allowlist_change_disables_invalid_guild_selections(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        invalid_scope = MagicMock()
+        invalid_scope.enabled.set = AsyncMock()
+        invalid_scope.disclosure_version.set = AsyncMock()
+        valid_scope = MagicMock()
+        valid_scope.enabled.set = AsyncMock()
+        valid_scope.disclosure_version.set = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.all_guilds = AsyncMock(
+            return_value={
+                1: {"provider_profile": "main", "model": "removed"},
+                2: {"provider_profile": "main", "model": "kept"},
+                3: {"provider_profile": "other", "model": "removed"},
+            }
+        )
+        cog.config.guild_from_id.side_effect = {1: invalid_scope, 2: valid_scope}.__getitem__
+
+        await cog._disable_guilds_using_profile("main", valid_models=("kept",))
+
+        invalid_scope.enabled.set.assert_awaited_once_with(False)
+        invalid_scope.disclosure_version.set.assert_awaited_once_with(0)
+        valid_scope.enabled.set.assert_not_awaited()
+
 
 class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
     policy = "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations"
     warning = "API keys and selected Discord data traverse the LAN unencrypted"
+
+    async def test_provider_profile_limit_and_model_change_invalidation(self) -> None:
+        raw = {
+            "dialect": "generic_chat",
+            "origin": "https://example.com",
+            "token_service": "service",
+            "models": ["old"],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog.config = MagicMock()
+        cog.config.profiles = AsyncMock(
+            return_value={f"profile-{index}": raw for index in range(MAX_PROVIDER_PROFILES)}
+        )
+        cog.config.profiles.set = AsyncMock()
+        cog._disable_guilds_using_profile = AsyncMock()
+        cog._send_plain = AsyncMock()
+        ctx = MagicMock()
+        ctx.tick = AsyncMock()
+
+        await ChannelSummary.provider_add.callback(
+            cog, ctx, "overflow", "generic_chat", "https://example.com", "service", models="model"
+        )
+        cog.config.profiles.set.assert_not_awaited()
+        self.assertIn("At most 25", cog._send_plain.await_args.args[1])
+
+        cog.config.profiles.return_value = {"main": raw}
+        await ChannelSummary.provider_models.callback(cog, ctx, "main", models="kept")
+        cog._disable_guilds_using_profile.assert_awaited_once_with(
+            "main", valid_models=("kept",)
+        )
 
     async def test_http_provider_add_warns_but_https_does_not(self) -> None:
         cog = object.__new__(ChannelSummary)
