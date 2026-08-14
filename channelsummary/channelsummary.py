@@ -492,7 +492,7 @@ def _public_citation(raw: Mapping[str, Any]) -> Citation:
     except UnicodeError:
         raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
     reserved_suffixes = (".localhost", ".local", ".internal", ".home", ".lan", ".test", ".invalid", ".example")
-    if "." not in hostname or hostname == "localhost" or hostname.endswith(reserved_suffixes):
+    if hostname.endswith(".") or "." not in hostname or hostname == "localhost" or hostname.endswith(reserved_suffixes):
         raise SummaryError(ErrorCode.RESPONSE_INVALID)
     try:
         address = ipaddress.ip_address(hostname)
@@ -650,7 +650,10 @@ def parse_duration(value: str) -> timedelta:
     amount = int(match.group(1))
     if amount <= 0:
         raise ValueError("Duration must be positive.")
-    return timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[match.group(2)]: amount})
+    try:
+        return timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[match.group(2)]: amount})
+    except OverflowError:
+        raise ValueError("Duration is too large.") from None
 
 
 def parse_message_reference(value: str, guild_id: int, channel_id: int) -> int:
@@ -834,8 +837,8 @@ def sanitize_summary_text(text: str, allowed_user_ids: set[int]) -> str:
 
     text = re.sub(r"<@!?(\d+)>", user_mention, text)
     text = re.sub(r"\[([^\]\n]{1,256})\]\((?:[^()\s]+|\([^)]*\))+\)", r"\1", text)
-    text = re.sub(r"<https?://[^>\s]+>", "[link omitted]", text)
-    text = re.sub(r"https?://\S+", "[link omitted]", text)
+    text = re.sub(r"<https?://[^>\s]+>", "[link omitted]", text, flags=re.IGNORECASE)
+    text = re.sub(r"https?://\S+", "[link omitted]", text, flags=re.IGNORECASE)
     text = re.sub(r"<@&\d+>|<#\d+>", "[mention omitted]", text)
     text = re.sub(r"@(everyone|here)", r"＠\1", text, flags=re.IGNORECASE)
     text = discord.utils.escape_markdown(text)
@@ -1154,7 +1157,7 @@ class ChannelSummary(commands.Cog):
                 await resolver.close()
         try:
             decoded = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except ValueError:
             raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
         return normalize_response(profile.dialect, decoded)
 

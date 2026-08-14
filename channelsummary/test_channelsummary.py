@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import socket
+import sys
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -261,6 +262,38 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(session.post.call_args.args[0], origin + "/v1/chat/completions")
                 self.assertEqual(session.post.call_args.kwargs["headers"]["Host"], expected_host)
 
+    async def test_json_integer_limit_is_invalid_and_closes_resolver(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog.get_api_key = AsyncMock(return_value="secret")
+        cog._resolve_profile = AsyncMock(
+            return_value=("example.com", 443, (("8.8.8.8", socket.AF_INET),))
+        )
+        resolver = MagicMock()
+        resolver.close = AsyncMock()
+        response = SimpleNamespace(status=200)
+        response_context = MagicMock()
+        response_context.__aenter__ = AsyncMock(return_value=response)
+        response_context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post.return_value = response_context
+        session_context = MagicMock()
+        session_context.__aenter__ = AsyncMock(return_value=session)
+        session_context.__aexit__ = AsyncMock(return_value=False)
+        raw = b'{"value":' + b"1" * (sys.get_int_max_str_digits() + 1) + b"}"
+        with (
+            patch("channelsummary.channelsummary.PinnedResolver", return_value=resolver),
+            patch("channelsummary.channelsummary.aiohttp.TCPConnector", return_value=object()),
+            patch("channelsummary.channelsummary.aiohttp.ClientSession", return_value=session_context),
+            patch("channelsummary.channelsummary.read_bounded_response", AsyncMock(return_value=raw)),
+            patch("channelsummary.channelsummary.normalize_response") as normalize,
+        ):
+            with self.assertRaises(SummaryError) as caught:
+                await cog.request_provider(profile("generic_chat"), {}, timeout_seconds=15)
+
+        self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
+        normalize.assert_not_called()
+        resolver.close.assert_awaited_once()
+
 
 class TestPayloads(unittest.TestCase):
     def build(
@@ -395,6 +428,21 @@ class TestResponseBoundary(unittest.TestCase):
                 dialect, self.citation_response(dialect, "https://example.com/%00%29")
             )
             self.assertEqual(encoded.citations[0].url, "https://example.com/%00%29")
+
+    def test_trailing_dot_citations_fail_closed_in_both_dialects(self) -> None:
+        for dialect in ("openai_responses", "generic_chat"):
+            for host in ("localhost.", "127.0.0.1.", "192.168.1.2.", "example.com.", "example.com。"):
+                with self.subTest(dialect=dialect, host=host), self.assertRaises(
+                    SummaryError
+                ) as caught:
+                    normalize_response(
+                        dialect, self.citation_response(dialect, f"https://{host}/source")
+                    )
+                self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
+            accepted = normalize_response(
+                dialect, self.citation_response(dialect, "https://example.com/source")
+            )
+            self.assertEqual(accepted.citations[0].url, "https://example.com/source")
 
     def test_unknown_duplicate_and_unsafe_citation_fail_closed(self) -> None:
         fixtures = [
@@ -613,6 +661,10 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
 
+    def test_duration_overflow_uses_validation_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Duration is too large"):
+            parse_duration("1000000000d")
+
     def test_summary_schema_rejects_forged_sources_and_unconfirms_bad_opener(self) -> None:
         raw = {
             "overview": "overview",
@@ -646,6 +698,14 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<#", rendered)
         self.assertNotIn("@everyone", rendered)
         self.assertNotIn("999999999999999999", rendered)
+
+    def test_safe_summary_rendering_removes_mixed_case_urls(self) -> None:
+        rendered = sanitize_summary_text(
+            "<HTTPS://UPPER.example/path> and hTtP://mixed.example/path",
+            set(),
+        )
+        self.assertNotIn("upper.example", rendered.casefold())
+        self.assertNotIn("mixed.example", rendered.casefold())
 
     async def test_channel_tool_cannot_search_before_explicit_start(self) -> None:
         cog = object.__new__(ChannelSummary)
