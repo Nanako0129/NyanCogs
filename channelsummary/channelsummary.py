@@ -21,6 +21,7 @@ import aiohttp
 import discord
 from redbot.core import Config, checks, commands
 from redbot.core.bot import Red
+from redbot.core.utils.chat_formatting import pagify
 from redbot.core.utils.views import SetApiView
 
 
@@ -1110,22 +1111,27 @@ class ChannelSummary(commands.Cog):
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > MAX_REQUEST_BYTES:
             raise SummaryError(ErrorCode.REQUEST_TOO_LARGE)
-        host, port, addresses = await self._resolve_profile(profile)
-        resolver = PinnedResolver(host, port, addresses)
-        is_http = urlsplit(profile.endpoint).scheme == "http"
-        connector = aiohttp.TCPConnector(
-            resolver=resolver,
-            ssl=False if is_http else ssl.create_default_context(),
-        )
-        timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(15, timeout_seconds), sock_read=timeout_seconds)
+        resolver = None
         try:
-            async with aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                trust_env=False,
-                cookie_jar=aiohttp.DummyCookieJar(),
-            ) as session:
-                try:
+            async with asyncio.timeout(timeout_seconds):
+                host, port, addresses = await self._resolve_profile(profile)
+                resolver = PinnedResolver(host, port, addresses)
+                is_http = urlsplit(profile.endpoint).scheme == "http"
+                connector = aiohttp.TCPConnector(
+                    resolver=resolver,
+                    ssl=False if is_http else ssl.create_default_context(),
+                )
+                timeout = aiohttp.ClientTimeout(
+                    total=timeout_seconds,
+                    connect=min(15, timeout_seconds),
+                    sock_read=timeout_seconds,
+                )
+                async with aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    trust_env=False,
+                    cookie_jar=aiohttp.DummyCookieJar(),
+                ) as session:
                     async with session.post(
                         profile.endpoint,
                         data=encoded,
@@ -1139,12 +1145,13 @@ class ChannelSummary(commands.Cog):
                         if not 200 <= response.status < 300:
                             raise SummaryError(_http_error(response.status))
                         raw = await read_bounded_response(response)
-                except asyncio.TimeoutError:
-                    raise SummaryError(ErrorCode.PROVIDER_TIMEOUT) from None
-                except aiohttp.ClientError:
-                    raise SummaryError(ErrorCode.PROVIDER_UNAVAILABLE) from None
+        except asyncio.TimeoutError:
+            raise SummaryError(ErrorCode.PROVIDER_TIMEOUT) from None
+        except aiohttp.ClientError:
+            raise SummaryError(ErrorCode.PROVIDER_UNAVAILABLE) from None
         finally:
-            await resolver.close()
+            if resolver is not None:
+                await resolver.close()
         try:
             decoded = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1176,11 +1183,12 @@ class ChannelSummary(commands.Cog):
         *,
         include_bots: bool,
         invocation_id: int | None,
+        progress_id: int | None = None,
     ) -> tuple[discord.Message, int]:
         inspected = 0
         async for message in channel.history(limit=1_000):
             inspected += 1
-            if is_eligible(message, include_bots, invocation_id):
+            if message.id != progress_id and is_eligible(message, include_bots, invocation_id):
                 return message, inspected
         raise commands.UserFeedbackCheckFailure("There are no eligible messages to summarize.")
 
@@ -1570,6 +1578,7 @@ class ChannelSummary(commands.Cog):
                     ctx.channel,
                     include_bots=bool(settings["include_bots"]),
                     invocation_id=invocation_id,
+                    progress_id=progress.id,
                 )
                 if not await self._checkpoint_ready(
                     ctx.channel,
@@ -1982,7 +1991,8 @@ class ChannelSummary(commands.Cog):
             lines.append(
                 f"`{item.name}` — `{item.dialect}` — {len(item.models)} model(s) — web=`{bool(item.web_kind)}` — token service=`{item.token_service}`"
             )
-        await self._send_plain(ctx, "\n".join(lines))
+        for page in pagify("\n".join(lines), page_length=1_900):
+            await self._send_plain(ctx, page)
 
     @summary_provider.command(name="add")
     async def provider_add(

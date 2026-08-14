@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import socket
 import unittest
@@ -206,6 +207,16 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
             ("::1", 80),
             ("api.example", 443),
         ])
+
+    async def test_request_timeout_includes_dns_resolution(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog.get_api_key = AsyncMock(return_value="secret")
+        cog._resolve_profile = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        with self.assertRaises(SummaryError) as caught:
+            await cog.request_provider(profile("generic_chat"), {}, timeout_seconds=15)
+
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_TIMEOUT)
 
     async def test_connector_tls_and_host_authority_follow_normalized_scheme(self) -> None:
         expected = NormalizedResponse("ok", None, (), (), "model", 0)
@@ -700,6 +711,21 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIn("exceeds", str(caught.exception))
 
+    async def test_snapshot_excludes_progress_message_when_bots_are_included(self) -> None:
+        progress = FakeMessage(444444444444444444, 999999999999999999, "progress", 59)
+        progress.author.bot = True
+        channel = FakeChannel([*self.messages, progress])
+        cog = object.__new__(ChannelSummary)
+
+        snapshot, _ = await cog._snapshot_message(
+            channel,
+            include_bots=True,
+            invocation_id=None,
+            progress_id=progress.id,
+        )
+
+        self.assertEqual(snapshot.id, self.messages[-1].id)
+
     async def test_agent_tool_round_then_structured_final(self) -> None:
         cog = object.__new__(ChannelSummary)
         cog._guild_attempts = __import__("collections").defaultdict(__import__("collections").deque)
@@ -970,6 +996,25 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
         cog._disable_guilds_using_profile.assert_awaited_once_with(
             "main", valid_models=("kept",)
         )
+
+    async def test_provider_list_pages_within_discord_content_limit(self) -> None:
+        raw = {
+            "dialect": "generic_chat",
+            "origin": "https://example.com",
+            "token_service": "s" * 64,
+            "models": ["model"],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog.config = MagicMock()
+        cog.config.profiles = AsyncMock(
+            return_value={f"profile-{index:02d}-" + "x" * 20: raw for index in range(25)}
+        )
+        cog._send_plain = AsyncMock()
+
+        await ChannelSummary.provider_list.callback(cog, MagicMock())
+
+        self.assertGreater(cog._send_plain.await_count, 1)
+        self.assertTrue(all(len(call.args[1]) <= 1_900 for call in cog._send_plain.await_args_list))
 
     async def test_http_provider_add_warns_but_https_does_not(self) -> None:
         cog = object.__new__(ChannelSummary)
