@@ -1112,7 +1112,9 @@ class ChannelSummary(commands.Cog):
         resolver = None
         try:
             async with asyncio.timeout(timeout_seconds):
-                host, port, addresses = await self._resolve_profile(profile)
+                host, port, addresses = await asyncio.wait_for(
+                    self._resolve_profile(profile), timeout=min(15, timeout_seconds)
+                )
                 resolver = PinnedResolver(host, port, addresses)
                 is_http = urlsplit(profile.endpoint).scheme == "http"
                 connector = aiohttp.TCPConnector(

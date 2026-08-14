@@ -216,13 +216,23 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
             ("api.example", 443),
         ])
 
-    async def test_request_timeout_includes_dns_resolution(self) -> None:
+    async def test_dns_resolution_uses_short_connection_timeout(self) -> None:
         cog = object.__new__(ChannelSummary)
         cog.get_api_key = AsyncMock(return_value="secret")
-        cog._resolve_profile = AsyncMock(side_effect=asyncio.TimeoutError)
+        cog._resolve_profile = AsyncMock(
+            return_value=("example.com", 443, (("8.8.8.8", socket.AF_INET),))
+        )
 
-        with self.assertRaises(SummaryError) as caught:
-            await cog.request_provider(profile("generic_chat"), {}, timeout_seconds=15)
+        async def expire_resolution(awaitable, *, timeout):
+            await awaitable
+            self.assertEqual(timeout, 15)
+            raise asyncio.TimeoutError
+
+        with (
+            patch("channelsummary.channelsummary.asyncio.wait_for", side_effect=expire_resolution),
+            self.assertRaises(SummaryError) as caught,
+        ):
+            await cog.request_provider(profile("generic_chat"), {}, timeout_seconds=3_600)
 
         self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_TIMEOUT)
 
