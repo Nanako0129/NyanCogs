@@ -444,6 +444,32 @@ class TestResponseBoundary(unittest.TestCase):
             )
             self.assertEqual(accepted.citations[0].url, "https://example.com/source")
 
+    def test_legacy_numeric_citations_fail_closed_in_both_dialects(self) -> None:
+        unsafe_hosts = (
+            "127.1",
+            "127.0.1",
+            "0177.0.0.1",
+            "0x7f.0.0.1",
+            "127.0x0.0.1",
+            "0300.0250.0001.0001",
+            "0xa9.0xfe.0x1.0x1",
+            "127%2e0.0.1",
+            "169%2E254.1.1",
+        )
+        for dialect in ("openai_responses", "generic_chat"):
+            for host in unsafe_hosts:
+                with self.subTest(dialect=dialect, host=host), self.assertRaises(
+                    SummaryError
+                ) as caught:
+                    normalize_response(
+                        dialect, self.citation_response(dialect, f"https://{host}/source")
+                    )
+                self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
+            for url in ("https://example.com/source", "https://8.8.8.8/source"):
+                with self.subTest(dialect=dialect, url=url):
+                    accepted = normalize_response(dialect, self.citation_response(dialect, url))
+                    self.assertEqual(accepted.citations[0].url, url)
+
     def test_unknown_duplicate_and_unsafe_citation_fail_closed(self) -> None:
         fixtures = [
             {"output": [{"type": "shell_call", "id": "x"}]},
@@ -659,6 +685,13 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
                 '{"query":"","author_id":"","before_message_id":"","after_message_id":"",'
                 '"start_unix":100000000000000000000,"end_unix":0,"limit":10}'
             )
+        self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
+        oversized_integer = (
+            '{"query":"","author_id":"","before_message_id":"","after_message_id":"",'
+            '"start_unix":' + "1" * (sys.get_int_max_str_digits() + 1) + ',"end_unix":0,"limit":10}'
+        )
+        with self.assertRaises(SummaryError) as caught:
+            validate_tool_arguments(oversized_integer)
         self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
 
     def test_duration_overflow_uses_validation_error(self) -> None:
@@ -1026,6 +1059,59 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
 class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
     policy = "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations"
     warning = "API keys and selected Discord data traverse the LAN unencrypted"
+
+    async def test_provider_add_reports_validation_without_mutation(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog.config = MagicMock()
+        cog.config.profiles = AsyncMock()
+        cog.config.profiles.set = AsyncMock()
+        cog._send_plain = AsyncMock()
+        ctx = MagicMock()
+
+        await ChannelSummary.provider_add.callback(
+            cog, ctx, "main", "invalid", "https://example.com", "service", models="model"
+        )
+
+        cog._send_plain.assert_awaited_once_with(ctx, str(SummaryError(ErrorCode.PROFILE_INVALID)))
+        cog.config.profiles.assert_not_awaited()
+        cog.config.profiles.set.assert_not_awaited()
+
+    async def test_provider_models_reports_validation_without_mutation(self) -> None:
+        raw = {
+            "dialect": "generic_chat",
+            "origin": "https://example.com",
+            "token_service": "service",
+            "models": ["model"],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog.config = MagicMock()
+        cog.config.profiles = AsyncMock(return_value={"main": raw})
+        cog.config.profiles.set = AsyncMock()
+        cog._disable_guilds_using_profile = AsyncMock()
+        cog._send_plain = AsyncMock()
+        ctx = MagicMock()
+        ctx.tick = AsyncMock()
+
+        await ChannelSummary.provider_models.callback(cog, ctx, "main", models="")
+
+        cog._send_plain.assert_awaited_once_with(ctx, str(SummaryError(ErrorCode.PROFILE_INVALID)))
+        cog.config.profiles.set.assert_not_awaited()
+        cog._disable_guilds_using_profile.assert_not_awaited()
+        ctx.tick.assert_not_awaited()
+
+    async def test_provider_key_reports_validation_without_modal(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog.get_profile = AsyncMock(side_effect=SummaryError(ErrorCode.PROFILE_INVALID))
+        cog._send_plain = AsyncMock()
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+
+        with patch("channelsummary.channelsummary.SetApiView") as view:
+            await ChannelSummary.provider_key.callback(cog, ctx, "missing")
+
+        cog._send_plain.assert_awaited_once_with(ctx, str(SummaryError(ErrorCode.PROFILE_INVALID)))
+        view.assert_not_called()
+        ctx.send.assert_not_awaited()
 
     async def test_provider_profile_limit_and_model_change_invalidation(self) -> None:
         raw = {

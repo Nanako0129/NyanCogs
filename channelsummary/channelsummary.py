@@ -497,7 +497,10 @@ def _public_citation(raw: Mapping[str, Any]) -> Citation:
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
-        pass
+        if "%" in hostname or all(
+            re.fullmatch(r"(?:[0-9]+|0x[0-9a-f]+)", label) for label in hostname.split(".")
+        ):
+            raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
     else:
         if not address.is_global or address.is_multicast:
             raise SummaryError(ErrorCode.RESPONSE_INVALID)
@@ -732,7 +735,7 @@ def is_eligible(message: discord.Message, include_bots: bool, invocation_id: int
 def validate_tool_arguments(raw: str) -> dict[str, Any]:
     try:
         args = json.loads(raw)
-    except json.JSONDecodeError:
+    except ValueError:
         raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
     expected = {
         "query",
@@ -2015,7 +2018,11 @@ class ChannelSummary(commands.Cog):
             "token_service": token_service,
             "models": [item.strip() for item in models.split(",") if item.strip()],
         }
-        item = validate_profile(name, raw)
+        try:
+            item = validate_profile(name, raw)
+        except SummaryError as error:
+            await self._send_plain(ctx, str(error))
+            return
         profiles = await self.config.profiles()
         previous = profiles.get(item.name)
         if previous is None and len(profiles) >= MAX_PROVIDER_PROFILES:
@@ -2063,7 +2070,11 @@ class ChannelSummary(commands.Cog):
             return
         candidate = dict(raw)
         candidate["models"] = [item.strip() for item in models.split(",") if item.strip()]
-        item = validate_profile(name, candidate)
+        try:
+            item = validate_profile(name, candidate)
+        except SummaryError as error:
+            await self._send_plain(ctx, str(error))
+            return
         profiles[item.name] = candidate
         await self.config.profiles.set(profiles)
         await self._disable_guilds_using_profile(item.name, valid_models=item.models)
@@ -2072,7 +2083,11 @@ class ChannelSummary(commands.Cog):
     @summary_provider.command(name="key")
     async def provider_key(self, ctx: commands.Context, name: str) -> None:
         """Open Red's owner-only shared API token modal for a profile."""
-        item = await self.get_profile(name)
+        try:
+            item = await self.get_profile(name)
+        except SummaryError as error:
+            await self._send_plain(ctx, str(error))
+            return
         view = SetApiView(default_service=item.token_service, default_keys={"api_key": ""})
         kwargs: dict[str, Any] = {"view": view, "allowed_mentions": discord.AllowedMentions.none()}
         if getattr(ctx, "interaction", None) is not None:
