@@ -51,6 +51,10 @@ surface is `[p]summaryset set <key> <value>`; use
 | `[p]summaryset enable I_ACCEPT` / `[p]summaryset disable` | Enable after disclosure acceptance, or disable summaries |
 | `[p]summaryset checkpoint <show\|reset>` | Inspect or clear this channel's successful-summary checkpoint |
 
+While a summary runs, the bot updates one temporary channel status through
+message collection, Agent context completion, and Embed rendering, then removes
+it. The progress text never exposes hidden reasoning or raw tool payloads.
+
 All users who can view and read the current channel may run a summary after a
 guild enables it. The bot needs View Channel, Read Message History, Send
 Messages, and Embed Links. A per-user cooldown, atomic guild request quota,

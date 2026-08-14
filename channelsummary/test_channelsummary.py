@@ -252,7 +252,9 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPayloads(unittest.TestCase):
-    def build(self, dialect: str, hosted: int = 4, results: int = 7, web: bool = True):
+    def build(
+        self, dialect: str, hosted: int = 4, results: int = 7, web: bool = True, app: int = 3
+    ):
         return build_payload(
             profile(dialect),
             model="model-1",
@@ -260,7 +262,7 @@ class TestPayloads(unittest.TestCase):
             input_items="input",
             effort="high",
             output_tokens=2_500,
-            remaining_app_calls=3,
+            remaining_app_calls=app,
             remaining_hosted_calls=hosted,
             remaining_web_results=results,
             web_enabled=web,
@@ -279,6 +281,13 @@ class TestPayloads(unittest.TestCase):
         payload = self.build("openrouter_responses", hosted=0)
         self.assertEqual(len(payload["tools"]), 1)
         self.assertNotIn("max_tool_calls", payload)
+
+    def test_zero_channel_budget_omits_only_the_channel_tool(self) -> None:
+        openai = self.build("openai_responses", app=0)
+        self.assertEqual([tool["type"] for tool in openai["tools"]], ["web_search"])
+        generic = self.build("generic_chat", app=0)
+        self.assertNotIn("tools", generic)
+        self.assertNotIn("parallel_tool_calls", generic)
 
     def test_generic_chat_never_gets_web_or_reasoning(self) -> None:
         payload = self.build("generic_chat")
@@ -368,6 +377,9 @@ class TestResponseBoundary(unittest.TestCase):
                         dialect, self.citation_response(dialect, f"https://example.com/{control}")
                     )
                 self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
+            with self.assertRaises(SummaryError) as caught:
+                normalize_response(dialect, self.citation_response(dialect, "https://[bad"))
+            self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
             encoded = normalize_response(
                 dialect, self.citation_response(dialect, "https://example.com/%00%29")
             )
@@ -654,14 +666,39 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             await cog._base_messages(
                 self.channel, self.messages[-1], settings, "auto", 0, None, 0
             )
-        with self.assertRaises(commands.UserFeedbackCheckFailure):
-            await cog._base_messages(
-                self.channel, self.messages[-1], settings, "from", self.messages[0].id, None, 0
-            )
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await cog._base_messages(self.channel, self.messages[-1], settings, "from", self.messages[0].id, None, 0)
+        self.assertIn("exceeds", str(caught.exception))
         state = await cog._base_messages(
             self.channel, self.messages[-1], settings, "time", timedelta(hours=1), None, 0
         )
         self.assertEqual(set(state.messages), {self.messages[-1].id})
+
+    async def test_explicit_range_accepts_1000_messages_and_rejects_1001(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        settings = {**GUILD_DEFAULTS, "max_distinct_messages": 1_000}
+        messages = [
+            FakeMessage(100000000000000000 + index, 444444444444444444, str(index), index % 60)
+            for index in range(1_001)
+        ]
+        exact_channel = FakeChannel(messages[:1_000])
+        snapshot, inspected = await cog._snapshot_message(
+            exact_channel, include_bots=False, invocation_id=None
+        )
+        state = await cog._base_messages(
+            exact_channel, snapshot, settings, "from", messages[0].id, None, inspected
+        )
+        self.assertEqual(len(state.messages), 1_000)
+
+        overflow_channel = FakeChannel(messages)
+        snapshot, inspected = await cog._snapshot_message(
+            overflow_channel, include_bots=False, invocation_id=None
+        )
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await cog._base_messages(
+                overflow_channel, snapshot, settings, "from", messages[0].id, None, inspected
+            )
+        self.assertIn("exceeds", str(caught.exception))
 
     async def test_agent_tool_round_then_structured_final(self) -> None:
         cog = object.__new__(ChannelSummary)
@@ -843,6 +880,11 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
     def test_slash_command_defers_before_channel_history_scans(self) -> None:
         source = inspect.getsource(ChannelSummary._execute_summary)
         self.assertLess(source.index("await ctx.defer()"), source.index("await self._snapshot_message("))
+        self.assertLess(source.index("正在讀取訊息"), source.index("await self._snapshot_message("))
+        self.assertLess(source.index("補齊話題脈絡"), source.index("await self._run_agent("))
+        self.assertLess(source.index("正在整理 Summary Embed"), source.index("self._render_embeds("))
+        self.assertIn("finally:", source)
+        self.assertIn("await progress.delete()", source)
 
     async def test_model_allowlist_change_disables_invalid_guild_selections(self) -> None:
         cog = object.__new__(ChannelSummary)

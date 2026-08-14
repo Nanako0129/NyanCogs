@@ -393,22 +393,21 @@ def build_payload(
     ):
         raise SummaryError(ErrorCode.REQUEST_TOO_LARGE)
     if profile.dialect.endswith("responses"):
+        tools = [_responses_tool(CHANNEL_SEARCH_TOOL)] if remaining_app_calls else []
         payload: dict[str, Any] = {
             "model": model,
             "instructions": system,
             "input": input_items,
             "max_output_tokens": output_tokens,
-            "tools": [_responses_tool(CHANNEL_SEARCH_TOOL)],
-            "parallel_tool_calls": False,
             "store": False,
         }
         if profile.dialect in {"openai_responses", "openrouter_responses"}:
             payload["reasoning"] = {"effort": effort}
         if web_enabled and profile.web_kind and remaining_hosted_calls and remaining_web_results:
             if profile.web_kind == "openai":
-                payload["tools"].append({"type": "web_search", "search_context_size": "low"})
+                tools.append({"type": "web_search", "search_context_size": "low"})
             else:
-                payload["tools"].append(
+                tools.append(
                     {
                         "type": "openrouter:web_search",
                         "parameters": {
@@ -418,6 +417,8 @@ def build_payload(
                     }
                 )
             payload["max_tool_calls"] = remaining_hosted_calls
+        if tools:
+            payload.update(tools=tools, parallel_tool_calls=False)
     else:
         if not isinstance(input_items, str):
             raise SummaryError(ErrorCode.PROFILE_INVALID)
@@ -428,9 +429,9 @@ def build_payload(
                 {"role": "user", "content": input_items},
             ],
             "max_tokens": output_tokens,
-            "tools": [_chat_tool(CHANNEL_SEARCH_TOOL)],
-            "parallel_tool_calls": False,
         }
+        if remaining_app_calls:
+            payload.update(tools=[_chat_tool(CHANNEL_SEARCH_TOOL)], parallel_tool_calls=False)
     payload["_remaining_app_calls"] = remaining_app_calls
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
     if len(encoded) > MAX_REQUEST_BYTES:
@@ -478,11 +479,15 @@ def _public_citation(raw: Mapping[str, Any]) -> Citation:
         or any(not char.isprintable() or char.isspace() or char in "()[]<>\\" for char in url)
     ):
         raise SummaryError(ErrorCode.RESPONSE_INVALID)
-    parts = urlsplit(url)
-    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+    except ValueError:
+        raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
+    if parts.scheme not in {"http", "https"} or not hostname or parts.username or parts.password:
         raise SummaryError(ErrorCode.RESPONSE_INVALID)
     try:
-        hostname = parts.hostname.encode("idna").decode("ascii").lower()
+        hostname = hostname.encode("idna").decode("ascii").lower()
     except UnicodeError:
         raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
     reserved_suffixes = (".localhost", ".local", ".internal", ".home", ".lan", ".test", ".invalid", ".example")
@@ -1214,12 +1219,25 @@ class ChannelSummary(commands.Cog):
             if start_id > snapshot.id:
                 raise commands.UserFeedbackCheckFailure("The start message is newer than the summary snapshot.")
             after = discord.Object(id=max(0, start_id - 1))
+            scanned = 0
             async for message in channel.history(
-                limit=max(0, 1_000 - state.inspected), before=before, after=after, oldest_first=True
+                limit=1_001,
+                before=discord.Object(id=snapshot.id),
+                after=after,
+                oldest_first=True,
             ):
+                scanned += 1
                 state.inspected += 1
-                if is_eligible(message, include_bots, invocation_id) and not add_within(message, maximum):
-                    break
+                if is_eligible(message, include_bots, invocation_id):
+                    if message.id not in state.messages and len(state.messages) >= maximum:
+                        raise commands.UserFeedbackCheckFailure(
+                            "The requested start-to-now range exceeds the configured message limit."
+                        )
+                    state.messages[message.id] = message
+            if scanned == 1_001:
+                raise commands.UserFeedbackCheckFailure(
+                    "The requested start-to-now range exceeds the safe history scan limit."
+                )
             if start_id not in state.messages:
                 raise commands.UserFeedbackCheckFailure("The start message is unavailable or not eligible.")
         elif mode == "time":
@@ -1527,61 +1545,93 @@ class ChannelSummary(commands.Cog):
         if channel_lock.locked():
             raise commands.UserFeedbackCheckFailure("A summary is already running in this channel.")
         async with channel_lock:
-            if getattr(ctx, "interaction", None) is not None:
+            interaction = getattr(ctx, "interaction", None)
+            if interaction is not None:
                 await ctx.defer()
-            snapshot, initial_inspected = await self._snapshot_message(
-                ctx.channel,
-                include_bots=bool(settings["include_bots"]),
-                invocation_id=invocation_id,
-            )
-            if not await self._checkpoint_ready(
-                ctx.channel,
-                snapshot.id,
-                int(settings["new_messages_required"]),
-                invocation_id,
-            ):
-                raise commands.UserFeedbackCheckFailure(
-                    f"This channel needs {settings['new_messages_required']} new human messages after its last successful summary."
+                progress = await interaction.edit_original_response(
+                    content="⏳ 正在讀取訊息…",
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
-            self._reserve_user_attempt(ctx.guild.id, ctx.author.id, int(settings["user_cooldown_seconds"]))
-            state = await self._base_messages(
-                ctx.channel,
-                snapshot,
-                settings,
-                mode,
-                value,
-                invocation_id,
-                initial_inspected,
-            )
-            semaphore_key = (ctx.guild.id, profile.name, int(settings["guild_concurrency"]))
-            semaphore = self._guild_semaphores.setdefault(
-                semaphore_key,
-                asyncio.Semaphore(int(settings["guild_concurrency"])),
-            )
-            async with semaphore:
-                summary, citations, actual_model = await self._run_agent(
+            else:
+                progress = await ctx.send(
+                    "⏳ 正在讀取訊息…", allowed_mentions=discord.AllowedMentions.none()
+                )
+
+            async def update_progress(content: str) -> None:
+                try:
+                    await progress.edit(
+                        content=content, allowed_mentions=discord.AllowedMentions.none()
+                    )
+                except discord.HTTPException:
+                    pass
+
+            try:
+                snapshot, initial_inspected = await self._snapshot_message(
+                    ctx.channel,
+                    include_bots=bool(settings["include_bots"]),
+                    invocation_id=invocation_id,
+                )
+                if not await self._checkpoint_ready(
+                    ctx.channel,
+                    snapshot.id,
+                    int(settings["new_messages_required"]),
+                    invocation_id,
+                ):
+                    raise commands.UserFeedbackCheckFailure(
+                        f"This channel needs {settings['new_messages_required']} new human messages after its last successful summary."
+                    )
+                self._reserve_user_attempt(ctx.guild.id, ctx.author.id, int(settings["user_cooldown_seconds"]))
+                state = await self._base_messages(
+                    ctx.channel,
+                    snapshot,
+                    settings,
+                    mode,
+                    value,
+                    invocation_id,
+                    initial_inspected,
+                )
+                await update_progress("🧭 Agent 正在補齊話題脈絡並產生摘要…")
+                semaphore_key = (ctx.guild.id, profile.name, int(settings["guild_concurrency"]))
+                semaphore = self._guild_semaphores.setdefault(
+                    semaphore_key,
+                    asyncio.Semaphore(int(settings["guild_concurrency"])),
+                )
+                async with semaphore:
+                    summary, citations, actual_model = await self._run_agent(
+                        ctx.guild,
+                        ctx.channel,
+                        profile,
+                        settings,
+                        state,
+                        mode,
+                        invocation_id,
+                    )
+                await update_progress("📝 正在整理 Summary Embed…")
+                embeds = self._render_embeds(
                     ctx.guild,
                     ctx.channel,
-                    profile,
+                    ctx.author,
                     settings,
                     state,
-                    mode,
-                    invocation_id,
+                    summary,
+                    citations,
+                    actual_model,
                 )
-            embeds = self._render_embeds(
-                ctx.guild,
-                ctx.channel,
-                ctx.author,
-                settings,
-                state,
-                summary,
-                citations,
-                actual_model,
-            )
-            for embed in embeds:
-                await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-            await self.config.channel(ctx.channel).checkpoint_message_id.set(snapshot.id)
-            await self.config.channel(ctx.channel).checkpoint_timestamp.set(datetime.now(UTC).timestamp())
+                try:
+                    await progress.delete()
+                except discord.HTTPException:
+                    pass
+                progress = None
+                for embed in embeds:
+                    await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                await self.config.channel(ctx.channel).checkpoint_message_id.set(snapshot.id)
+                await self.config.channel(ctx.channel).checkpoint_timestamp.set(datetime.now(UTC).timestamp())
+            finally:
+                if progress is not None:
+                    try:
+                        await progress.delete()
+                    except discord.HTTPException:
+                        pass
 
     @staticmethod
     def _require_guild_manager(ctx: commands.Context) -> None:
@@ -1761,6 +1811,7 @@ class ChannelSummary(commands.Cog):
                 "`/summary from <message>` — inclusive hard start\n"
                 "`/summary time <30m|2h|1d>` — time window with opener completion\n"
                 "`/summary settings` — Manage Messages settings panel\n\n"
+                "A temporary channel message shows collection, Agent, and Embed progress without hidden reasoning.\n\n"
                 "Summaries send selected channel content and stable Discord IDs to the configured external provider. "
                 "Web search may send Agent-generated queries to that provider's search backend. "
                 "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. "
@@ -2030,7 +2081,8 @@ class ChannelSummary(commands.Cog):
                 "`[p]summaryset enable I_ACCEPT` · `[p]summaryset disable`.\n\n"
                 "**Summary ranges**\n"
                 "`/summary auto [count]` · `/summary from <same-channel message>` · "
-                "`/summary time <30m|2h|1d>`"
+                "`/summary time <30m|2h|1d>`\n"
+                "A temporary channel message shows collection, Agent, and Embed progress without hidden reasoning."
             ),
             colour=discord.Colour.blurple(),
         )
