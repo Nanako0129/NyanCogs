@@ -2,6 +2,81 @@
 
 Cogs for [Red Discord Bot](https://github.com/Cog-Creators/Red-DiscordBot).
 
+## ChannelSummary
+
+ChannelSummary creates attributed Discord channel summaries through an OpenAI-
+compatible LLM Agent. It supports recent-message, explicit-start, and duration
+ranges. The Agent can search additional history only in the invocation channel
+and can use native OpenAI or OpenRouter web search when the selected profile
+supports it.
+
+Install and load it with Red's Downloader:
+
+```text
+[p]cog install NyanCogs channelsummary
+[p]load channelsummary
+```
+
+The bot owner then creates one or more global provider profiles. Profiles store
+only endpoint, dialect, token-service name, and model allowlist metadata; API
+keys remain in Red's shared API token storage.
+
+```text
+[p]summary provider add openai openai_responses https://api.openai.com channelsummary_openai gpt-5.6
+[p]summary provider key openai
+
+[p]summary provider add openrouter openrouter_responses https://openrouter.ai channelsummary_openrouter openai/gpt-5.6
+[p]summary provider key openrouter
+```
+
+HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. API keys
+and selected Discord data traverse the LAN unencrypted; use HTTP only on a
+trusted LAN. Prefer HTTPS whenever it is available.
+
+Guild members with guild-level Manage Messages use `/summary settings` to pick
+a profile and model, adjust limits through the Select and Modal panel, review
+the data-export disclosure, and enable the Cog. The equivalent text setting
+surface is `[p]summaryset set <key> <value>`; use
+`[p]summary help` for every key, range, provider command, and privacy detail.
+
+| Command | Purpose |
+|---|---|
+| `/summary auto [count]` | Summarize recent messages and search backward for the natural topic start |
+| `/summary from <message>` | Summarize from an inclusive same-channel message ID or link |
+| `/summary time <duration>` | Summarize a range such as `30m`, `2h`, or `1d` |
+| `/summary settings` | Open the Manage Messages Select and Modal configuration panel |
+| `[p]summaryset show` | Show all effective guild settings |
+| `[p]summaryset set <key> <value>` | Change any documented text setting |
+| `[p]summaryset reset <key\|all>` | Reset one setting or the full guild configuration |
+| `[p]summaryset enable I_ACCEPT` / `[p]summaryset disable` | Enable after disclosure acceptance, or disable summaries |
+| `[p]summaryset checkpoint <show\|reset>` | Inspect or clear this channel's successful-summary checkpoint |
+
+While a summary runs, the bot updates one temporary channel status through
+message collection, Agent context completion, and Embed rendering, then removes
+it. The progress text never exposes hidden reasoning or raw tool payloads.
+
+All users who can view and read the current channel may run a summary after a
+guild enables it. The bot needs View Channel, Read Message History, Send
+Messages, and Embed Links. A per-user cooldown, atomic guild request quota,
+bounded guild/provider concurrency, and a persistent per-channel new-message
+checkpoint limit API cost and repeated output. Defaults require 20 new human
+messages after a successful summary before that channel can run another.
+
+Summary Embeds preserve validated `<@user_id>` speaker attribution but use
+`AllowedMentions.none()`, so they do not notify anyone. Discord jump links are
+constructed locally from supplied messages. Web links are rendered only from
+provider citation annotations. Model-authored links, mass/role/channel
+mentions, and fabricated message IDs are not trusted.
+
+Selected message text, stable user and message IDs, timestamps, replies,
+attachment URLs, embed metadata, and Agent-generated web queries may leave
+Discord for the selected provider and search backend; their retention policies
+apply. ChannelSummary does not persist messages, prompts, searches, provider
+responses, or summaries. With an HTTP provider, API keys and selected Discord
+data traverse the LAN unencrypted; use HTTP only on a trusted LAN. Its complete
+statement is in
+[`channelsummary/info.json`](channelsummary/info.json).
+
 ## EmbedFixer
 
 EmbedFixer replaces supported social links with provider-fixed links sent by the
