@@ -1060,8 +1060,10 @@ class ChannelSummary(commands.Cog):
         self._user_attempts: dict[tuple[int, int], float] = {}
 
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
-        """The cog stores no user-owned data."""
-        return None
+        """Clear this user's ephemeral cooldown entries; no user data is persisted in Config."""
+        self._user_attempts = {
+            key: attempted for key, attempted in self._user_attempts.items() if key[1] != user_id
+        }
 
     async def get_profile(self, name: str) -> ProviderProfile:
         profiles = await self.config.profiles()
@@ -1249,12 +1251,25 @@ class ChannelSummary(commands.Cog):
             if duration > timedelta(hours=int(settings["max_duration_hours"])):
                 raise commands.UserFeedbackCheckFailure("The duration exceeds this server's configured limit.")
             cutoff = snapshot.created_at - duration
+            scanned = 0
             async for message in channel.history(
-                limit=max(0, 1_000 - state.inspected), before=before, after=cutoff, oldest_first=True
+                limit=1_001,
+                before=discord.Object(id=snapshot.id),
+                after=cutoff,
+                oldest_first=True,
             ):
+                scanned += 1
                 state.inspected += 1
-                if is_eligible(message, include_bots, invocation_id) and not add_within(message, maximum):
-                    break
+                if is_eligible(message, include_bots, invocation_id):
+                    if message.id not in state.messages and len(state.messages) >= maximum:
+                        raise commands.UserFeedbackCheckFailure(
+                            "The requested time range exceeds the configured message limit."
+                        )
+                    state.messages[message.id] = message
+            if scanned == 1_001:
+                raise commands.UserFeedbackCheckFailure(
+                    "The requested time range exceeds the safe history scan limit."
+                )
         else:
             raise ValueError(mode)
         if not state.messages:

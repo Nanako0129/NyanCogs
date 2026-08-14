@@ -817,10 +817,96 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
             await cog._base_messages(self.channel, self.messages[-1], settings, "from", self.messages[0].id, None, 0)
         self.assertIn("exceeds", str(caught.exception))
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await cog._base_messages(
+                self.channel, self.messages[-1], settings, "time", timedelta(hours=1), None, 0
+            )
+        self.assertIn("exceeds", str(caught.exception))
+
+    async def test_time_range_returns_complete_window_and_ignores_older(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        snapshot = FakeMessage(400000000000000000, 444444444444444444, "snapshot", 40)
+        inside = [
+            FakeMessage(200000000000000000, 444444444444444444, "inside one", 20),
+            FakeMessage(300000000000000000, 555555555555555555, "inside two", 30),
+        ]
+        older = FakeMessage(100000000000000000, 444444444444444444, "older", 0)
+        older.created_at = snapshot.created_at - timedelta(hours=2)
         state = await cog._base_messages(
-            self.channel, self.messages[-1], settings, "time", timedelta(hours=1), None, 0
+            FakeChannel([older, *inside, snapshot]),
+            snapshot,
+            {**GUILD_DEFAULTS, "max_distinct_messages": 3},
+            "time",
+            timedelta(hours=1),
+            None,
+            999,
         )
-        self.assertEqual(set(state.messages), {self.messages[-1].id})
+
+        self.assertEqual(set(state.messages), {snapshot.id, *(message.id for message in inside)})
+        self.assertEqual(len(state.messages), 3)
+        self.assertEqual(state.inspected, 1_001)
+
+    async def test_time_range_rejects_configured_message_overflow(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        snapshot = FakeMessage(300000000000000000, 444444444444444444, "snapshot", 40)
+        channel = FakeChannel(
+            [
+                FakeMessage(100000000000000000, 444444444444444444, "one", 20),
+                FakeMessage(200000000000000000, 555555555555555555, "two", 30),
+                snapshot,
+            ]
+        )
+
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await cog._base_messages(
+                channel,
+                snapshot,
+                {**GUILD_DEFAULTS, "max_distinct_messages": 2},
+                "time",
+                timedelta(hours=1),
+                None,
+                0,
+            )
+        self.assertIn("configured message limit", str(caught.exception))
+
+    async def test_time_range_accepts_1000_raw_but_rejects_1001_raw(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        snapshot = FakeMessage(200000000000002000, 444444444444444444, "snapshot", 59)
+        raw = [
+            FakeMessage(200000000000000000 + index, 444444444444444444, str(index), 30)
+            for index in range(1_001)
+        ]
+        for message in raw:
+            message.author.bot = True
+        raw[0].author.bot = raw[999].author.bot = False
+        settings = {**GUILD_DEFAULTS, "max_distinct_messages": 5}
+
+        state = await cog._base_messages(
+            FakeChannel([*raw[:1_000], snapshot]),
+            snapshot,
+            settings,
+            "time",
+            timedelta(hours=1),
+            None,
+            997,
+        )
+        self.assertEqual(set(state.messages), {snapshot.id, raw[0].id, raw[999].id})
+        self.assertEqual(state.inspected, 1_997)
+
+        raw[100].author.bot = raw[500].author.bot = False
+        raw[200].author.bot = raw[300].author.bot = False
+        raw[200].is_system = lambda: True
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await cog._base_messages(
+                FakeChannel([*raw, snapshot]),
+                snapshot,
+                settings,
+                "time",
+                timedelta(hours=1),
+                raw[300].id,
+                0,
+            )
+        self.assertIn("safe history scan limit", str(caught.exception))
 
     async def test_explicit_range_accepts_1000_messages_and_rejects_1001(self) -> None:
         cog = object.__new__(ChannelSummary)
@@ -1016,6 +1102,21 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sum(await __import__("asyncio").gather(reserve(), reserve())), 1)
 
+    async def test_user_deletion_clears_only_target_cooldowns(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog.config = MagicMock()
+        cog._user_attempts = {(1, 42): 1.0, (2, 42): 2.0, (1, 99): 3.0, (3, 100): 4.0}
+
+        await cog.red_delete_data_for_user(requester="discord_deleted_user", user_id=42)
+        self.assertEqual(cog._user_attempts, {(1, 99): 3.0, (3, 100): 4.0})
+        await cog.red_delete_data_for_user(requester="owner", user_id=42)
+        self.assertEqual(cog._user_attempts, {(1, 99): 3.0, (3, 100): 4.0})
+        self.assertEqual(cog.config.mock_calls, [])
+        self.assertIn("ephemeral cooldown", ChannelSummary.red_delete_data_for_user.__doc__)
+
+        cog._reserve_user_attempt(4, 42, 0)
+        self.assertEqual({key for key in cog._user_attempts if key[1] == 42}, {(4, 42)})
+
     async def test_settings_view_contains_selects_and_enable_controls(self) -> None:
         current = dict(GUILD_DEFAULTS)
         current.update({"provider_profile": "main", "model": "model-1"})
@@ -1045,6 +1146,8 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertLess(source.index("await ctx.defer()"), source.index("await self._snapshot_message("))
         self.assertLess(source.index("正在讀取訊息"), source.index("await self._snapshot_message("))
         self.assertLess(source.index("補齊話題脈絡"), source.index("await self._run_agent("))
+        self.assertLess(source.index("await self._base_messages("), source.index("await self._run_agent("))
+        self.assertLess(source.index("await self._base_messages("), source.index("checkpoint_message_id.set("))
         self.assertLess(source.index("正在整理 Summary Embed"), source.index("self._render_embeds("))
         self.assertIn("finally:", source)
         self.assertIn("await progress.delete()", source)
@@ -1270,6 +1373,16 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
                 text = " ".join(path.read_text(encoding="utf-8").split())
                 self.assertIn(self.policy, text)
                 self.assertIn(self.warning, text)
+
+    def test_info_discloses_ephemeral_user_cooldown_deletion(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        statement = json.loads((root / "channelsummary" / "info.json").read_text(encoding="utf-8"))[
+            "end_user_data_statement"
+        ]
+        self.assertIn("ephemeral in-memory per-user cooldown timestamps", statement)
+        self.assertIn("deletion requests clear that user's cooldown entries across guilds", statement)
+        self.assertIn("No prompts or summaries are persisted by this cog", statement)
+        self.assertNotIn("deletion is a no-op", statement)
 
 
 class TestSetup(unittest.IsolatedAsyncioTestCase):
