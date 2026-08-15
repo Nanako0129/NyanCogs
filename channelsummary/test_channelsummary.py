@@ -11,13 +11,16 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock, patch
 
+import discord
 from redbot.core import commands
 
 from .channelsummary import (
     CHANNEL_DEFAULTS,
+    DISCLOSURE_VERSION,
     GUILD_DEFAULTS,
     MAX_PROVIDER_PROFILES,
     MAX_RESPONSE_BYTES,
@@ -32,6 +35,7 @@ from .channelsummary import (
     SummaryTopic,
     SummaryError,
     build_payload,
+    image_inputs,
     message_record,
     normalize_origin,
     normalize_response,
@@ -59,7 +63,18 @@ class TestConfiguration(unittest.TestCase):
         self.assertEqual(GUILD_DEFAULTS["auto_message_count"], 100)
         self.assertEqual(GUILD_DEFAULTS["new_messages_required"], 20)
         self.assertEqual(GUILD_DEFAULTS["request_timeout_seconds"], 600)
+        self.assertEqual(GUILD_DEFAULTS["agent_max_turns"], 4)
+        self.assertEqual(GUILD_DEFAULTS["image_detail"], "auto")
+        self.assertEqual(GUILD_DEFAULTS["max_images"], 20)
         self.assertFalse({"api_key", "prompt", "response", "messages"} & set(GUILD_DEFAULTS))
+
+    def test_image_and_turn_settings_are_bounded(self) -> None:
+        self.assertEqual(ChannelSummary._parse_setting_value("agent_max_turns", "10"), 10)
+        self.assertEqual(ChannelSummary._parse_setting_value("image_detail", "ORIGINAL"), "original")
+        self.assertEqual(ChannelSummary._parse_setting_value("max_images", "0"), 0)
+        for key, value in (("agent_max_turns", "11"), ("image_detail", "full"), ("max_images", "21")):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                ChannelSummary._parse_setting_value(key, value)
 
     def test_request_timeout_supports_long_running_agents(self) -> None:
         self.assertEqual(ChannelSummary._parse_setting_value("request_timeout_seconds", "3600"), 3_600)
@@ -314,7 +329,14 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
 
 class TestPayloads(unittest.TestCase):
     def build(
-        self, dialect: str, hosted: int = 4, results: int = 7, web: bool = True, app: int = 3
+        self,
+        dialect: str,
+        hosted: int = 4,
+        results: int = 7,
+        web: bool = True,
+        app: int = 3,
+        images=(),
+        force: bool = False,
     ):
         return build_payload(
             profile(dialect),
@@ -327,6 +349,8 @@ class TestPayloads(unittest.TestCase):
             remaining_hosted_calls=hosted,
             remaining_web_results=results,
             web_enabled=web,
+            images=images,
+            force_channel_history=force,
         )
 
     def test_openai_and_openrouter_have_separate_budgets(self) -> None:
@@ -355,6 +379,39 @@ class TestPayloads(unittest.TestCase):
         self.assertEqual(len(payload["tools"]), 1)
         self.assertNotIn("reasoning", payload)
         self.assertNotIn("max_tool_calls", payload)
+
+    def test_all_dialects_use_their_native_image_content_shape(self) -> None:
+        image = (("https://cdn.discordapp.com/attachments/1/2/image.png?ex=signed", "high"),)
+        for dialect in ("openai_responses", "openrouter_responses", "generic_responses"):
+            with self.subTest(dialect=dialect):
+                content = self.build(dialect, images=image)["input"][0]["content"]
+                self.assertEqual(content[0], {"type": "input_text", "text": "input"})
+                self.assertEqual(
+                    content[1],
+                    {"type": "input_image", "image_url": image[0][0], "detail": "high"},
+                )
+        content = self.build("generic_chat", images=image)["messages"][1]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "input"})
+        self.assertEqual(
+            content[1],
+            {"type": "image_url", "image_url": {"url": image[0][0], "detail": "high"}},
+        )
+
+    def test_forced_channel_tool_is_required_and_exclusive_for_all_dialects(self) -> None:
+        for dialect in ("openai_responses", "openrouter_responses", "generic_responses", "generic_chat"):
+            with self.subTest(dialect=dialect):
+                payload = self.build(dialect, force=True)
+                self.assertEqual(len(payload["tools"]), 1)
+                self.assertNotIn("max_tool_calls", payload)
+                if dialect == "generic_chat":
+                    self.assertEqual(payload["tool_choice"]["function"]["name"], "search_channel_history")
+                else:
+                    self.assertEqual(payload["tool_choice"]["name"], "search_channel_history")
+
+    def test_text_only_payload_shapes_remain_scalar(self) -> None:
+        for dialect in ("openai_responses", "openrouter_responses", "generic_responses"):
+            self.assertEqual(self.build(dialect)["input"], "input")
+        self.assertEqual(self.build("generic_chat")["messages"][1]["content"], "input")
 
 
 class TestResponseBoundary(unittest.TestCase):
@@ -644,6 +701,33 @@ class FakeMessage:
         return False
 
 
+def fake_attachment(
+    attachment_id: int,
+    filename: str = "image.png",
+    *,
+    channel_id: int = 987654321098765432,
+    content_type: str = "image/png",
+    size: int = 1_024,
+    width: int = 32,
+    height: int = 32,
+    url: str | None = None,
+):
+    if url is None:
+        url = (
+            f"https://cdn.discordapp.com/attachments/{channel_id}/{attachment_id}/{quote(filename, safe='')}"
+            "?ex=abc&is=def&hm=signature"
+        )
+    return SimpleNamespace(
+        id=attachment_id,
+        filename=filename,
+        content_type=content_type,
+        size=size,
+        width=width,
+        height=height,
+        url=url,
+    )
+
+
 class FakeChannel:
     def __init__(self, messages: list[FakeMessage]):
         self.messages = messages
@@ -671,6 +755,86 @@ class FakeChannel:
                 yield message
 
         return iterator()
+
+
+class TestImageBoundary(unittest.TestCase):
+    def settings(self, **updates):
+        return {**GUILD_DEFAULTS, **updates}
+
+    def test_valid_signed_discord_attachment_is_selected_but_url_is_not_transcribed(self) -> None:
+        message = FakeMessage(111111111111111111, 444444444444444444, "image", 1)
+        attachment = fake_attachment(222222222222222222)
+        message.attachments = [attachment]
+
+        self.assertEqual(
+            image_inputs([message], 987654321098765432, self.settings(image_detail="high")),
+            ((attachment.url, "high"),),
+        )
+        self.assertNotIn(attachment.url, json.dumps(message_record(message)))
+
+    def test_hostile_text_embed_and_filename_urls_are_never_promoted(self) -> None:
+        message = FakeMessage(
+            111111111111111111,
+            444444444444444444,
+            "http://127.0.0.1/private.png https://evil.example/a.png",
+            1,
+        )
+        attachment = fake_attachment(222222222222222222, "https:__127.0.0.1_secret.png")
+        message.attachments = [attachment]
+        message.embeds = [SimpleNamespace(title="x", description="x", url="http://10.0.0.1/a.png")]
+
+        selected = image_inputs([message], 987654321098765432, self.settings())
+        self.assertEqual(selected, ((attachment.url, "auto"),))
+        self.assertTrue(selected[0][0].startswith("https://cdn.discordapp.com/attachments/"))
+        self.assertEqual(selected[0][0].split("/", 3)[2], "cdn.discordapp.com")
+
+    def test_invalid_url_mime_suffix_dimensions_and_per_image_limits_are_skipped(self) -> None:
+        valid_id = 222222222222222222
+        invalid = (
+            fake_attachment(valid_id, url="http://cdn.discordapp.com/attachments/987654321098765432/222222222222222222/image.png"),
+            fake_attachment(valid_id, url="https://evil.example/attachments/987654321098765432/222222222222222222/image.png"),
+            fake_attachment(valid_id, url="https://user@cdn.discordapp.com/attachments/987654321098765432/222222222222222222/image.png"),
+            fake_attachment(valid_id, url="https://cdn.discordapp.com:444/attachments/987654321098765432/222222222222222222/image.png"),
+            fake_attachment(valid_id, url="https://cdn.discordapp.com/attachments/1/222222222222222222/image.png"),
+            fake_attachment(valid_id, url="https://cdn.discordapp.com/attachments/987654321098765432/3/image.png"),
+            fake_attachment(valid_id, url="https://cdn.discordapp.com/attachments/987654321098765432/222222222222222222/not-image.png"),
+            fake_attachment(valid_id, url="https://cdn.discordapp.com/attachments/987654321098765432/222222222222222222/image.png#fragment"),
+            fake_attachment(valid_id, content_type="image/gif"),
+            fake_attachment(valid_id, filename="image.jpg", content_type="image/png"),
+            fake_attachment(valid_id, size=0),
+            fake_attachment(valid_id, width=0),
+            fake_attachment(valid_id, height=0),
+            fake_attachment(valid_id, size=20 * 1024 * 1024 + 1),
+            fake_attachment(valid_id, width=5_001, height=5_000),
+        )
+        message = FakeMessage(111111111111111111, 444444444444444444, "x", 1)
+        message.attachments = list(invalid)
+        self.assertEqual(image_inputs([message], 987654321098765432, self.settings()), ())
+
+    def test_count_and_aggregate_caps_keep_first_eligible_images_chronologically(self) -> None:
+        messages = []
+        for index in range(21):
+            message = FakeMessage(111111111111111111 + index, 444444444444444444, str(index), index)
+            message.attachments = [fake_attachment(222222222222222222 + index)]
+            messages.append(message)
+        selected = image_inputs(reversed(messages), 987654321098765432, self.settings())
+        self.assertEqual(len(selected), 20)
+        self.assertIn("/222222222222222222/", selected[0][0])
+        self.assertIn("/222222222222222241/", selected[-1][0])
+
+        byte_limited = FakeMessage(333333333333333333, 444444444444444444, "bytes", 1)
+        byte_limited.attachments = [
+            fake_attachment(333333333333333330 + index, size=20 * 1024 * 1024)
+            for index in range(3)
+        ]
+        self.assertEqual(len(image_inputs([byte_limited], 987654321098765432, self.settings())), 2)
+
+        pixel_limited = FakeMessage(444444444444444444, 444444444444444444, "pixels", 1)
+        pixel_limited.attachments = [
+            fake_attachment(444444444444444440 + index, width=5_000, height=5_000)
+            for index in range(5)
+        ]
+        self.assertEqual(len(image_inputs([pixel_limited], 987654321098765432, self.settings())), 4)
 
 
 class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
@@ -821,6 +985,72 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(result)
         self.assertEqual(payload["messages"], [message_record(message) for message in self.messages[1:]])
         self.assertTrue(all(record["type"] == "message" for record in payload["messages"]))
+
+    async def test_forced_history_ignores_hostile_filters_and_loads_contiguous_context(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        state = RunState(
+            self.messages[-1].id,
+            {self.messages[-1].id},
+            {self.messages[-1].id: self.messages[-1]},
+        )
+        hostile = json.dumps(
+            {
+                "query": "will-not-match",
+                "author_id": "999999999999999999",
+                "before_message_id": str(self.messages[1].id),
+                "after_message_id": str(self.messages[1].id),
+                "start_unix": 2_000_000_000,
+                "end_unix": 2_000_000_001,
+                "limit": 1,
+            }
+        )
+
+        result = json.loads(
+            await cog._search_channel_history(
+                self.channel,
+                state,
+                GUILD_DEFAULTS,
+                hostile,
+                None,
+                force_contiguous=True,
+            )
+        )
+
+        self.assertEqual(result["status"], "range_start")
+        self.assertEqual(set(state.messages), {message.id for message in self.messages})
+        self.assertEqual(state.boundary_reason, "range_start")
+
+    async def test_local_long_gap_excludes_the_older_side_and_records_boundary(self) -> None:
+        old = FakeMessage(111111111111111111, 444444444444444444, "old", 0)
+        near = FakeMessage(222222222222222222, 555555555555555555, "near", 50)
+        snapshot = FakeMessage(333333333333333333, 444444444444444444, "snapshot", 59)
+        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
+        args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":100}'
+
+        result = json.loads(
+            await object.__new__(ChannelSummary)._search_channel_history(
+                FakeChannel([old, near, snapshot]),
+                state,
+                GUILD_DEFAULTS,
+                args,
+                None,
+                force_contiguous=True,
+            )
+        )
+
+        self.assertEqual(result["status"], "long_gap")
+        self.assertEqual(set(state.messages), {near.id, snapshot.id})
+        self.assertEqual(state.boundary_message_id, near.id)
+        self.assertEqual(state.boundary_gap_seconds, 3_000)
+
+        await object.__new__(ChannelSummary)._search_channel_history(
+            FakeChannel([old, near, snapshot]),
+            state,
+            GUILD_DEFAULTS,
+            args,
+            None,
+        )
+        self.assertNotIn(old.id, state.messages)
 
     async def test_base_range_rejects_zero_and_never_exceeds_one_message(self) -> None:
         cog = object.__new__(ChannelSummary)
@@ -1008,10 +1238,388 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             "auto",
             None,
         )
-        self.assertEqual(result.topics[0].opener_user_id, self.messages[1].author.id)
+        self.assertEqual(result.topics[0].opener_user_id, self.messages[0].author.id)
+        self.assertEqual(result.topics[0].boundary_reason, "range_start")
         self.assertEqual(citations[0].url, "https://example.com")
         self.assertEqual(actual, "model-1")
         self.assertEqual(cog.request_provider.await_count, 2)
+
+    async def test_auto_and_time_force_the_first_tool_request(self) -> None:
+        args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":10}'
+        final = {
+            "overview": "Overview",
+            "topics": [
+                {
+                    "title": "Topic",
+                    "opener_message_id": str(self.messages[0].id),
+                    "opener_user_id": str(self.messages[0].author.id),
+                    "boundary_reason": "range_start",
+                    "summary": "Details",
+                    "source_message_ids": [str(message.id) for message in self.messages],
+                }
+            ],
+        }
+        for mode in ("auto", "time"):
+            with self.subTest(mode=mode):
+                cog = object.__new__(ChannelSummary)
+                cog._reserve_guild_attempt = AsyncMock()
+                cog.request_provider = AsyncMock(
+                    side_effect=[
+                        NormalizedResponse(None, None, (FunctionCall("call_1", "search_channel_history", args),), (), None, 0),
+                        NormalizedResponse(json.dumps(final), None, (), (), None, 0),
+                    ]
+                )
+                state = RunState(
+                    self.messages[-1].id,
+                    {self.messages[-1].id},
+                    {self.messages[-1].id: self.messages[-1]},
+                )
+                settings = {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": True}
+
+                await cog._run_agent(
+                    SimpleNamespace(id=123456789012345678),
+                    self.channel,
+                    profile("openai_responses"),
+                    settings,
+                    state,
+                    mode,
+                    None,
+                )
+
+                first_payload = cog.request_provider.await_args_list[0].args[1]
+                self.assertEqual(first_payload["tool_choice"]["name"], "search_channel_history")
+                self.assertEqual([tool["type"] for tool in first_payload["tools"]], ["function"])
+
+    async def test_early_final_is_ignored_and_forced_again(self) -> None:
+        args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":10}'
+        early = {
+            "overview": "early",
+            "topics": [{"title": "Topic", "opener_message_id": str(self.messages[-1].id), "opener_user_id": str(self.messages[-1].author.id), "boundary_reason": "range_start", "summary": "early", "source_message_ids": [str(self.messages[-1].id)]}],
+        }
+        final = {
+            "overview": "final",
+            "topics": [{"title": "Topic", "opener_message_id": str(self.messages[0].id), "opener_user_id": str(self.messages[0].author.id), "boundary_reason": "range_start", "summary": "done", "source_message_ids": [str(message.id) for message in self.messages]}],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.request_provider = AsyncMock(
+            side_effect=[
+                NormalizedResponse(json.dumps(early), None, (), (), None, 0),
+                NormalizedResponse(None, None, (FunctionCall("call_1", "search_channel_history", args),), (), None, 0),
+                NormalizedResponse(json.dumps(final), None, (), (), None, 0),
+            ]
+        )
+        state = RunState(self.messages[-1].id, {self.messages[-1].id}, {self.messages[-1].id: self.messages[-1]})
+
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=123456789012345678),
+            self.channel,
+            profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False},
+            state,
+            "auto",
+            None,
+        )
+
+        self.assertEqual(result.overview, "final")
+        self.assertIn("tool_choice", cog.request_provider.await_args_list[0].args[1])
+        self.assertIn("tool_choice", cog.request_provider.await_args_list[1].args[1])
+
+    async def test_semantic_topic_change_is_accepted_after_contiguous_backfill(self) -> None:
+        base_time = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
+        messages = [
+            FakeMessage(100000000000000000 + index, 444444444444444444, str(index), 0)
+            for index in range(102)
+        ]
+        for index, message in enumerate(messages):
+            message.created_at = base_time + timedelta(seconds=index)
+        args = '{"query":"x","author_id":"999999999999999999","before_message_id":"111111111111111111","after_message_id":"222222222222222222","start_unix":1,"end_unix":2,"limit":1}'
+        final = {
+            "overview": "ok",
+            "topics": [{"title": "Topic", "opener_message_id": str(messages[1].id), "opener_user_id": str(messages[1].author.id), "boundary_reason": "topic_change", "summary": "done", "source_message_ids": [str(messages[1].id), str(messages[-1].id)]}],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.request_provider = AsyncMock(
+            side_effect=[
+                NormalizedResponse(None, None, (FunctionCall("call", "search_channel_history", args),), (), None, 0),
+                NormalizedResponse(json.dumps(final), None, (), (), None, 0),
+            ]
+        )
+        state = RunState(messages[-1].id, {messages[-1].id}, {messages[-1].id: messages[-1]})
+
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=123456789012345678),
+            FakeChannel(messages),
+            profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False},
+            state,
+            "auto",
+            None,
+        )
+
+        self.assertEqual(state.boundary_backfills, 1)
+        self.assertEqual(result.topics[0].boundary_reason, "topic_change")
+
+    async def test_zero_call_or_one_turn_overwrites_earliest_boundary_as_limit(self) -> None:
+        final = {
+            "overview": "ok",
+            "topics": [{"title": "Topic", "opener_message_id": str(self.messages[-1].id), "opener_user_id": str(self.messages[-1].author.id), "boundary_reason": "topic_change", "summary": "done", "source_message_ids": [str(self.messages[-1].id)]}],
+        }
+        for limits in ({"channel_tool_max_calls": 0}, {"agent_max_turns": 1}):
+            with self.subTest(limits=limits):
+                cog = object.__new__(ChannelSummary)
+                cog._reserve_guild_attempt = AsyncMock()
+                cog.request_provider = AsyncMock(return_value=NormalizedResponse(json.dumps(final), None, (), (), None, 0))
+                state = RunState(self.messages[-1].id, {self.messages[-1].id}, {self.messages[-1].id: self.messages[-1]})
+                result, _, _ = await cog._run_agent(
+                    SimpleNamespace(id=123456789012345678),
+                    self.channel,
+                    profile("openai_responses"),
+                    {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False, **limits},
+                    state,
+                    "auto",
+                    None,
+                )
+                topic = result.topics[0]
+                self.assertEqual(topic.boundary_reason, "limit_reached")
+                self.assertIsNone(topic.opener_message_id)
+                self.assertIsNone(topic.opener_user_id)
+
+    async def test_limit_override_targets_chronologically_earliest_topic(self) -> None:
+        final = {
+            "overview": "ok",
+            "topics": [
+                {"title": "newer", "opener_message_id": str(self.messages[2].id), "opener_user_id": str(self.messages[2].author.id), "boundary_reason": "topic_change", "summary": "new", "source_message_ids": [str(self.messages[2].id)]},
+                {"title": "older", "opener_message_id": str(self.messages[1].id), "opener_user_id": str(self.messages[1].author.id), "boundary_reason": "topic_change", "summary": "old", "source_message_ids": [str(self.messages[1].id)]},
+            ],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.request_provider = AsyncMock(return_value=NormalizedResponse(json.dumps(final), None, (), (), None, 0))
+        state = RunState(
+            self.messages[2].id,
+            {self.messages[1].id, self.messages[2].id},
+            {self.messages[1].id: self.messages[1], self.messages[2].id: self.messages[2]},
+        )
+
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=123456789012345678),
+            self.channel,
+            profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False, "channel_tool_max_calls": 0},
+            state,
+            "auto",
+            None,
+        )
+
+        self.assertEqual(result.topics[0].boundary_reason, "topic_change")
+        self.assertEqual(result.topics[1].boundary_reason, "limit_reached")
+        self.assertIsNone(result.topics[1].opener_message_id)
+
+    async def test_input_exhaustion_rolls_back_backfill_and_forces_limit_boundary(self) -> None:
+        older = FakeMessage(111111111111111111, 444444444444444444, "o" * 8_000, 1)
+        snapshot = FakeMessage(222222222222222222, 555555555555555555, "s" * 4_000, 2)
+        args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":10}'
+        final = {
+            "overview": "ok",
+            "topics": [{"title": "Topic", "opener_message_id": str(snapshot.id), "opener_user_id": str(snapshot.author.id), "boundary_reason": "topic_change", "summary": "done", "source_message_ids": [str(snapshot.id)]}],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.request_provider = AsyncMock(
+            side_effect=[
+                NormalizedResponse(None, None, (FunctionCall("call", "search_channel_history", args),), (), None, 0),
+                NormalizedResponse(json.dumps(final), None, (), (), None, 0),
+            ]
+        )
+        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
+
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=123456789012345678),
+            FakeChannel([older, snapshot]),
+            profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False, "max_input_chars": 10_000},
+            state,
+            "auto",
+            None,
+        )
+
+        self.assertEqual(set(state.messages), {snapshot.id})
+        self.assertTrue(state.boundary_exhausted)
+        self.assertEqual(result.topics[0].boundary_reason, "limit_reached")
+
+    async def test_premature_limit_after_backfill_forces_another_contiguous_call(self) -> None:
+        base_time = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
+        messages = [
+            FakeMessage(100000000000000000 + index, 444444444444444444, str(index), 0)
+            for index in range(202)
+        ]
+        for index, message in enumerate(messages):
+            message.created_at = base_time + timedelta(seconds=index)
+        args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":100}'
+        premature = {
+            "overview": "premature",
+            "topics": [{"title": "Topic", "opener_message_id": None, "opener_user_id": None, "boundary_reason": "limit_reached", "summary": "wait", "source_message_ids": [str(messages[-1].id)]}],
+        }
+        final = {
+            "overview": "complete",
+            "topics": [{"title": "Topic", "opener_message_id": str(messages[1].id), "opener_user_id": str(messages[1].author.id), "boundary_reason": "topic_change", "summary": "done", "source_message_ids": [str(messages[1].id), str(messages[-1].id)]}],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.request_provider = AsyncMock(
+            side_effect=[
+                NormalizedResponse(None, None, (FunctionCall("one", "search_channel_history", args),), (), None, 0),
+                NormalizedResponse(json.dumps(premature), None, (), (), None, 0),
+                NormalizedResponse(None, None, (FunctionCall("two", "search_channel_history", args),), (), None, 0),
+                NormalizedResponse(json.dumps(final), None, (), (), None, 0),
+            ]
+        )
+        state = RunState(messages[-1].id, {messages[-1].id}, {messages[-1].id: messages[-1]})
+
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=123456789012345678),
+            FakeChannel(messages),
+            profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False},
+            state,
+            "auto",
+            None,
+        )
+
+        self.assertEqual(result.overview, "complete")
+        self.assertIn("tool_choice", cog.request_provider.await_args_list[2].args[1])
+        self.assertEqual(state.boundary_backfills, 2)
+
+    async def test_unforced_second_search_stays_contiguous_until_boundary_is_resolved(self) -> None:
+        base_time = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
+        messages = [
+            FakeMessage(100000000000000000 + index, 444444444444444444, str(index), 0)
+            for index in range(102)
+        ]
+        messages[0].content = "target older side"
+        messages[0].created_at = base_time
+        for index, message in enumerate(messages[1:], 1):
+            message.created_at = base_time + timedelta(seconds=3_601 + index)
+        first_args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":100}'
+        filtered_args = json.dumps(
+            {
+                "query": "target older side",
+                "author_id": str(messages[0].author.id),
+                "before_message_id": str(messages[1].id),
+                "after_message_id": "",
+                "start_unix": 0,
+                "end_unix": 0,
+                "limit": 1,
+            }
+        )
+        final = {
+            "overview": "complete",
+            "topics": [
+                {
+                    "title": "Topic",
+                    "opener_message_id": str(messages[-1].id),
+                    "opener_user_id": str(messages[-1].author.id),
+                    "boundary_reason": "topic_change",
+                    "summary": "done",
+                    "source_message_ids": [str(messages[1].id), str(messages[-1].id)],
+                }
+            ],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.request_provider = AsyncMock(
+            side_effect=[
+                NormalizedResponse(None, None, (FunctionCall("one", "search_channel_history", first_args),), (), None, 0),
+                NormalizedResponse(None, None, (FunctionCall("two", "search_channel_history", filtered_args),), (), None, 0),
+                NormalizedResponse(json.dumps(final), None, (), (), None, 0),
+            ]
+        )
+        state = RunState(messages[-1].id, {messages[-1].id}, {messages[-1].id: messages[-1]})
+
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=123456789012345678),
+            FakeChannel(messages),
+            profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False},
+            state,
+            "auto",
+            None,
+        )
+
+        self.assertNotIn("tool_choice", cog.request_provider.await_args_list[1].args[1])
+        self.assertNotIn(messages[0].id, state.messages)
+        self.assertEqual(state.boundary_reason, "long_gap")
+        self.assertEqual(state.boundary_message_id, messages[1].id)
+        self.assertEqual(result.topics[0].boundary_reason, "long_gap")
+        self.assertEqual(result.topics[0].opener_message_id, messages[1].id)
+
+    async def test_from_mode_does_not_force_backfill(self) -> None:
+        final = {
+            "overview": "ok",
+            "topics": [{"title": "Topic", "opener_message_id": str(self.messages[2].id), "opener_user_id": str(self.messages[2].author.id), "boundary_reason": "topic_change", "summary": "done", "source_message_ids": [str(self.messages[1].id), str(self.messages[2].id)]}],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.request_provider = AsyncMock(return_value=NormalizedResponse(json.dumps(final), None, (), (), None, 0))
+        state = RunState(
+            self.messages[-1].id,
+            {self.messages[1].id, self.messages[2].id},
+            {self.messages[1].id: self.messages[1], self.messages[2].id: self.messages[2]},
+            hard_start_id=self.messages[1].id,
+        )
+
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=123456789012345678),
+            self.channel,
+            profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False},
+            state,
+            "from",
+            None,
+        )
+
+        self.assertEqual(result.topics[0].boundary_reason, "explicit_start")
+        self.assertEqual(result.topics[0].opener_message_id, self.messages[1].id)
+        self.assertNotIn("tool_choice", cog.request_provider.await_args.args[1])
+
+    async def test_run_deadline_is_cumulative_and_tool_added_image_appears_next_turn(self) -> None:
+        older = self.messages[1]
+        older.attachments = [fake_attachment(777777777777777777)]
+        snapshot = self.messages[2]
+        channel = FakeChannel([older, snapshot])
+        args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":10}'
+        final = {
+            "overview": "ok",
+            "topics": [{"title": "Topic", "opener_message_id": str(older.id), "opener_user_id": str(older.author.id), "boundary_reason": "range_start", "summary": "done", "source_message_ids": [str(older.id), str(snapshot.id)]}],
+        }
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.request_provider = AsyncMock(
+            side_effect=[
+                NormalizedResponse(None, None, (FunctionCall("call", "search_channel_history", args),), (), None, 0),
+                NormalizedResponse(json.dumps(final), None, (), (), None, 0),
+            ]
+        )
+        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
+
+        with patch("channelsummary.channelsummary.time.monotonic", side_effect=[100.0, 110.0, 125.0]):
+            await cog._run_agent(
+                SimpleNamespace(id=123456789012345678),
+                channel,
+                profile("openai_responses"),
+                {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False},
+                state,
+                "auto",
+                None,
+            )
+
+        timeouts = [call.kwargs["timeout_seconds"] for call in cog.request_provider.await_args_list]
+        self.assertEqual(timeouts, [590.0, 575.0])
+        self.assertIsInstance(cog.request_provider.await_args_list[0].args[1]["input"], str)
+        second_content = cog.request_provider.await_args_list[1].args[1]["input"][0]["content"]
+        self.assertEqual(second_content[1]["type"], "input_image")
 
     def test_footer_is_exact_requested_format(self) -> None:
         settings = dict(GUILD_DEFAULTS)
@@ -1383,6 +1991,79 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
         help_text = " ".join(embed.description for embed in ctx.send.await_args.kwargs["embeds"])
         self.assertIn(self.policy, help_text)
         self.assertIn(self.warning, help_text)
+
+    async def test_v1_is_gated_and_manage_messages_acceptance_records_v2(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        scope = MagicMock()
+        scope.all = AsyncMock(
+            return_value={
+                **GUILD_DEFAULTS,
+                "enabled": True,
+                "disclosure_version": 1,
+                "provider_profile": "main",
+                "model": "model-1",
+            }
+        )
+        scope.disclosure_version.set = AsyncMock()
+        scope.enabled.set = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            send_messages_in_threads=False,
+            embed_links=True,
+        )
+        ctx = MagicMock()
+        ctx.guild = SimpleNamespace(me=object())
+        ctx.channel = channel
+        ctx.author = SimpleNamespace()
+
+        with self.assertRaises(SummaryError) as caught:
+            await cog._execute_summary(ctx, "auto")
+        self.assertEqual(caught.exception.code, ErrorCode.NOT_CONFIGURED)
+
+        cog.get_profile = AsyncMock(return_value=profile("openai_responses"))
+        scope.all.return_value = {
+            **GUILD_DEFAULTS,
+            "provider_profile": "main",
+            "model": "model-1",
+        }
+        await cog.enable_guild(SimpleNamespace())
+        scope.disclosure_version.set.assert_awaited_once_with(DISCLOSURE_VERSION)
+        self.assertEqual(DISCLOSURE_VERSION, 2)
+        scope.enabled.set.assert_awaited_once_with(True)
+
+    async def test_runtime_and_files_disclose_image_fetch_resend_and_retention(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=dict(GUILD_DEFAULTS))
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        settings_text = (await cog._settings_embed(MagicMock())).description
+
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        ctx.interaction = None
+        await ChannelSummary.summary_help.callback(cog, ctx)
+        help_text = " ".join(embed.description for embed in ctx.send.await_args.kwargs["embeds"])
+        root = Path(__file__).resolve().parents[1]
+        texts = [
+            settings_text,
+            help_text,
+            (root / "README.md").read_text(encoding="utf-8"),
+            (root / "channelsummary" / "info.json").read_text(encoding="utf-8"),
+        ]
+        for text in texts:
+            with self.subTest(text=text[:30]):
+                normalized = " ".join(text.split())
+                self.assertIn("fetches and reads eligible image", normalized)
+                self.assertIn("signed Discord CDN URLs", normalized)
+                self.assertIn("every stateless provider turn", normalized)
+                self.assertIn("up to 10 turns", normalized)
+                self.assertIn("retention policies apply", normalized)
 
     def test_readme_and_info_disclose_unencrypted_http(self) -> None:
         root = Path(__file__).resolve().parents[1]

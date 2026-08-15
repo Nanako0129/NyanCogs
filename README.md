@@ -68,13 +68,17 @@ constructed locally from supplied messages. Web links are rendered only from
 provider citation annotations. Model-authored links, mass/role/channel
 mentions, and fabricated message IDs are not trusted.
 
-Selected message text, stable user and message IDs, timestamps, replies,
-attachment URLs, embed metadata, and Agent-generated web queries may leave
-Discord for the selected provider and search backend; their retention policies
-apply. ChannelSummary does not persist messages, prompts, searches, provider
-responses, or summaries. With an HTTP provider, API keys and selected Discord
-data traverse the LAN unencrypted; use HTTP only on a trusted LAN. Its complete
-statement is in
+Selected message text, stable user and message IDs, timestamps, reply and embed
+metadata, and Agent-generated web queries may leave Discord. When images are
+enabled, the selected provider fetches and reads eligible image content (PNG,
+JPEG, or WebP) through signed Discord CDN URLs. Image metadata, references, and
+signed URLs may be resent on every stateless provider turn, up to 10 turns. Provider
+and search-backend retention policies apply. Images are limited to 20 MiB and
+25 MP each, 50 MiB and 100 MP total, and the first 20 eligible attachments in
+chronological order. ChannelSummary does not persist messages, prompts,
+searches, provider responses, or summaries. With an HTTP provider, API keys
+and selected Discord data traverse the LAN unencrypted; signed URLs do too.
+Use HTTP only on a trusted LAN. Its complete statement is in
 [`channelsummary/info.json`](channelsummary/info.json).
 
 ## EmbedFixer
