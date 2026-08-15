@@ -2583,6 +2583,10 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertIn("embed=embeds[0]", source)
         self.assertIn("詳細原因僅觸發者可見", source)
         self.assertEqual(source.count("await self._reserve_guild_attempt("), 1)
+        self.assertLess(
+            source.index("user_reservation = self._reserve_user_attempt("),
+            source.index("await self._reserve_guild_attempt("),
+        )
         self.assertNotIn(
             "_reserve_guild_attempt", inspect.getsource(ChannelSummary._run_agent)
         )
@@ -2659,6 +2663,14 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             "詳細原因僅觸發者可見",
             progress.edit.await_args.kwargs["content"],
         )
+
+        key = (ctx.guild.id, ctx.author.id)
+        existing = cog._reserve_user_attempt(*key, int(settings["user_cooldown_seconds"]))
+        cog._reserve_guild_attempt.reset_mock()
+        with self.assertRaises(commands.CommandOnCooldown):
+            await cog._execute_summary(ctx, "auto")
+        cog._reserve_guild_attempt.assert_not_awaited()
+        self.assertEqual(cog._user_attempts[key], existing)
 
     async def test_model_allowlist_change_disables_invalid_guild_selections(self) -> None:
         cog = object.__new__(ChannelSummary)

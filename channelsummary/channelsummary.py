@@ -2599,13 +2599,13 @@ class ChannelSummary(commands.Cog):
                     raise commands.UserFeedbackCheckFailure(
                         f"This channel needs {settings['new_messages_required']} new human messages after its last successful summary."
                     )
-                await self._reserve_guild_attempt(
-                    ctx.guild.id, int(settings["guild_attempts_per_hour"])
-                )
                 user_reservation = self._reserve_user_attempt(
                     ctx.guild.id,
                     ctx.author.id,
                     int(settings["user_cooldown_seconds"]),
+                )
+                await self._reserve_guild_attempt(
+                    ctx.guild.id, int(settings["guild_attempts_per_hour"])
                 )
                 state = await self._base_messages(
                     ctx.channel,
