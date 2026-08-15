@@ -2585,7 +2585,15 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.count("await self._reserve_guild_attempt("), 1)
         self.assertLess(
             source.index("user_reservation = self._reserve_user_attempt("),
+            source.index("await self._base_messages("),
+        )
+        self.assertLess(
+            source.index("await self._base_messages("),
             source.index("await self._reserve_guild_attempt("),
+        )
+        self.assertLess(
+            source.index("await self._reserve_guild_attempt("),
+            source.index("progress = await ctx.channel.send("),
         )
         self.assertNotIn(
             "_reserve_guild_attempt", inspect.getsource(ChannelSummary._run_agent)
@@ -2656,8 +2664,9 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cog._user_attempts, {})
         cog._reserve_guild_attempt.assert_awaited_once()
         interaction.delete_original_response.assert_not_awaited()
-        interaction.edit_original_response.assert_awaited_once_with(
-            content=f"摘要已開始：{progress.jump_url}"
+        self.assertEqual(
+            [call.kwargs["content"] for call in interaction.edit_original_response.await_args_list],
+            ["⏳ 正在讀取訊息…", f"摘要已開始：{progress.jump_url}"],
         )
         self.assertIn(
             "詳細原因僅觸發者可見",
@@ -2667,10 +2676,20 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         key = (ctx.guild.id, ctx.author.id)
         existing = cog._reserve_user_attempt(*key, int(settings["user_cooldown_seconds"]))
         cog._reserve_guild_attempt.reset_mock()
+        channel.send.reset_mock()
         with self.assertRaises(commands.CommandOnCooldown):
             await cog._execute_summary(ctx, "auto")
         cog._reserve_guild_attempt.assert_not_awaited()
+        channel.send.assert_not_awaited()
         self.assertEqual(cog._user_attempts[key], existing)
+
+        cog._user_attempts.clear()
+        cog._base_messages.side_effect = commands.UserFeedbackCheckFailure("bad range")
+        with self.assertRaises(commands.UserFeedbackCheckFailure):
+            await cog._execute_summary(ctx, "auto")
+        cog._reserve_guild_attempt.assert_not_awaited()
+        channel.send.assert_not_awaited()
+        self.assertEqual(cog._user_attempts, {})
 
     async def test_model_allowlist_change_disables_invalid_guild_selections(self) -> None:
         cog = object.__new__(ChannelSummary)

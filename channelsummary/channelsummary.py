@@ -2561,19 +2561,16 @@ class ChannelSummary(commands.Cog):
             interaction = getattr(ctx, "interaction", None)
             if interaction is not None:
                 await ctx.defer(ephemeral=True)
-            progress = await ctx.channel.send(
-                "⏳ 正在讀取訊息…", allowed_mentions=discord.AllowedMentions.none()
-            )
-            if interaction is not None:
                 try:
-                    await interaction.edit_original_response(
-                        content=f"摘要已開始：{progress.jump_url}"
-                    )
+                    await interaction.edit_original_response(content="⏳ 正在讀取訊息…")
                 except discord.HTTPException:
                     pass
             user_reservation: float | None = None
+            progress: discord.Message | None = None
 
             async def update_progress(content: str) -> None:
+                if progress is None:
+                    return
                 try:
                     await progress.edit(
                         content=content,
@@ -2588,7 +2585,7 @@ class ChannelSummary(commands.Cog):
                     ctx.channel,
                     include_bots=bool(settings["include_bots"]),
                     invocation_id=invocation_id,
-                    progress_id=progress.id,
+                    progress_id=None,
                 )
                 if not await self._checkpoint_ready(
                     ctx.channel,
@@ -2604,9 +2601,6 @@ class ChannelSummary(commands.Cog):
                     ctx.author.id,
                     int(settings["user_cooldown_seconds"]),
                 )
-                await self._reserve_guild_attempt(
-                    ctx.guild.id, int(settings["guild_attempts_per_hour"])
-                )
                 state = await self._base_messages(
                     ctx.channel,
                     snapshot,
@@ -2616,7 +2610,20 @@ class ChannelSummary(commands.Cog):
                     invocation_id,
                     initial_inspected,
                 )
-                await update_progress("🧭 Agent 正在補齊話題脈絡並產生摘要…")
+                await self._reserve_guild_attempt(
+                    ctx.guild.id, int(settings["guild_attempts_per_hour"])
+                )
+                progress = await ctx.channel.send(
+                    "🧭 Agent 正在補齊話題脈絡並產生摘要…",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                if interaction is not None:
+                    try:
+                        await interaction.edit_original_response(
+                            content=f"摘要已開始：{progress.jump_url}"
+                        )
+                    except discord.HTTPException:
+                        pass
                 semaphore_key = (ctx.guild.id, profile.name, int(settings["guild_concurrency"]))
                 semaphore = self._guild_semaphores.setdefault(
                     semaphore_key,
