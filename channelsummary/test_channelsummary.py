@@ -2707,6 +2707,10 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         cog._release_guild_attempt.assert_not_awaited()
         channel.send.assert_not_awaited()
         self.assertEqual(cog._user_attempts[key], existing)
+        self.assertEqual(
+            interaction.edit_original_response.await_args.kwargs["content"],
+            "摘要未開始；詳細原因如下。",
+        )
 
         cog._user_attempts.clear()
         cog._base_messages.side_effect = commands.UserFeedbackCheckFailure("bad range")
@@ -2716,6 +2720,10 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         cog._release_guild_attempt.assert_not_awaited()
         channel.send.assert_not_awaited()
         self.assertEqual(cog._user_attempts, {})
+        self.assertEqual(
+            interaction.edit_original_response.await_args.kwargs["content"],
+            "摘要未開始；詳細原因如下。",
+        )
 
     async def test_model_allowlist_change_disables_invalid_guild_selections(self) -> None:
         cog = object.__new__(ChannelSummary)

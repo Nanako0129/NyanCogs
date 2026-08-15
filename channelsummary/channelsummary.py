@@ -2697,6 +2697,13 @@ class ChannelSummary(commands.Cog):
                             )
                         except discord.HTTPException:
                             pass
+                elif progress is None and interaction is not None:
+                    try:
+                        await interaction.edit_original_response(
+                            content="摘要未開始；詳細原因如下。"
+                        )
+                    except discord.HTTPException:
+                        pass
                 else:
                     await update_progress("❌ 摘要失敗；詳細原因僅觸發者可見。")
                 raise
