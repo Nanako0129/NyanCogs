@@ -925,7 +925,7 @@ def _normalize_chat(
         validate_function_arguments(str(name), arguments)
         seen.add(call_id)
         calls.append(FunctionCall(call_id, name, arguments))
-    if calls and (text is not None or refusal is not None):
+    if calls and (text not in (None, "") or refusal is not None):
         raise SummaryError(ErrorCode.RESPONSE_INVALID)
     return NormalizedResponse(text, refusal, tuple(calls), tuple(citations), _bounded_model(raw.get("model")), 0)
 

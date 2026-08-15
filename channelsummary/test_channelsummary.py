@@ -903,7 +903,7 @@ class TestResponseBoundary(unittest.TestCase):
         self.assertEqual(result.citations[0].url, "https://example.com/a")
         self.assertNotIn("reason", repr(result))
 
-    def test_chat_tool_call_normalizes(self) -> None:
+    def test_chat_tool_call_content_exclusivity(self) -> None:
         raw = {
             "model": "vendor/model",
             "choices": [
@@ -925,8 +925,17 @@ class TestResponseBoundary(unittest.TestCase):
                 }
             ],
         }
-        result = normalize_response("generic_chat", raw)
-        self.assertEqual(result.function_calls[0].call_id, "call_1")
+        for content in (None, ""):
+            with self.subTest(content=content):
+                raw["choices"][0]["message"]["content"] = content
+                result = normalize_response("generic_chat", raw)
+                self.assertEqual(result.text, content)
+                self.assertEqual(result.function_calls[0].call_id, "call_1")
+        for content in ("summary", " "):
+            with self.subTest(content=content), self.assertRaises(SummaryError) as caught:
+                raw["choices"][0]["message"]["content"] = content
+                normalize_response("generic_chat", raw)
+            self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
 
     def test_citation_controls_and_whitespace_fail_closed_in_both_dialects(self) -> None:
         for dialect in ("openai_responses", "generic_chat"):
