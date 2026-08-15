@@ -8,7 +8,8 @@ ChannelSummary creates attributed Discord channel summaries through an OpenAI-
 compatible LLM Agent. It supports recent-message, explicit-start, and duration
 ranges. The Agent can search additional history only in the invocation channel
 and can use native OpenAI or OpenRouter web search when the selected profile
-supports it.
+supports it. Generic Responses and Chat/CLIProxy profiles can instead use the
+application-controlled Firecrawl cloud tools.
 
 Install and load it with Red's Downloader:
 
@@ -27,7 +28,17 @@ keys remain in Red's shared API token storage.
 
 [p]summary provider add openrouter openrouter_responses https://openrouter.ai channelsummary_openrouter openai/gpt-5.6
 [p]summary provider key openrouter
+
+[p]summary provider webkey
+[p]summary provider webquota 20
 ```
+
+`web_enabled` is the guild master switch. `web_mode` is `auto`, `native`, or
+`firecrawl`: `auto` keeps native hosted search for OpenAI/OpenRouter and selects
+Firecrawl for other profiles when its separately stored key is present. There
+is no runtime fallback between backends. Each summary can attempt at most 5
+Firecrawl calls and expose at most five search results regardless of higher guild
+settings; fetched markdown is capped by `web_fetch_max_chars`.
 
 HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. API keys
 and selected Discord data traverse the LAN unencrypted; use HTTP only on a
@@ -64,16 +75,34 @@ messages after a successful summary before that channel can run another.
 
 Summary Embeds preserve validated `<@user_id>` speaker attribution but use
 `AllowedMentions.none()`, so they do not notify anyone. Discord jump links are
-constructed locally from supplied messages. Web links are rendered only from
-provider citation annotations. Model-authored links, mass/role/channel
-mentions, and fabricated message IDs are not trusted.
+constructed locally from supplied messages. Native-mode web links are rendered
+only from provider citation annotations. Firecrawl-mode links are rendered only
+from application-validated URLs in successful same-run Firecrawl search results;
+model annotations and manually authored fetch URLs grant no authority. Rendering
+performs no network I/O.
 
-Selected message text, stable user and message IDs, timestamps, replies,
-attachment URLs, embed metadata, and Agent-generated web queries may leave
-Discord for the selected provider and search backend; their retention policies
-apply. ChannelSummary does not persist messages, prompts, searches, provider
-responses, or summaries. With an HTTP provider, API keys and selected Discord
-data traverse the LAN unencrypted; use HTTP only on a trusted LAN. Its complete
+Selected message text, stable user and message IDs, timestamps, reply and embed
+metadata leave Discord for the selected LLM. In Firecrawl mode, private
+Discord-derived search queries and fetch URLs go to Firecrawl. Firecrawl-returned
+URLs, titles, snippets, and markdown go to the LLM and may be resent across up
+to 20 stateless turns. Firecrawl retention and training are unverified, and its
+credits may incur cost. After a guild manager consents, any channel reader may
+trigger these exports.
+
+The owner Firecrawl hourly quota is one process-wide shared pool; one enabled
+guild can exhaust Firecrawl availability and spend allowance for all guilds;
+the guild request quota is not an owner Firecrawl budget control. A process
+restart clears the in-memory pool, and multiple processes multiply the cap.
+Firecrawl cloud is trusted to control target DNS, redirects, and SSRF; DNS
+rebinding and split-horizon behavior remain residual vendor risk.
+
+When images are enabled, image content and signed Discord CDN URLs may be resent
+to the LLM across up to 20 stateless turns. Provider retention and training are
+unverified. Images are limited to 20 MiB and 25 MP each, 50 MiB and 100 MP total,
+and the first 20 eligible attachments in chronological order. ChannelSummary
+does not persist messages, prompts, searches, provider responses, or summaries.
+With an HTTP provider, API keys and selected Discord data traverse the LAN
+unencrypted; signed URLs do too. Use HTTP only on a trusted LAN. Its complete
 statement is in
 [`channelsummary/info.json`](channelsummary/info.json).
 
