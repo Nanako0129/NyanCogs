@@ -2532,7 +2532,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cog.config.mock_calls, [])
         self.assertIn("ephemeral cooldown", ChannelSummary.red_delete_data_for_user.__doc__)
 
-        cog._reserve_user_attempt(4, 42, 0)
+        self.assertIsInstance(cog._reserve_user_attempt(4, 42, 0), float)
         self.assertEqual({key for key in cog._user_attempts if key[1] == 42}, {(4, 42)})
 
     async def test_settings_view_contains_selects_and_enable_controls(self) -> None:
@@ -2567,16 +2567,98 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
 
     def test_slash_command_defers_before_channel_history_scans(self) -> None:
         source = inspect.getsource(ChannelSummary._execute_summary)
-        self.assertLess(source.index("await ctx.defer()"), source.index("await self._snapshot_message("))
+        self.assertLess(
+            source.index("await ctx.defer(ephemeral=True)"),
+            source.index("await self._snapshot_message("),
+        )
+        self.assertIn("await ctx.defer(ephemeral=True)", source)
         self.assertIn("progress = await ctx.channel.send(", source)
-        self.assertNotIn("interaction.edit_original_response", source)
+        self.assertIn("interaction.edit_original_response", source)
+        self.assertNotIn("delete_original_response", source)
         self.assertLess(source.index("正在讀取訊息"), source.index("await self._snapshot_message("))
         self.assertLess(source.index("補齊話題脈絡"), source.index("await self._run_agent("))
         self.assertLess(source.index("await self._base_messages("), source.index("await self._run_agent("))
         self.assertLess(source.index("await self._base_messages("), source.index("checkpoint_message_id.set("))
         self.assertLess(source.index("正在整理 Summary Embed"), source.index("self._render_embeds("))
-        self.assertIn("finally:", source)
-        self.assertIn("await progress.delete()", source)
+        self.assertIn("embed=embeds[0]", source)
+        self.assertIn("詳細原因僅觸發者可見", source)
+        self.assertEqual(source.count("await self._reserve_guild_attempt("), 1)
+        self.assertNotIn(
+            "_reserve_guild_attempt", inspect.getsource(ChannelSummary._run_agent)
+        )
+        self.assertIn("self._user_attempts.pop(key, None)", source)
+
+    async def test_failed_slash_summary_keeps_progress_and_refunds_user_cooldown(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog._channel_locks = __import__("collections").defaultdict(__import__("asyncio").Lock)
+        cog._guild_semaphores = {}
+        cog._user_attempts = {}
+        settings = {
+            **GUILD_DEFAULTS,
+            "enabled": True,
+            "disclosure_version": DISCLOSURE_VERSION,
+            "provider_profile": "main",
+            "model": "model-1",
+            "web_enabled": False,
+        }
+        guild_scope = MagicMock()
+        guild_scope.all = AsyncMock(return_value=settings)
+        channel_scope = MagicMock()
+        channel_scope.checkpoint_message_id.set = AsyncMock()
+        channel_scope.checkpoint_timestamp.set = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.guild.return_value = guild_scope
+        cog.config.channel.return_value = channel_scope
+        cog.get_profile = AsyncMock(return_value=profile("generic_responses"))
+        cog.get_api_key = AsyncMock(return_value="provider-secret")
+        cog._select_web_backend = AsyncMock(return_value=("off", None))
+        snapshot = FakeMessage(333333333333333333, 444444444444444444, "snapshot", 36)
+        cog._snapshot_message = AsyncMock(return_value=(snapshot, 1))
+        cog._checkpoint_ready = AsyncMock(return_value=True)
+        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
+        cog._base_messages = AsyncMock(return_value=state)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog._run_agent = AsyncMock(side_effect=SummaryError(ErrorCode.INPUT_CHAR_LIMIT))
+
+        progress = MagicMock()
+        progress.id = 999999999999999999
+        progress.jump_url = "https://discord.com/channels/1/2/3"
+        progress.edit = AsyncMock()
+        interaction = MagicMock()
+        interaction.edit_original_response = AsyncMock()
+        interaction.delete_original_response = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 987654321098765432
+        channel.send = AsyncMock(return_value=progress)
+        channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            send_messages_in_threads=False,
+            embed_links=True,
+        )
+        ctx = MagicMock()
+        ctx.guild = SimpleNamespace(id=123456789012345678, me=object())
+        ctx.channel = channel
+        ctx.author = SimpleNamespace(id=444444444444444444)
+        ctx.message = SimpleNamespace(id=888888888888888888)
+        ctx.interaction = interaction
+        ctx.defer = AsyncMock()
+
+        with self.assertRaises(SummaryError) as caught:
+            await cog._execute_summary(ctx, "auto")
+
+        self.assertEqual(caught.exception.code, ErrorCode.INPUT_CHAR_LIMIT)
+        self.assertEqual(cog._user_attempts, {})
+        cog._reserve_guild_attempt.assert_awaited_once()
+        interaction.delete_original_response.assert_not_awaited()
+        interaction.edit_original_response.assert_awaited_once_with(
+            content=f"摘要已開始：{progress.jump_url}"
+        )
+        self.assertIn(
+            "詳細原因僅觸發者可見",
+            progress.edit.await_args.kwargs["content"],
+        )
 
     async def test_model_allowlist_change_disables_invalid_guild_selections(self) -> None:
         cog = object.__new__(ChannelSummary)
