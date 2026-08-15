@@ -2580,6 +2580,7 @@ class ChannelSummary(commands.Cog):
             guild_reservation: float | None = None
             progress: discord.Message | None = None
             state: RunState | None = None
+            summary_output_published = False
 
             async def update_progress(content: str) -> None:
                 if progress is None:
@@ -2671,13 +2672,18 @@ class ChannelSummary(commands.Cog):
                     embed=embeds[0],
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+                summary_output_published = True
                 for embed in embeds[1:]:
                     await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                 await self.config.channel(ctx.channel).checkpoint_message_id.set(snapshot.id)
                 await self.config.channel(ctx.channel).checkpoint_timestamp.set(datetime.now(UTC).timestamp())
             except (Exception, asyncio.CancelledError):
                 key = (ctx.guild.id, ctx.author.id)
-                if user_reservation is not None and self._user_attempts.get(key) == user_reservation:
+                if (
+                    not summary_output_published
+                    and user_reservation is not None
+                    and self._user_attempts.get(key) == user_reservation
+                ):
                     self._user_attempts.pop(key, None)
                 if (
                     guild_reservation is not None

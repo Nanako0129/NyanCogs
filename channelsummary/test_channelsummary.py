@@ -2605,7 +2605,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("self._user_attempts.pop(key, None)", source)
 
-    async def test_failed_slash_summary_keeps_progress_and_refunds_user_cooldown(self) -> None:
+    async def test_failed_slash_summary_updates_progress_and_cooldown(self) -> None:
         cog = object.__new__(ChannelSummary)
         cog._channel_locks = __import__("collections").defaultdict(__import__("asyncio").Lock)
         cog._guild_semaphores = {}
@@ -2724,6 +2724,23 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             interaction.edit_original_response.await_args.kwargs["content"],
             "摘要未開始；詳細原因如下。",
         )
+
+        cog._base_messages.side_effect = None
+        cog._base_messages.return_value = started_state
+        cog._run_agent = AsyncMock(return_value=("summary", [], "model-1"))
+        cog._render_embeds = MagicMock(
+            return_value=[discord.Embed(title="one"), discord.Embed(title="two")]
+        )
+        cog._release_guild_attempt.reset_mock()
+        ctx.send = AsyncMock()
+        channel_scope.checkpoint_message_id.set.side_effect = RuntimeError(
+            "checkpoint failed"
+        )
+        with self.assertRaisesRegex(RuntimeError, "checkpoint failed"):
+            await cog._execute_summary(ctx, "auto")
+        self.assertIn(key, cog._user_attempts)
+        ctx.send.assert_awaited_once()
+        cog._release_guild_attempt.assert_not_awaited()
 
     async def test_model_allowlist_change_disables_invalid_guild_selections(self) -> None:
         cog = object.__new__(ChannelSummary)
