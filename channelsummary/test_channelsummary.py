@@ -1769,6 +1769,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(citations[0].url, "https://example.com")
         self.assertEqual(actual, "model-1")
         self.assertEqual(cog.request_provider.await_count, 2)
+        self.assertEqual(state.provider_calls, 2)
 
     async def test_auto_and_time_force_the_first_tool_request(self) -> None:
         args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":10}'
@@ -2520,6 +2521,10 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sum(await __import__("asyncio").gather(reserve(), reserve())), 1)
 
+        cog._guild_attempts[123] = __import__("collections").deque([1.0, 2.0, 3.0])
+        await cog._release_guild_attempt(123, 2.0)
+        self.assertEqual(list(cog._guild_attempts[123]), [1.0, 3.0])
+
     async def test_user_deletion_clears_only_target_cooldowns(self) -> None:
         cog = object.__new__(ChannelSummary)
         cog.config = MagicMock()
@@ -2629,13 +2634,15 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         cog._checkpoint_ready = AsyncMock(return_value=True)
         state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
         cog._base_messages = AsyncMock(return_value=state)
-        cog._reserve_guild_attempt = AsyncMock()
+        cog._reserve_guild_attempt = AsyncMock(return_value=123.0)
+        cog._release_guild_attempt = AsyncMock()
         cog._run_agent = AsyncMock(side_effect=SummaryError(ErrorCode.INPUT_CHAR_LIMIT))
 
         progress = MagicMock()
         progress.id = 999999999999999999
         progress.jump_url = "https://discord.com/channels/1/2/3"
         progress.edit = AsyncMock()
+        progress.delete = AsyncMock()
         interaction = MagicMock()
         interaction.edit_original_response = AsyncMock()
         interaction.delete_original_response = AsyncMock()
@@ -2663,23 +2670,41 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code, ErrorCode.INPUT_CHAR_LIMIT)
         self.assertEqual(cog._user_attempts, {})
         cog._reserve_guild_attempt.assert_awaited_once()
+        cog._release_guild_attempt.assert_awaited_once_with(ctx.guild.id, 123.0)
+        progress.delete.assert_awaited_once()
         interaction.delete_original_response.assert_not_awaited()
         self.assertEqual(
             [call.kwargs["content"] for call in interaction.edit_original_response.await_args_list],
-            ["⏳ 正在讀取訊息…", f"摘要已開始：{progress.jump_url}"],
+            [
+                "⏳ 正在讀取訊息…",
+                f"摘要已開始：{progress.jump_url}",
+                "摘要未開始；詳細原因如下。",
+            ],
         )
-        self.assertIn(
-            "詳細原因僅觸發者可見",
-            progress.edit.await_args.kwargs["content"],
-        )
+
+        started_state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
+        started_state.provider_calls = 1
+        cog._base_messages.return_value = started_state
+        cog._reserve_guild_attempt.reset_mock()
+        cog._release_guild_attempt.reset_mock()
+        progress.edit.reset_mock()
+        progress.delete.reset_mock()
+        with self.assertRaises(SummaryError):
+            await cog._execute_summary(ctx, "auto")
+        cog._reserve_guild_attempt.assert_awaited_once()
+        cog._release_guild_attempt.assert_not_awaited()
+        progress.delete.assert_not_awaited()
+        self.assertIn("詳細原因僅觸發者可見", progress.edit.await_args.kwargs["content"])
 
         key = (ctx.guild.id, ctx.author.id)
         existing = cog._reserve_user_attempt(*key, int(settings["user_cooldown_seconds"]))
         cog._reserve_guild_attempt.reset_mock()
+        cog._release_guild_attempt.reset_mock()
         channel.send.reset_mock()
         with self.assertRaises(commands.CommandOnCooldown):
             await cog._execute_summary(ctx, "auto")
         cog._reserve_guild_attempt.assert_not_awaited()
+        cog._release_guild_attempt.assert_not_awaited()
         channel.send.assert_not_awaited()
         self.assertEqual(cog._user_attempts[key], existing)
 
@@ -2688,6 +2713,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(commands.UserFeedbackCheckFailure):
             await cog._execute_summary(ctx, "auto")
         cog._reserve_guild_attempt.assert_not_awaited()
+        cog._release_guild_attempt.assert_not_awaited()
         channel.send.assert_not_awaited()
         self.assertEqual(cog._user_attempts, {})
 

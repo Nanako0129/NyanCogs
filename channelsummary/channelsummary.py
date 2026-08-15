@@ -318,6 +318,7 @@ class RunState:
     app_calls: int = 0
     hosted_calls: int = 0
     firecrawl_calls: int = 0
+    provider_calls: int = 0
     hard_start_id: int = 0
     boundary_backfills: int = 0
     boundary_reason: str | None = None
@@ -1803,7 +1804,7 @@ class ChannelSummary(commands.Cog):
             raise SummaryError(ErrorCode.RESPONSE_INVALID)
         return markdown[:max_chars]
 
-    async def _reserve_guild_attempt(self, guild_id: int, limit: int) -> None:
+    async def _reserve_guild_attempt(self, guild_id: int, limit: int) -> float:
         now = time.monotonic()
         async with self._guild_quota_locks[guild_id]:
             attempts = self._guild_attempts[guild_id]
@@ -1812,6 +1813,15 @@ class ChannelSummary(commands.Cog):
             if len(attempts) >= limit:
                 raise commands.CommandOnCooldown(commands.Cooldown(limit, 3_600), 3_600 - (now - attempts[0]), commands.BucketType.guild)
             attempts.append(now)
+            return now
+
+    async def _release_guild_attempt(self, guild_id: int, reservation: float) -> None:
+        async with self._guild_quota_locks[guild_id]:
+            attempts = self._guild_attempts[guild_id]
+            try:
+                attempts.remove(reservation)
+            except ValueError:
+                pass
 
     def _reserve_user_attempt(self, guild_id: int, user_id: int, seconds: int) -> float:
         now = time.monotonic()
@@ -2214,6 +2224,7 @@ class ChannelSummary(commands.Cog):
             remaining_timeout = deadline - time.monotonic()
             if remaining_timeout <= 0:
                 raise SummaryError(ErrorCode.PROVIDER_TIMEOUT)
+            state.provider_calls += 1
             response = await self.request_provider(
                 profile,
                 payload,
@@ -2566,7 +2577,9 @@ class ChannelSummary(commands.Cog):
                 except discord.HTTPException:
                     pass
             user_reservation: float | None = None
+            guild_reservation: float | None = None
             progress: discord.Message | None = None
+            state: RunState | None = None
 
             async def update_progress(content: str) -> None:
                 if progress is None:
@@ -2610,7 +2623,7 @@ class ChannelSummary(commands.Cog):
                     invocation_id,
                     initial_inspected,
                 )
-                await self._reserve_guild_attempt(
+                guild_reservation = await self._reserve_guild_attempt(
                     ctx.guild.id, int(settings["guild_attempts_per_hour"])
                 )
                 progress = await ctx.channel.send(
@@ -2666,7 +2679,26 @@ class ChannelSummary(commands.Cog):
                 key = (ctx.guild.id, ctx.author.id)
                 if user_reservation is not None and self._user_attempts.get(key) == user_reservation:
                     self._user_attempts.pop(key, None)
-                await update_progress("❌ 摘要失敗；詳細原因僅觸發者可見。")
+                if (
+                    guild_reservation is not None
+                    and state is not None
+                    and state.provider_calls == 0
+                ):
+                    await self._release_guild_attempt(ctx.guild.id, guild_reservation)
+                    if progress is not None:
+                        try:
+                            await progress.delete()
+                        except discord.HTTPException:
+                            pass
+                    if interaction is not None:
+                        try:
+                            await interaction.edit_original_response(
+                                content="摘要未開始；詳細原因如下。"
+                            )
+                        except discord.HTTPException:
+                            pass
+                else:
+                    await update_progress("❌ 摘要失敗；詳細原因僅觸發者可見。")
                 raise
 
     @staticmethod
