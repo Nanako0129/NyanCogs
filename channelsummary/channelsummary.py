@@ -196,6 +196,8 @@ class ErrorCode(StrEnum):
     API_KEY_MISSING = "API_KEY_MISSING"
     ENDPOINT_INVALID = "ENDPOINT_INVALID"
     ENDPOINT_UNSAFE = "ENDPOINT_UNSAFE"
+    INPUT_CHAR_LIMIT = "INPUT_CHAR_LIMIT"
+    REQUEST_BYTE_LIMIT = "REQUEST_BYTE_LIMIT"
     REQUEST_TOO_LARGE = "REQUEST_TOO_LARGE"
     PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
     PROVIDER_AUTH = "PROVIDER_AUTH"
@@ -213,6 +215,12 @@ PUBLIC_ERRORS = {
     ErrorCode.API_KEY_MISSING: "The selected provider API key is not configured.",
     ErrorCode.ENDPOINT_INVALID: "The provider endpoint is invalid.",
     ErrorCode.ENDPOINT_UNSAFE: "The provider endpoint address is not allowed for its URL scheme.",
+    ErrorCode.INPUT_CHAR_LIMIT: (
+        "The selected messages exceed `max_input_chars`; reduce the range or raise that setting."
+    ),
+    ErrorCode.REQUEST_BYTE_LIMIT: (
+        "The serialized provider request exceeds the 1 MiB safety limit; reduce the range or images."
+    ),
     ErrorCode.REQUEST_TOO_LARGE: "The summary request exceeds its configured limit.",
     ErrorCode.PROVIDER_TIMEOUT: "The provider request timed out.",
     ErrorCode.PROVIDER_AUTH: "The provider rejected its credentials.",
@@ -310,6 +318,7 @@ class RunState:
     app_calls: int = 0
     hosted_calls: int = 0
     firecrawl_calls: int = 0
+    provider_calls: int = 0
     hard_start_id: int = 0
     boundary_backfills: int = 0
     boundary_reason: str | None = None
@@ -602,7 +611,7 @@ def build_payload(
     payload["_remaining_app_calls"] = remaining_app_calls
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
     if len(encoded) > MAX_REQUEST_BYTES:
-        raise SummaryError(ErrorCode.REQUEST_TOO_LARGE)
+        raise SummaryError(ErrorCode.REQUEST_BYTE_LIMIT)
     payload.pop("_remaining_app_calls")
     return payload
 
@@ -1572,7 +1581,7 @@ class ChannelSummary(commands.Cog):
             raise SummaryError(ErrorCode.API_KEY_MISSING)
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > MAX_REQUEST_BYTES:
-            raise SummaryError(ErrorCode.REQUEST_TOO_LARGE)
+            raise SummaryError(ErrorCode.REQUEST_BYTE_LIMIT)
         resolver = None
         try:
             async with asyncio.timeout(timeout_seconds):
@@ -1795,7 +1804,7 @@ class ChannelSummary(commands.Cog):
             raise SummaryError(ErrorCode.RESPONSE_INVALID)
         return markdown[:max_chars]
 
-    async def _reserve_guild_attempt(self, guild_id: int, limit: int) -> None:
+    async def _reserve_guild_attempt(self, guild_id: int, limit: int) -> float:
         now = time.monotonic()
         async with self._guild_quota_locks[guild_id]:
             attempts = self._guild_attempts[guild_id]
@@ -1804,8 +1813,17 @@ class ChannelSummary(commands.Cog):
             if len(attempts) >= limit:
                 raise commands.CommandOnCooldown(commands.Cooldown(limit, 3_600), 3_600 - (now - attempts[0]), commands.BucketType.guild)
             attempts.append(now)
+            return now
 
-    def _reserve_user_attempt(self, guild_id: int, user_id: int, seconds: int) -> None:
+    async def _release_guild_attempt(self, guild_id: int, reservation: float) -> None:
+        async with self._guild_quota_locks[guild_id]:
+            attempts = self._guild_attempts[guild_id]
+            try:
+                attempts.remove(reservation)
+            except ValueError:
+                pass
+
+    def _reserve_user_attempt(self, guild_id: int, user_id: int, seconds: int) -> float:
         now = time.monotonic()
         key = guild_id, user_id
         previous = self._user_attempts.get(key, 0.0)
@@ -1813,6 +1831,7 @@ class ChannelSummary(commands.Cog):
             retry = seconds - (now - previous)
             raise commands.CommandOnCooldown(commands.Cooldown(1, seconds), retry, commands.BucketType.user)
         self._user_attempts[key] = now
+        return now
 
     async def _snapshot_message(
         self,
@@ -2147,7 +2166,7 @@ class ChannelSummary(commands.Cog):
         tool_notes: list[dict[str, Any]] = []
         working_input = self._agent_input(state, gap_minutes, tool_notes)
         if len(working_input) > int(settings["max_input_chars"]):
-            raise SummaryError(ErrorCode.REQUEST_TOO_LARGE)
+            raise SummaryError(ErrorCode.INPUT_CHAR_LIMIT)
         remaining_app = int(settings["channel_tool_max_calls"])
         if web_backend is None:
             web_backend = "native" if settings["web_enabled"] and profile.web_kind else "off"
@@ -2174,7 +2193,7 @@ class ChannelSummary(commands.Cog):
             turns_left = max_turns - turn
             working_input = self._agent_input(state, gap_minutes, tool_notes)
             if len(working_input) > int(settings["max_input_chars"]):
-                raise SummaryError(ErrorCode.REQUEST_TOO_LARGE)
+                raise SummaryError(ErrorCode.INPUT_CHAR_LIMIT)
             can_force = self._can_force_boundary(
                 state, settings, mode, remaining_app, turns_left, len(working_input)
             )
@@ -2186,7 +2205,6 @@ class ChannelSummary(commands.Cog):
             offered_firecrawl = (
                 remaining_firecrawl if turns_left >= 2 and not force_history else 0
             )
-            await self._reserve_guild_attempt(guild.id, int(settings["guild_attempts_per_hour"]))
             payload = build_payload(
                 profile,
                 model=str(settings["model"]),
@@ -2206,6 +2224,7 @@ class ChannelSummary(commands.Cog):
             remaining_timeout = deadline - time.monotonic()
             if remaining_timeout <= 0:
                 raise SummaryError(ErrorCode.PROVIDER_TIMEOUT)
+            state.provider_calls += 1
             response = await self.request_provider(
                 profile,
                 payload,
@@ -2552,21 +2571,28 @@ class ChannelSummary(commands.Cog):
         async with channel_lock:
             interaction = getattr(ctx, "interaction", None)
             if interaction is not None:
-                await ctx.defer()
-            progress = await ctx.channel.send(
-                "⏳ 正在讀取訊息…", allowed_mentions=discord.AllowedMentions.none()
-            )
-            if interaction is not None:
+                await ctx.defer(ephemeral=True)
                 try:
-                    await interaction.delete_original_response()
+                    await interaction.edit_original_response(content="⏳ 正在讀取訊息…")
                 except discord.HTTPException:
                     pass
+            user_reservation: float | None = None
+            guild_reservation: float | None = None
+            progress: discord.Message | None = None
+            state: RunState | None = None
+            summary_output_published = False
 
-            async def update_progress(content: str) -> None:
+            async def update_progress(content: str, *, clear_embed: bool = True) -> None:
+                if progress is None:
+                    return
+                edit_kwargs: dict[str, Any] = {
+                    "content": content,
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                if clear_embed:
+                    edit_kwargs["embed"] = None
                 try:
-                    await progress.edit(
-                        content=content, allowed_mentions=discord.AllowedMentions.none()
-                    )
+                    await progress.edit(**edit_kwargs)
                 except discord.HTTPException:
                     pass
 
@@ -2575,7 +2601,7 @@ class ChannelSummary(commands.Cog):
                     ctx.channel,
                     include_bots=bool(settings["include_bots"]),
                     invocation_id=invocation_id,
-                    progress_id=progress.id,
+                    progress_id=None,
                 )
                 if not await self._checkpoint_ready(
                     ctx.channel,
@@ -2586,7 +2612,11 @@ class ChannelSummary(commands.Cog):
                     raise commands.UserFeedbackCheckFailure(
                         f"This channel needs {settings['new_messages_required']} new human messages after its last successful summary."
                     )
-                self._reserve_user_attempt(ctx.guild.id, ctx.author.id, int(settings["user_cooldown_seconds"]))
+                user_reservation = self._reserve_user_attempt(
+                    ctx.guild.id,
+                    ctx.author.id,
+                    int(settings["user_cooldown_seconds"]),
+                )
                 state = await self._base_messages(
                     ctx.channel,
                     snapshot,
@@ -2596,7 +2626,20 @@ class ChannelSummary(commands.Cog):
                     invocation_id,
                     initial_inspected,
                 )
-                await update_progress("🧭 Agent 正在補齊話題脈絡並產生摘要…")
+                guild_reservation = await self._reserve_guild_attempt(
+                    ctx.guild.id, int(settings["guild_attempts_per_hour"])
+                )
+                progress = await ctx.channel.send(
+                    "🧭 Agent 正在補齊話題脈絡並產生摘要…",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                if interaction is not None:
+                    try:
+                        await interaction.edit_original_response(
+                            content=f"摘要已開始：{progress.jump_url}"
+                        )
+                    except discord.HTTPException:
+                        pass
                 semaphore_key = (ctx.guild.id, profile.name, int(settings["guild_concurrency"]))
                 semaphore = self._guild_semaphores.setdefault(
                     semaphore_key,
@@ -2626,21 +2669,55 @@ class ChannelSummary(commands.Cog):
                     citations,
                     actual_model,
                 )
-                try:
-                    await progress.delete()
-                except discord.HTTPException:
-                    pass
-                progress = None
-                for embed in embeds:
+                await progress.edit(
+                    content=None,
+                    embed=embeds[0],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                summary_output_published = True
+                for embed in embeds[1:]:
                     await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                 await self.config.channel(ctx.channel).checkpoint_message_id.set(snapshot.id)
                 await self.config.channel(ctx.channel).checkpoint_timestamp.set(datetime.now(UTC).timestamp())
-            finally:
-                if progress is not None:
+            except (Exception, asyncio.CancelledError):
+                key = (ctx.guild.id, ctx.author.id)
+                if (
+                    not summary_output_published
+                    and user_reservation is not None
+                    and self._user_attempts.get(key) == user_reservation
+                ):
+                    self._user_attempts.pop(key, None)
+                if (
+                    guild_reservation is not None
+                    and state is not None
+                    and state.provider_calls == 0
+                ):
+                    await self._release_guild_attempt(ctx.guild.id, guild_reservation)
+                    if progress is not None:
+                        try:
+                            await progress.delete()
+                        except discord.HTTPException:
+                            pass
+                    if interaction is not None:
+                        try:
+                            await interaction.edit_original_response(
+                                content="摘要未開始；詳細原因如下。"
+                            )
+                        except discord.HTTPException:
+                            pass
+                elif progress is None and interaction is not None:
                     try:
-                        await progress.delete()
+                        await interaction.edit_original_response(
+                            content="摘要未開始；詳細原因如下。"
+                        )
                     except discord.HTTPException:
                         pass
+                else:
+                    await update_progress(
+                        "❌ 摘要失敗；詳細原因僅觸發者可見。",
+                        clear_embed=not summary_output_published,
+                    )
+                raise
 
     @staticmethod
     def _require_guild_manager(ctx: commands.Context) -> None:
