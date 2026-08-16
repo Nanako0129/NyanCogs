@@ -2582,15 +2582,17 @@ class ChannelSummary(commands.Cog):
             state: RunState | None = None
             summary_output_published = False
 
-            async def update_progress(content: str) -> None:
+            async def update_progress(content: str, *, clear_embed: bool = True) -> None:
                 if progress is None:
                     return
+                edit_kwargs: dict[str, Any] = {
+                    "content": content,
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                if clear_embed:
+                    edit_kwargs["embed"] = None
                 try:
-                    await progress.edit(
-                        content=content,
-                        embed=None,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                    await progress.edit(**edit_kwargs)
                 except discord.HTTPException:
                     pass
 
@@ -2711,7 +2713,10 @@ class ChannelSummary(commands.Cog):
                     except discord.HTTPException:
                         pass
                 else:
-                    await update_progress("❌ 摘要失敗；詳細原因僅觸發者可見。")
+                    await update_progress(
+                        "❌ 摘要失敗；詳細原因僅觸發者可見。",
+                        clear_embed=not summary_output_published,
+                    )
                 raise
 
     @staticmethod

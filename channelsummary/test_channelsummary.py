@@ -2741,6 +2741,11 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertIn(key, cog._user_attempts)
         ctx.send.assert_awaited_once()
         cog._release_guild_attempt.assert_not_awaited()
+        self.assertEqual(
+            progress.edit.await_args.kwargs["content"],
+            "❌ 摘要失敗；詳細原因僅觸發者可見。",
+        )
+        self.assertNotIn("embed", progress.edit.await_args.kwargs)
 
     async def test_model_allowlist_change_disables_invalid_guild_selections(self) -> None:
         cog = object.__new__(ChannelSummary)
