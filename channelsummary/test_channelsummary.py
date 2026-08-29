@@ -1434,15 +1434,38 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         raw["topics"][0]["source_message_ids"] = ["999999999999999999"]
         parsed = parse_agent_summary(__import__("json").dumps(raw), {item.id: item for item in self.messages})
         self.assertEqual(parsed.topics[0].source_message_ids, ())
-        for invalid in ("not-a-list", [1.5], [True], [[self.messages[0].id]]):
-            raw["topics"][0]["source_message_ids"] = invalid
-            with self.subTest(invalid=invalid), self.assertRaises(SummaryError) as caught:
-                parse_agent_summary(__import__("json").dumps(raw), {item.id: item for item in self.messages})
+
+    def test_summary_schema_rejection_reasons_are_granular(self) -> None:
+        topic = {
+            "title": "Topic",
+            "opener_message_id": str(self.messages[0].id),
+            "opener_user_id": str(self.messages[0].author.id),
+            "boundary_reason": "range_start",
+            "summary": "Summary",
+            "source_message_ids": [str(self.messages[0].id)],
+        }
+        valid = {"overview": "Overview", "topics": [topic]}
+        oversized_integer = "1" * (sys.get_int_max_str_digits() + 1)
+        cases = (
+            ({"overview": "Overview"}, channelsummary_module._ResponseReason.SUMMARY_ROOT_SHAPE_INVALID),
+            ({**valid, "overview": 1}, channelsummary_module._ResponseReason.SUMMARY_OVERVIEW_INVALID),
+            ({**valid, "topics": []}, channelsummary_module._ResponseReason.SUMMARY_TOPICS_INVALID),
+            ({**valid, "topics": [{}]}, channelsummary_module._ResponseReason.SUMMARY_TOPIC_SHAPE_INVALID),
+            ({**valid, "topics": [{**topic, "title": ""}]}, channelsummary_module._ResponseReason.SUMMARY_TITLE_INVALID),
+            ({**valid, "topics": [{**topic, "summary": 1}]}, channelsummary_module._ResponseReason.SUMMARY_TEXT_INVALID),
+            ({**valid, "topics": [{**topic, "source_message_ids": "not-a-list"}]}, channelsummary_module._ResponseReason.SUMMARY_SOURCE_LIST_INVALID),
+            ({**valid, "topics": [{**topic, "source_message_ids": [True]}]}, channelsummary_module._ResponseReason.SUMMARY_SOURCE_ITEM_INVALID),
+            ({**valid, "topics": [{**topic, "source_message_ids": [oversized_integer]}]}, channelsummary_module._ResponseReason.SUMMARY_SOURCE_INTEGER_INVALID),
+            ({**valid, "topics": [{**topic, "opener_message_id": "not-an-id"}]}, channelsummary_module._ResponseReason.SUMMARY_OPENER_INTEGER_INVALID),
+            ({**valid, "topics": [{**topic, "boundary_reason": "unknown"}]}, channelsummary_module._ResponseReason.SUMMARY_BOUNDARY_REASON_INVALID),
+        )
+        known = {item.id: item for item in self.messages}
+        for raw, reason in cases:
+            with self.subTest(reason=reason), self.assertRaises(SummaryError) as caught:
+                parse_agent_summary(json.dumps(raw), known)
             self.assertEqual(caught.exception.stage, channelsummary_module._ResponseStage.AGENT_SUMMARY)
-            self.assertEqual(
-                caught.exception.reason,
-                channelsummary_module._ResponseReason.SUMMARY_SCHEMA_OR_REFERENCE_INVALID,
-            )
+            self.assertEqual(caught.exception.reason, reason)
+            self.assertEqual(str(caught.exception), "The provider returned an invalid response.")
 
     def test_summary_decoder_rejects_huge_and_deep_json(self) -> None:
         invalid = (
@@ -2772,7 +2795,47 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             ),
             (
                 channelsummary_module._ResponseStage.AGENT_SUMMARY,
-                channelsummary_module._ResponseReason.SUMMARY_SCHEMA_OR_REFERENCE_INVALID,
+                channelsummary_module._ResponseReason.SUMMARY_ROOT_SHAPE_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_OVERVIEW_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_TOPICS_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_TOPIC_SHAPE_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_TITLE_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_TEXT_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_SOURCE_LIST_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_SOURCE_ITEM_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_SOURCE_INTEGER_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_OPENER_INTEGER_INVALID,
+            ),
+            (
+                channelsummary_module._ResponseStage.AGENT_SUMMARY,
+                channelsummary_module._ResponseReason.SUMMARY_BOUNDARY_REASON_INVALID,
             ),
             (
                 channelsummary_module._ResponseStage.AGENT_PROTOCOL,
@@ -2793,7 +2856,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         target.disabled = False
         target.addHandler(handler)
 
-        async def execute(error: SummaryError) -> None:
+        async def execute(error: SummaryError, dialect: str = "openai_responses") -> None:
             for name in ("body", "prompt", "url", "headers", "tool", "arguments", "locals"):
                 setattr(error, name, sentinel)
             cog = object.__new__(ChannelSummary)
@@ -2816,7 +2879,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             cog.get_profile = AsyncMock(
                 return_value=ProviderProfile(
                     "profile-" + sentinel,
-                    "openai_responses",
+                    dialect,
                     "https://" + sentinel.casefold() + ".invalid",
                     "token-" + sentinel,
                     (model,),
@@ -2830,6 +2893,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
             state.provider_calls = 999
             cog._base_messages = AsyncMock(return_value=state)
+            cog._reserve_user_attempt = MagicMock(return_value=456.0)
             cog._reserve_guild_attempt = AsyncMock(return_value=123.0)
             cog._release_guild_attempt = AsyncMock()
             cog._run_agent = AsyncMock(side_effect=error)
@@ -2854,13 +2918,19 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             ctx.message = SimpleNamespace(id=sentinel_id - 5)
             ctx.interaction = None
 
-            with self.assertRaises(SummaryError):
+            with (
+                patch("channelsummary.channelsummary.time.monotonic", side_effect=[100.0, 3_700.5]),
+                self.assertRaises(SummaryError),
+            ):
                 await cog._execute_summary(ctx, "auto", sentinel)
 
         try:
-            for stage, reason in cases:
+            for index, (stage, reason) in enumerate(cases):
                 before = len(records)
-                await execute(SummaryError(ErrorCode.RESPONSE_INVALID, stage=stage, reason=reason))
+                await execute(
+                    SummaryError(ErrorCode.RESPONSE_INVALID, stage=stage, reason=reason),
+                    sentinel if index == 0 else "openai_responses",
+                )
                 self.assertEqual(len(records), before + 1)
             await execute(SummaryError(ErrorCode.RESPONSE_INVALID))
             self.assertEqual(len(records), len(cases))
@@ -2881,17 +2951,20 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             "provider_call_index",
             "elapsed_ms",
         }
-        for record, (stage, reason) in zip(records, cases, strict=True):
+        for index, (record, (stage, reason)) in enumerate(zip(records, cases, strict=True)):
+            dialect = "unknown" if index == 0 else "openai_responses"
             self.assertEqual(set(record.__dict__) - standard, allowlist)
-            self.assertEqual(record.getMessage(), "ChannelSummary rejected an invalid provider response.")
+            self.assertEqual(
+                record.getMessage(),
+                f"channelsummary.response_invalid stage={stage.value} reason={reason.value} "
+                f"dialect={dialect} provider_call_index=20 elapsed_ms=3600000",
+            )
             self.assertEqual(record.event, "response_invalid")
             self.assertEqual(record.stage, stage.value)
             self.assertEqual(record.reason, reason.value)
-            self.assertEqual(record.dialect, "openai_responses")
-            self.assertIsInstance(record.provider_call_index, int)
-            self.assertTrue(0 <= record.provider_call_index <= 20)
-            self.assertIsInstance(record.elapsed_ms, int)
-            self.assertTrue(0 <= record.elapsed_ms <= 3_600_000)
+            self.assertEqual(record.dialect, dialect)
+            self.assertEqual(record.provider_call_index, 20)
+            self.assertEqual(record.elapsed_ms, 3_600_000)
             self.assertIsNone(record.exc_info)
             self.assertIsNone(record.exc_text)
             rendered = record.getMessage() + repr(record.__dict__)

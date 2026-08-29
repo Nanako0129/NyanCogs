@@ -222,7 +222,17 @@ class _ResponseReason(StrEnum):
     ENVELOPE_INVALID = "envelope_invalid"
     TOOL_OR_CITATION_CONTRACT_INVALID = "tool_or_citation_contract_invalid"
     SUMMARY_JSON_INVALID = "summary_json_invalid"
-    SUMMARY_SCHEMA_OR_REFERENCE_INVALID = "summary_schema_or_reference_invalid"
+    SUMMARY_ROOT_SHAPE_INVALID = "root_shape_invalid"
+    SUMMARY_OVERVIEW_INVALID = "overview_invalid"
+    SUMMARY_TOPICS_INVALID = "topics_invalid"
+    SUMMARY_TOPIC_SHAPE_INVALID = "topic_shape_invalid"
+    SUMMARY_TITLE_INVALID = "title_invalid"
+    SUMMARY_TEXT_INVALID = "summary_text_invalid"
+    SUMMARY_SOURCE_LIST_INVALID = "source_list_invalid"
+    SUMMARY_SOURCE_ITEM_INVALID = "source_item_invalid"
+    SUMMARY_SOURCE_INTEGER_INVALID = "source_integer_invalid"
+    SUMMARY_OPENER_INTEGER_INVALID = "opener_integer_invalid"
+    SUMMARY_BOUNDARY_REASON_INVALID = "boundary_reason_invalid"
     EMPTY_OR_PROTOCOL_INVALID = "empty_or_protocol_invalid"
 
 
@@ -1318,6 +1328,13 @@ def validate_function_arguments(name: str, raw: str) -> dict[str, Any]:
 
 
 def parse_agent_summary(raw: str, known: Mapping[int, discord.Message]) -> AgentSummary:
+    def invalid(reason: _ResponseReason) -> SummaryError:
+        return SummaryError(
+            ErrorCode.RESPONSE_INVALID,
+            stage=_ResponseStage.AGENT_SUMMARY,
+            reason=reason,
+        )
+
     try:
         value = json.loads(raw)
     except (ValueError, RecursionError):
@@ -1326,73 +1343,70 @@ def parse_agent_summary(raw: str, known: Mapping[int, discord.Message]) -> Agent
             stage=_ResponseStage.AGENT_SUMMARY,
             reason=_ResponseReason.SUMMARY_JSON_INVALID,
         ) from None
-    try:
-        if not isinstance(value, dict) or set(value) != {"overview", "topics"}:
-            raise SummaryError(ErrorCode.RESPONSE_INVALID)
-        overview, topics_raw = value["overview"], value["topics"]
-        if not isinstance(overview, str) or len(overview) > 8_000 or not isinstance(topics_raw, list) or not 1 <= len(topics_raw) <= 20:
-            raise SummaryError(ErrorCode.RESPONSE_INVALID)
-        topics: list[SummaryTopic] = []
-        allowed_reasons = {"range_start", "long_gap", "topic_change", "limit_reached", "explicit_start"}
-        for item in topics_raw:
-            if not isinstance(item, dict) or set(item) != {
-                "title",
-                "opener_message_id",
-                "opener_user_id",
-                "boundary_reason",
-                "summary",
-                "source_message_ids",
-            }:
-                raise SummaryError(ErrorCode.RESPONSE_INVALID)
-            title, summary = item["title"], item["summary"]
-            if not isinstance(title, str) or not 1 <= len(title) <= 100 or not isinstance(summary, str) or len(summary) > 12_000:
-                raise SummaryError(ErrorCode.RESPONSE_INVALID)
-            source_ids = item["source_message_ids"]
-            if not isinstance(source_ids, list):
-                raise SummaryError(ErrorCode.RESPONSE_INVALID)
-            ids: list[int] = []
-            seen: set[int] = set()
-            for source_id in source_ids:
-                if isinstance(source_id, bool) or not isinstance(source_id, (int, str)):
-                    raise SummaryError(ErrorCode.RESPONSE_INVALID)
-                try:
-                    source_id = int(source_id)
-                except ValueError:
-                    raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
-                if source_id in known and source_id not in seen:
-                    seen.add(source_id)
-                    if len(ids) < 100:
-                        ids.append(source_id)
-            opener_id = item["opener_message_id"]
-            opener_user = item["opener_user_id"]
-            if opener_id is not None:
-                try:
-                    opener_id = int(opener_id)
-                    opener_user = int(opener_user)
-                except (TypeError, ValueError):
-                    raise SummaryError(ErrorCode.RESPONSE_INVALID) from None
-                message = known.get(opener_id)
-                if message is None or message.author.id != opener_user:
-                    opener_id = opener_user = None
-            if item["boundary_reason"] not in allowed_reasons:
-                raise SummaryError(ErrorCode.RESPONSE_INVALID)
-            topics.append(
-                SummaryTopic(
-                    title,
-                    opener_id,
-                    opener_user,
-                    item["boundary_reason"],
-                    summary,
-                    tuple(ids),
-                )
+    if not isinstance(value, dict) or set(value) != {"overview", "topics"}:
+        raise invalid(_ResponseReason.SUMMARY_ROOT_SHAPE_INVALID)
+    overview, topics_raw = value["overview"], value["topics"]
+    if not isinstance(overview, str) or len(overview) > 8_000:
+        raise invalid(_ResponseReason.SUMMARY_OVERVIEW_INVALID)
+    if not isinstance(topics_raw, list) or not 1 <= len(topics_raw) <= 20:
+        raise invalid(_ResponseReason.SUMMARY_TOPICS_INVALID)
+    topics: list[SummaryTopic] = []
+    allowed_reasons = {"range_start", "long_gap", "topic_change", "limit_reached", "explicit_start"}
+    for item in topics_raw:
+        if not isinstance(item, dict) or set(item) != {
+            "title",
+            "opener_message_id",
+            "opener_user_id",
+            "boundary_reason",
+            "summary",
+            "source_message_ids",
+        }:
+            raise invalid(_ResponseReason.SUMMARY_TOPIC_SHAPE_INVALID)
+        title, summary = item["title"], item["summary"]
+        if not isinstance(title, str) or not 1 <= len(title) <= 100:
+            raise invalid(_ResponseReason.SUMMARY_TITLE_INVALID)
+        if not isinstance(summary, str) or len(summary) > 12_000:
+            raise invalid(_ResponseReason.SUMMARY_TEXT_INVALID)
+        source_ids = item["source_message_ids"]
+        if not isinstance(source_ids, list):
+            raise invalid(_ResponseReason.SUMMARY_SOURCE_LIST_INVALID)
+        ids: list[int] = []
+        seen: set[int] = set()
+        for source_id in source_ids:
+            if isinstance(source_id, bool) or not isinstance(source_id, (int, str)):
+                raise invalid(_ResponseReason.SUMMARY_SOURCE_ITEM_INVALID)
+            try:
+                source_id = int(source_id)
+            except ValueError:
+                raise invalid(_ResponseReason.SUMMARY_SOURCE_INTEGER_INVALID) from None
+            if source_id in known and source_id not in seen:
+                seen.add(source_id)
+                if len(ids) < 100:
+                    ids.append(source_id)
+        opener_id = item["opener_message_id"]
+        opener_user = item["opener_user_id"]
+        if opener_id is not None:
+            try:
+                opener_id = int(opener_id)
+                opener_user = int(opener_user)
+            except (TypeError, ValueError):
+                raise invalid(_ResponseReason.SUMMARY_OPENER_INTEGER_INVALID) from None
+            message = known.get(opener_id)
+            if message is None or message.author.id != opener_user:
+                opener_id = opener_user = None
+        if item["boundary_reason"] not in allowed_reasons:
+            raise invalid(_ResponseReason.SUMMARY_BOUNDARY_REASON_INVALID)
+        topics.append(
+            SummaryTopic(
+                title,
+                opener_id,
+                opener_user,
+                item["boundary_reason"],
+                summary,
+                tuple(ids),
             )
-        return AgentSummary(overview, tuple(topics))
-    except SummaryError as error:
-        error.classify(
-            _ResponseStage.AGENT_SUMMARY,
-            _ResponseReason.SUMMARY_SCHEMA_OR_REFERENCE_INVALID,
         )
-        raise
+    return AgentSummary(overview, tuple(topics))
 
 
 def sanitize_summary_text(text: str, allowed_user_ids: set[int]) -> str:
@@ -2880,20 +2894,28 @@ class ChannelSummary(commands.Cog):
                     and error.reason is not None
                 ):
                     dialect = profile.dialect if profile.dialect in DIALECT_PATHS else "unknown"
+                    provider_call_index = min(
+                        max(state.provider_calls if state is not None else 0, 0), 20
+                    )
+                    elapsed_ms = min(
+                        max(int((time.monotonic() - started_at) * 1_000), 0),
+                        3_600_000,
+                    )
                     log.warning(
-                        "ChannelSummary rejected an invalid provider response.",
+                        "channelsummary.response_invalid stage=%s reason=%s dialect=%s "
+                        "provider_call_index=%d elapsed_ms=%d",
+                        error.stage.value,
+                        error.reason.value,
+                        dialect,
+                        provider_call_index,
+                        elapsed_ms,
                         extra={
                             "event": "response_invalid",
                             "stage": error.stage.value,
                             "reason": error.reason.value,
                             "dialect": dialect,
-                            "provider_call_index": min(
-                                max(state.provider_calls if state is not None else 0, 0), 20
-                            ),
-                            "elapsed_ms": min(
-                                max(int((time.monotonic() - started_at) * 1_000), 0),
-                                3_600_000,
-                            ),
+                            "provider_call_index": provider_call_index,
+                            "elapsed_ms": elapsed_ms,
                         },
                     )
                 key = (ctx.guild.id, ctx.author.id)
