@@ -32,6 +32,7 @@ MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
 SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 SAFE_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
 MAX_RESPONSE_BYTES = 2_097_152
+MAX_PROVIDER_ERROR_BYTES = 65_536
 MAX_FIRECRAWL_RESPONSE_BYTES = 1_048_576
 MAX_REQUEST_BYTES = 1_048_576
 MAX_PROVIDER_PROFILES = 25
@@ -201,6 +202,7 @@ class ErrorCode(StrEnum):
     REQUEST_BYTE_LIMIT = "REQUEST_BYTE_LIMIT"
     REQUEST_TOO_LARGE = "REQUEST_TOO_LARGE"
     PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
+    PROVIDER_IMAGE_FETCH_TIMEOUT = "PROVIDER_IMAGE_FETCH_TIMEOUT"
     PROVIDER_AUTH = "PROVIDER_AUTH"
     PROVIDER_RATE_LIMIT = "PROVIDER_RATE_LIMIT"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
@@ -250,6 +252,9 @@ PUBLIC_ERRORS = {
     ),
     ErrorCode.REQUEST_TOO_LARGE: "The summary request exceeds its configured limit.",
     ErrorCode.PROVIDER_TIMEOUT: "The provider request timed out.",
+    ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT: (
+        "The provider timed out downloading an image twice. Retry later or disable image summaries."
+    ),
     ErrorCode.PROVIDER_AUTH: "The provider rejected its credentials.",
     ErrorCode.PROVIDER_RATE_LIMIT: "The provider rate limit was reached.",
     ErrorCode.PROVIDER_UNAVAILABLE: "The provider is unavailable.",
@@ -1086,6 +1091,68 @@ def _reject_json_constant(_value: str) -> None:
     raise ValueError
 
 
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError
+    return result
+
+
+def _is_provider_image_fetch_timeout(raw: bytes) -> bool:
+    """Recognize only the observed bounded provider error without retaining it."""
+    if len(raw) > MAX_PROVIDER_ERROR_BYTES:
+        return False
+    try:
+        decoded = json.loads(
+            raw,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_strict_json_object,
+        )
+        _walk_limits(decoded, max_string=MAX_PROVIDER_ERROR_BYTES)
+    except (ValueError, RecursionError, SummaryError):
+        return False
+    expected = {
+        "error": {
+            "type": "invalid_request_error",
+            "code": "invalid_value",
+            "param": "url",
+            "message": (
+                "Unable to download content from the provided URL before the timeout. Check that the URL is "
+                "publicly accessible and responds promptly, or upload the file and provide a file_id instead."
+            ),
+        }
+    }
+    return decoded == expected and all(
+        isinstance(value, str) for value in decoded["error"].values()
+    )
+
+
+def _has_local_input_image(payload: Mapping[str, Any]) -> bool:
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        content = (
+            item.get("content")
+            if isinstance(item, dict)
+            and set(item) == {"role", "content"}
+            and item.get("role") == "user"
+            else None
+        )
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and set(part) == {"type", "image_url", "detail"}
+                and part.get("type") == "input_image"
+                and isinstance(part.get("image_url"), str)
+                and part.get("detail") in {"low", "auto", "high", "original"}
+            ):
+                return True
+    return False
+
+
 def parse_duration(value: str) -> timedelta:
     match = re.fullmatch(r"\s*(\d+)\s*([mhd])\s*", value.casefold())
     if not match:
@@ -1735,6 +1802,20 @@ class ChannelSummary(commands.Cog):
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > MAX_REQUEST_BYTES:
             raise SummaryError(ErrorCode.REQUEST_BYTE_LIMIT)
+        offered_functions, allow_hosted_web = _offered_capabilities(payload)
+        retry_image_fetch = (
+            profile.dialect in {"openai_responses", "openrouter_responses", "generic_responses"}
+            and payload.get("store") is False
+            and _has_local_input_image(payload)
+            and not allow_hosted_web
+        )
+        endpoint = profile.endpoint
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Host": urlsplit(profile.origin).netloc,
+        }
+        started_at = time.monotonic()
         resolver = None
         try:
             async with asyncio.timeout(timeout_seconds):
@@ -1758,19 +1839,51 @@ class ChannelSummary(commands.Cog):
                     trust_env=False,
                     cookie_jar=aiohttp.DummyCookieJar(),
                 ) as session:
-                    async with session.post(
-                        profile.endpoint,
-                        data=encoded,
-                        headers={
-                            "Authorization": f"Bearer {key}",
-                            "Content-Type": "application/json",
-                            "Host": urlsplit(profile.origin).netloc,
-                        },
-                        allow_redirects=False,
-                    ) as response:
-                        if not 200 <= response.status < 300:
-                            raise SummaryError(_http_error(response.status))
-                        raw = await read_bounded_response(response)
+                    for attempt in (1, 2):
+                        async with session.post(
+                            endpoint,
+                            data=encoded,
+                            headers=headers,
+                            allow_redirects=False,
+                        ) as response:
+                            if 200 <= response.status < 300:
+                                raw = await read_bounded_response(response)
+                                break
+                            if response.status != 400 or not retry_image_fetch:
+                                raise SummaryError(_http_error(response.status))
+                            try:
+                                error_raw = await read_bounded_response(
+                                    response, MAX_PROVIDER_ERROR_BYTES
+                                )
+                            except SummaryError as error:
+                                if error.code is ErrorCode.RESPONSE_TOO_LARGE:
+                                    raise SummaryError(_http_error(response.status)) from None
+                                raise
+                            if not _is_provider_image_fetch_timeout(error_raw):
+                                raise SummaryError(_http_error(response.status))
+                            if attempt == 2:
+                                raise SummaryError(ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT)
+                            # A retry may incur a second provider charge; never retry more than once.
+                            dialect = profile.dialect if profile.dialect in DIALECT_PATHS else "unknown"
+                            elapsed_ms = min(
+                                max(int((time.monotonic() - started_at) * 1_000), 0),
+                                3_600_000,
+                            )
+                            log.warning(
+                                "channelsummary.provider_retry reason=image_url_download_timeout "
+                                "dialect=%s attempt=2 status=400 elapsed_ms=%d",
+                                dialect,
+                                elapsed_ms,
+                                extra={
+                                    "event": "provider_retry",
+                                    "reason": "image_url_download_timeout",
+                                    "dialect": dialect,
+                                    "attempt": 2,
+                                    "status": 400,
+                                    "elapsed_ms": elapsed_ms,
+                                },
+                            )
+                        await asyncio.sleep(1)
         except asyncio.TimeoutError:
             raise SummaryError(ErrorCode.PROVIDER_TIMEOUT) from None
         except aiohttp.ClientError:
@@ -1786,7 +1899,6 @@ class ChannelSummary(commands.Cog):
                 stage=_ResponseStage.PROVIDER_JSON,
                 reason=_ResponseReason.JSON_INVALID,
             ) from None
-        offered_functions, allow_hosted_web = _offered_capabilities(payload)
         return normalize_response(
             profile.dialect,
             decoded,
