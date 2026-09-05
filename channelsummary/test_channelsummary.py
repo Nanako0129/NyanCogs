@@ -32,8 +32,10 @@ from .channelsummary import (
     FIRECRAWL_TOKEN_SERVICE,
     MAX_FIRECRAWL_CALLS_PER_RUN,
     MAX_FIRECRAWL_RESPONSE_BYTES,
+    MAX_PROVIDER_ERROR_BYTES,
     MAX_PROVIDER_PROFILES,
     MAX_RESPONSE_BYTES,
+    PUBLIC_ERRORS,
     ErrorCode,
     AgentSummary,
     ChannelSummary,
@@ -227,11 +229,123 @@ class TestFirecrawlCapabilities(unittest.TestCase):
 
 
 class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
+    image_timeout_body = json.dumps(
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_value",
+                "param": "url",
+                "message": (
+                    "Unable to download content from the provided URL before the timeout. Check that the URL is "
+                    "publicly accessible and responds promptly, or upload the file and provide a file_id instead."
+                ),
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+
     @staticmethod
     def record(address: str) -> tuple[object, ...]:
         family = socket.AF_INET6 if ":" in address else socket.AF_INET
         sockaddr = (address, 443, 0, 0) if family == socket.AF_INET6 else (address, 443)
         return family, socket.SOCK_STREAM, 6, "", sockaddr
+
+    @staticmethod
+    def image_payload(dialect: str = "openai_responses", *, hosted: bool = False) -> dict:
+        return build_payload(
+            profile(dialect),
+            model="model-1",
+            system="private prompt",
+            input_items="private input",
+            effort="high",
+            output_tokens=2_500,
+            remaining_app_calls=1,
+            remaining_hosted_calls=1 if hosted else 0,
+            remaining_web_results=1,
+            web_backend="native" if hosted else "off",
+            images=(
+                ImageInput(
+                    111111111111111111,
+                    222222222222222222,
+                    "https://cdn.discordapp.com/attachments/private/image.png?secret=1",
+                    "high",
+                ),
+            ),
+        )
+
+    async def request_with_transport(
+        self,
+        provider: ProviderProfile,
+        payload: Mapping[str, object],
+        responses: tuple[tuple[int, bytes | BaseException], ...],
+        *,
+        normalized: NormalizedResponse | None = None,
+        operation=None,
+        sleep_error: BaseException | None = None,
+    ):
+        cog = object.__new__(ChannelSummary)
+        cog.get_api_key = AsyncMock(return_value="private-api-key")
+        cog._resolve_profile = AsyncMock(
+            return_value=("example.com", 443, (("8.8.8.8", socket.AF_INET),))
+        )
+        resolver = MagicMock()
+        resolver.close = AsyncMock()
+        response_contexts = []
+        for status, body in responses:
+            response = SimpleNamespace(status=status, body=body)
+            context = MagicMock()
+            context.__aenter__ = AsyncMock(return_value=response)
+            context.__aexit__ = AsyncMock(return_value=False)
+            response_contexts.append(context)
+        session = MagicMock()
+        session.post.side_effect = response_contexts
+        session_context = MagicMock()
+        session_context.__aenter__ = AsyncMock(return_value=session)
+        session_context.__aexit__ = AsyncMock(return_value=False)
+        timeout_context = MagicMock()
+        timeout_context.__aenter__ = AsyncMock(return_value=None)
+        timeout_context.__aexit__ = AsyncMock(return_value=False)
+        outer_timeout = MagicMock(return_value=timeout_context)
+        sleep = AsyncMock(side_effect=sleep_error)
+
+        async def bounded(response, max_bytes=MAX_RESPONSE_BYTES):
+            if isinstance(response.body, BaseException):
+                raise response.body
+            if len(response.body) > max_bytes:
+                raise SummaryError(ErrorCode.RESPONSE_TOO_LARGE)
+            return response.body
+
+        expected = normalized or NormalizedResponse("ok", None, (), (), "model-1", 0)
+        with (
+            patch("channelsummary.channelsummary.PinnedResolver", return_value=resolver) as pinned,
+            patch("channelsummary.channelsummary.aiohttp.TCPConnector", return_value=object()) as connector,
+            patch("channelsummary.channelsummary.aiohttp.ClientSession", return_value=session_context) as client,
+            patch("channelsummary.channelsummary.asyncio.timeout", new=outer_timeout),
+            patch("channelsummary.channelsummary.asyncio.sleep", new=sleep),
+            patch(
+                "channelsummary.channelsummary.read_bounded_response",
+                AsyncMock(side_effect=bounded),
+            ) as read,
+            patch("channelsummary.channelsummary.normalize_response", return_value=expected) as normalize,
+        ):
+            self.transport = SimpleNamespace(
+                cog=cog,
+                resolver=resolver,
+                response_contexts=response_contexts,
+                session=session,
+                session_context=session_context,
+                timeout_context=timeout_context,
+                outer_timeout=outer_timeout,
+                sleep=sleep,
+                pinned=pinned,
+                connector=connector,
+                client=client,
+                read=read,
+                normalize=normalize,
+            )
+            if operation is not None:
+                return await operation(cog)
+            return await cog.request_provider(provider, payload, timeout_seconds=3_600)
 
     def test_only_global_addresses_are_accepted(self) -> None:
         result = public_addresses([self.record("8.8.8.8"), self.record("2606:4700:4700::1111")])
@@ -421,6 +535,239 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.reason, channelsummary_module._ResponseReason.JSON_INVALID)
         normalize.assert_not_called()
         resolver.close.assert_awaited_once()
+
+    async def test_exact_image_timeout_retries_once_with_one_transport_and_safe_log(self) -> None:
+        payload = self.image_payload()
+        sentinel = "PRIVATE_BODY_PROMPT_URL_ID_PROFILE_MODEL_HEADER_KEY_EXCEPTION"
+        payload["instructions"] = sentinel
+        payload["input"][0]["content"][2]["image_url"] = "https://example.com/" + sentinel
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        target = logging.getLogger("red.nyancogs.channelsummary")
+        old_level, old_propagate, old_disabled = target.level, target.propagate, target.disabled
+        target.setLevel(logging.WARNING)
+        target.propagate = False
+        target.disabled = False
+        target.addHandler(handler)
+        try:
+            result = await self.request_with_transport(
+                profile("openai_responses"),
+                payload,
+                ((400, self.image_timeout_body), (200, b"{}")),
+            )
+        finally:
+            target.removeHandler(handler)
+            target.setLevel(old_level)
+            target.propagate = old_propagate
+            target.disabled = old_disabled
+
+        self.assertEqual(result.text, "ok")
+        transport = self.transport
+        self.assertEqual(transport.session.post.call_count, 2)
+        first, second = transport.session.post.call_args_list
+        self.assertEqual(first.args[0], profile("openai_responses").endpoint)
+        self.assertEqual(first.args, second.args)
+        self.assertIs(first.kwargs["data"], second.kwargs["data"])
+        self.assertIs(first.kwargs["headers"], second.kwargs["headers"])
+        self.assertFalse(first.kwargs["allow_redirects"])
+        self.assertFalse(second.kwargs["allow_redirects"])
+        self.assertIn(sentinel.encode(), first.kwargs["data"])
+        transport.cog._resolve_profile.assert_awaited_once()
+        transport.pinned.assert_called_once()
+        transport.connector.assert_called_once()
+        transport.client.assert_called_once()
+        transport.outer_timeout.assert_called_once_with(3_600)
+        transport.timeout_context.__aenter__.assert_awaited_once()
+        transport.timeout_context.__aexit__.assert_awaited_once()
+        transport.session_context.__aenter__.assert_awaited_once()
+        transport.session_context.__aexit__.assert_awaited_once()
+        transport.resolver.close.assert_awaited_once()
+        for context in transport.response_contexts:
+            context.__aenter__.assert_awaited_once()
+            context.__aexit__.assert_awaited_once()
+        transport.sleep.assert_awaited_once_with(1)
+        self.assertEqual(transport.read.await_args_list[0].args[1], MAX_PROVIDER_ERROR_BYTES)
+        self.assertEqual(len(transport.read.await_args_list[1].args), 1)
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        standard = set(logging.LogRecord("baseline", 0, __file__, 0, "", (), None).__dict__)
+        self.assertEqual(
+            set(record.__dict__) - standard,
+            {"event", "reason", "dialect", "attempt", "status", "elapsed_ms"},
+        )
+        self.assertEqual(
+            record.getMessage(),
+            "channelsummary.provider_retry reason=image_url_download_timeout "
+            f"dialect=openai_responses attempt=2 status=400 elapsed_ms={record.elapsed_ms}",
+        )
+        self.assertIsInstance(record.elapsed_ms, int)
+        self.assertGreaterEqual(record.elapsed_ms, 0)
+        self.assertLessEqual(record.elapsed_ms, 3_600_000)
+        self.assertEqual(
+            (record.event, record.reason, record.dialect, record.attempt, record.status),
+            ("provider_retry", "image_url_download_timeout", "openai_responses", 2, 400),
+        )
+        self.assertIsNone(record.exc_info)
+        self.assertIsNone(record.exc_text)
+        self.assertNotIn(sentinel, record.getMessage() + repr(record.__dict__))
+
+    async def test_exact_image_timeout_twice_has_specific_actionable_error(self) -> None:
+        with self.assertRaises(SummaryError) as caught:
+            await self.request_with_transport(
+                profile("generic_responses"),
+                self.image_payload("generic_responses"),
+                ((400, self.image_timeout_body), (400, self.image_timeout_body)),
+            )
+
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT)
+        self.assertEqual(
+            str(caught.exception),
+            "The provider timed out downloading an image twice. "
+            "Retry later or disable image summaries.",
+        )
+        self.assertEqual(self.transport.session.post.call_count, 2)
+        self.transport.sleep.assert_awaited_once_with(1)
+        self.transport.resolver.close.assert_awaited_once()
+        self.transport.session_context.__aexit__.assert_awaited_once()
+
+    async def test_image_timeout_body_and_payload_negative_matrix_never_retries(self) -> None:
+        self.assertLessEqual(MAX_PROVIDER_ERROR_BYTES, 65_536)
+        exact = json.loads(self.image_timeout_body)
+        body_cases = {
+            "message_variation": self.image_timeout_body.replace(b"promptly", b"promptly!"),
+            "outer_extra": json.dumps({**exact, "extra": "x"}).encode(),
+            "outer_missing": b"{}",
+            "outer_wrong_type": b'{"error":"wrong"}',
+            "inner_extra": json.dumps({"error": {**exact["error"], "extra": "x"}}).encode(),
+            "inner_missing": json.dumps(
+                {"error": {key: value for key, value in exact["error"].items() if key != "param"}}
+            ).encode(),
+            "wrong_type": json.dumps({"error": {**exact["error"], "param": 1}}).encode(),
+            "malformed": b'{"error":',
+            "nan": b'{"error":{"type":NaN,"code":"invalid_value","param":"url","message":"x"}}',
+            "deep": b'{"error":' + b"[" * 34 + b"0" + b"]" * 34 + b"}",
+            "duplicate": self.image_timeout_body.replace(
+                b'{"error":{', b'{"error":{"type":"invalid_request_error",'
+            ),
+            "oversized": b" " * (MAX_PROVIDER_ERROR_BYTES + 1),
+        }
+        payload_cases = (
+            ("text_only", profile("openai_responses"), {**self.image_payload(), "input": "text"}),
+            ("generic_chat", profile("generic_chat"), self.image_payload("generic_chat")),
+            ("hosted_tools", profile("openai_responses"), self.image_payload(hosted=True)),
+            ("store_true", profile("openai_responses"), {**self.image_payload(), "store": True}),
+        )
+        cases = [
+            (name, profile("openai_responses"), self.image_payload(), body)
+            for name, body in body_cases.items()
+        ] + [
+            (name, provider, payload, self.image_timeout_body)
+            for name, provider, payload in payload_cases
+        ]
+        for name, provider, payload, body in cases:
+            with self.subTest(name=name), self.assertRaises(SummaryError) as caught:
+                await self.request_with_transport(provider, payload, ((400, body),))
+            self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_REJECTED)
+            self.assertEqual(self.transport.session.post.call_count, 1)
+            self.transport.sleep.assert_not_awaited()
+
+    async def test_other_http_status_never_reads_body_or_retries(self) -> None:
+        with self.assertRaises(SummaryError) as caught:
+            await self.request_with_transport(
+                profile("openai_responses"),
+                self.image_payload(),
+                ((429, self.image_timeout_body),),
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_RATE_LIMIT)
+        self.assertEqual(self.transport.session.post.call_count, 1)
+        self.transport.read.assert_not_awaited()
+        self.transport.sleep.assert_not_awaited()
+
+    async def test_retry_sleep_and_second_attempt_expiry_remain_provider_timeout(self) -> None:
+        cases = (
+            ("sleep", ((400, self.image_timeout_body),), asyncio.TimeoutError()),
+            (
+                "attempt_two",
+                ((400, self.image_timeout_body), (200, asyncio.TimeoutError())),
+                None,
+            ),
+        )
+        for name, responses, sleep_error in cases:
+            with self.subTest(name=name), self.assertRaises(SummaryError) as caught:
+                await self.request_with_transport(
+                    profile("openai_responses"),
+                    self.image_payload(),
+                    responses,
+                    sleep_error=sleep_error,
+                )
+            self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_TIMEOUT)
+            self.transport.outer_timeout.assert_called_once_with(3_600)
+            self.transport.resolver.close.assert_awaited_once()
+            self.assertLessEqual(self.transport.session.post.call_count, 2)
+
+    async def test_run_agent_retry_preserves_turn_counters_budgets_and_local_tools(self) -> None:
+        message = FakeMessage(111111111111111111, 444444444444444444, "message", 1)
+        message.attachments = [fake_attachment(222222222222222222)]
+        channel = FakeChannel([message])
+        state = RunState(message.id, {message.id}, {message.id: message}, hard_start_id=message.id)
+        final = {
+            "overview": "done",
+            "topics": [
+                {
+                    "title": "Topic",
+                    "opener_message_id": str(message.id),
+                    "opener_user_id": str(message.author.id),
+                    "boundary_reason": "explicit_start",
+                    "summary": "done",
+                    "source_message_ids": [str(message.id)],
+                }
+            ],
+        }
+        normalized = NormalizedResponse(json.dumps(final), None, (), (), "model-1", 0)
+
+        async def run(cog):
+            cog._search_channel_history = AsyncMock()
+            cog._firecrawl_search = AsyncMock()
+            cog._firecrawl_fetch = AsyncMock()
+            cog._reserve_guild_attempt = AsyncMock()
+            cog._reserve_user_attempt = MagicMock()
+            result = await cog._run_agent(
+                SimpleNamespace(id=123456789012345678),
+                channel,
+                profile("openai_responses"),
+                {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False},
+                state,
+                "from",
+                None,
+                web_backend="off",
+                provider_key="private-api-key",
+            )
+            cog._search_channel_history.assert_not_awaited()
+            cog._firecrawl_search.assert_not_awaited()
+            cog._firecrawl_fetch.assert_not_awaited()
+            cog._reserve_guild_attempt.assert_not_awaited()
+            cog._reserve_user_attempt.assert_not_called()
+            return result
+
+        summary, citations, actual_model = await self.request_with_transport(
+            profile("openai_responses"),
+            self.image_payload(),
+            ((400, self.image_timeout_body), (200, b"{}")),
+            normalized=normalized,
+            operation=run,
+        )
+        self.assertEqual(summary.overview, "done")
+        self.assertEqual(citations, ())
+        self.assertEqual(actual_model, "model-1")
+        self.assertEqual(
+            (state.provider_calls, state.app_calls, state.hosted_calls, state.firecrawl_calls),
+            (1, 0, 0, 0),
+        )
+        self.assertEqual(self.transport.session.post.call_count, 2)
+        first, second = self.transport.session.post.call_args_list
+        self.assertEqual(first.kwargs["data"], second.kwargs["data"])
+        self.assertIn(b'"type":"input_image"', first.kwargs["data"])
 
 
 class TestFirecrawlBackend(unittest.IsolatedAsyncioTestCase):
@@ -3419,6 +3766,14 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
         scope.disclosure_version.set.assert_awaited_once_with(DISCLOSURE_VERSION)
         self.assertEqual(DISCLOSURE_VERSION, 3)
         scope.enabled.set.assert_awaited_once_with(True)
+
+    def test_retry_adds_only_the_specific_public_error_without_migrating_disclosure(self) -> None:
+        self.assertEqual(DISCLOSURE_VERSION, 3)
+        self.assertEqual(set(PUBLIC_ERRORS), set(ErrorCode))
+        self.assertEqual(
+            PUBLIC_ERRORS[ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT],
+            "The provider timed out downloading an image twice. Retry later or disable image summaries.",
+        )
 
     async def test_runtime_and_files_disclose_v3_exports_and_shared_pool(self) -> None:
         cog = object.__new__(ChannelSummary)
