@@ -1214,7 +1214,13 @@ def message_record(message: discord.Message) -> dict[str, Any]:
     }
     reference = getattr(message, "reference", None)
     if reference and reference.message_id:
-        record["reply_to"] = str(reference.message_id)
+        ref_type = getattr(reference, "type", None)
+        if (
+            ref_type is None
+            or ref_type == discord.MessageReferenceType.default
+            or ref_type == discord.MessageReferenceType.default.value
+        ):
+            record["reply_to"] = str(reference.message_id)
     attachments = getattr(message, "attachments", ())
     if attachments:
         evidence["attachments"] = [
