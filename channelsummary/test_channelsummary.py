@@ -1051,6 +1051,7 @@ class TestPayloads(unittest.TestCase):
         backend: str | None = None,
         firecrawl: int = 0,
         approved=(),
+        output_tokens: int = 2_500,
     ):
         return build_payload(
             profile(dialect),
@@ -1058,7 +1059,7 @@ class TestPayloads(unittest.TestCase):
             system="system",
             input_items="input",
             effort="high",
-            output_tokens=2_500,
+            output_tokens=output_tokens,
             remaining_app_calls=app,
             remaining_hosted_calls=hosted,
             remaining_web_results=results,
@@ -1132,6 +1133,17 @@ class TestPayloads(unittest.TestCase):
                     self.assertEqual(payload["tool_choice"]["function"]["name"], "search_channel_history")
                 else:
                     self.assertEqual(payload["tool_choice"]["name"], "search_channel_history")
+
+    def test_output_token_ceiling_is_shared_by_settings_and_payload(self) -> None:
+        self.assertEqual(GUILD_DEFAULTS["max_output_tokens"], 50_000)
+        self.assertEqual(ChannelSummary._parse_setting_value("max_output_tokens", "50000"), 50_000)
+        with self.assertRaises(ValueError):
+            ChannelSummary._parse_setting_value("max_output_tokens", "50001")
+        self.assertEqual(self.build("openai_responses", output_tokens=50_000)["max_output_tokens"], 50_000)
+        self.assertEqual(self.build("generic_chat", output_tokens=50_000)["max_tokens"], 50_000)
+        with self.assertRaises(SummaryError) as caught:
+            self.build("openai_responses", output_tokens=50_001)
+        self.assertEqual(caught.exception.code, ErrorCode.REQUEST_TOO_LARGE)
 
     def test_text_only_payload_shapes_remain_scalar(self) -> None:
         for dialect in ("openai_responses", "openrouter_responses", "generic_responses"):
@@ -1992,6 +2004,8 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             "source_message_ids (at most 100 supplied top-level message_id strings, never attachment_id or reply_to values)",
             prompt,
         )
+        self.assertIn("Write dense, information-rich prose", prompt)
+        self.assertIn("use several complete sentences rather than a one-line gist", prompt)
 
     def test_safe_summary_rendering_keeps_only_valid_user_mentions(self) -> None:
         text = (
@@ -3119,14 +3133,40 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(embeds[0].author.name, self.messages[1].author.display_name)
         self.assertIn("<@444444444444444444>", embeds[0].description)
-        self.assertIn("discord.com/channels/123456789012345678", embeds[0].description)
+        self.assertIn(
+            f"[起頭訊息](https://discord.com/channels/123456789012345678/{self.channel.id}/{self.messages[0].id})",
+            embeds[0].description,
+        )
+        self.assertNotIn("Discord 記錄", embeds[0].description)
+        self.assertEqual(embeds[0].description.count("discord.com/channels/"), 1)
         self.assertIn("[1. example.com](https://example.com/source)", embeds[0].description)
+        self.assertIn("實際引用 3 則", embeds[0].footer.text)
         self.assertIn("model: gpt-5.6-luna｜effort: high", embeds[0].footer.text)
 
     def test_embed_page_limit_is_explicit(self) -> None:
-        pages = split_embed_text("\n\n".join("x" * 3_900 for _ in range(10)))
+        pages = split_embed_text(["x" * 3_900 for _ in range(10)])
         self.assertEqual(len(pages), 8)
         self.assertIn("8 頁安全上限", pages[-1])
+
+    def test_embed_pages_break_before_topic_headings(self) -> None:
+        sections = [
+            "## 摘要\noverview",
+            "## 話題一\n**起頭：** a\n\n" + "一" * 3_880,
+            "## 話題二\n**起頭：** b\n\n" + "二" * 200,
+            "## 話題三\n**起頭：** c\n\n" + "三" * 3_600,
+        ]
+        pages = split_embed_text(sections)
+        self.assertEqual(len(pages), 3)
+        self.assertTrue(all(page.startswith("## ") for page in pages))
+        self.assertEqual(pages[0], sections[0])
+        self.assertEqual(pages[1], sections[1])
+        self.assertEqual(pages[2], sections[2] + "\n\n" + sections[3])
+        self.assertTrue(all(len(page) <= 3_900 for page in pages))
+        oversized = split_embed_text(["## 長話題\n" + "\n".join("行" * 100 for _ in range(60))])
+        self.assertGreater(len(oversized), 1)
+        self.assertTrue(oversized[0].startswith("## 長話題\n"))
+        self.assertTrue(all(len(page) <= 3_900 for page in oversized))
+        self.assertEqual(split_embed_text([]), ["No summary content was returned."])
 
     def test_command_tree_exposes_all_surfaces(self) -> None:
         root = ChannelSummary.summary_group
