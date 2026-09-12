@@ -3879,6 +3879,9 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
         settings_embed = await cog._settings_embed(MagicMock())
         self.assertIn(self.policy, settings_embed.description)
         self.assertIn(self.warning, settings_embed.description)
+        self.assertLessEqual(len(settings_embed.description), 4_096)
+        for label in ("**To the LLM:**", "**Firecrawl mode:**", "**Shared Firecrawl quota:**", "**HTTP providers:**", "**Who can trigger:**", "**Stored:**"):
+            self.assertIn("\n" + label if label != "**To the LLM:**" else label, settings_embed.description)
 
         ctx = MagicMock()
         ctx.send = AsyncMock()

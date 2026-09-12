@@ -50,21 +50,27 @@ FIRECRAWL_TOKEN_SERVICE = "channelsummary_firecrawl"
 MAX_FIRECRAWL_CALLS_PER_RUN = 5
 _FIRECRAWL_ATTEMPTS: deque[float] = deque()
 _FIRECRAWL_QUOTA_LOCK = asyncio.Lock()
+DISCLOSURE_HTTP = (
+    "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP provider, API keys and "
+    "selected Discord data traverse the LAN unencrypted; signed URLs do too. Use HTTP only on a trusted LAN."
+)
+# Same facts as before v3 acceptance, regrouped under bold labels so the settings
+# panel reads as a checklist instead of one paragraph. DISCLOSURE_VERSION stays 3.
 DISCLOSURE_TEXT = (
-    "Selected Discord message text, stable user/message IDs, timestamps, reply and embed metadata are sent "
-    "to the selected LLM. In Firecrawl mode, private Discord-derived search queries and fetch URLs are sent "
-    "to Firecrawl; Firecrawl-returned URLs, titles, snippets, and markdown are sent to the LLM and may be "
-    "resent across up to 20 stateless turns. Firecrawl retention and training are unverified, and its credits "
-    "may incur cost. After a guild manager consents, any channel reader may trigger these exports. A summary "
-    "can attempt at most 5 Firecrawl calls. The owner hourly quota is one process-wide shared pool: one enabled "
-    "guild can exhaust Firecrawl availability and spend allowance for all guilds, and the guild request quota "
-    "is not an owner Firecrawl budget control. A process restart clears this pool; multiple processes multiply "
-    "the cap. Firecrawl cloud is trusted to control target DNS, redirects, and SSRF; DNS rebinding and "
-    "split-horizon behavior remain residual vendor risk. When images are enabled, image content and signed "
-    "Discord CDN URLs may be resent to the LLM across up to 20 stateless turns. Provider retention and training "
-    "are unverified. HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP provider, "
-    "API keys and selected Discord data traverse the LAN unencrypted; signed URLs do too. Use HTTP only on a "
-    "trusted LAN."
+    "**To the LLM:** selected Discord message text, stable user/message IDs, timestamps, reply and embed "
+    "metadata. When images are enabled, image content and signed Discord CDN URLs may be resent to the LLM "
+    "across up to 20 stateless turns. Provider retention and training are unverified.\n"
+    "**Firecrawl mode:** private Discord-derived search queries and fetch URLs are sent to Firecrawl; "
+    "Firecrawl-returned URLs, titles, snippets, and markdown are sent to the LLM and may be resent across "
+    "up to 20 stateless turns. Firecrawl retention and training are unverified, and its credits may incur "
+    "cost. A summary can attempt at most 5 Firecrawl calls. Firecrawl cloud is trusted to control target DNS, "
+    "redirects, and SSRF; DNS rebinding and split-horizon behavior remain residual vendor risk.\n"
+    "**Shared Firecrawl quota:** the owner hourly quota is one process-wide shared pool: one enabled guild "
+    "can exhaust Firecrawl availability and spend allowance for all guilds, and the guild request quota is "
+    "not an owner Firecrawl budget control. A process restart clears this pool; multiple processes multiply "
+    "the cap.\n"
+    f"**HTTP providers:** {DISCLOSURE_HTTP}\n"
+    "**Who can trigger:** after a guild manager consents, any channel reader may trigger these exports."
 )
 
 DIALECT_PATHS = {
@@ -3187,7 +3193,11 @@ class ChannelSummary(commands.Cog):
         settings = await self.config.guild(guild).all()
         embed = discord.Embed(
             title="ChannelSummary settings",
-            description="Before enabling: " + DISCLOSURE_TEXT + " No summaries or prompts are stored by this cog.",
+            description=(
+                "**Data-export disclosure** — Enable records your acceptance of the following.\n"
+                + DISCLOSURE_TEXT
+                + "\n**Stored:** configuration and channel checkpoints only. No summaries or prompts are stored by this cog."
+            ),
             colour=discord.Colour.orange() if not settings["enabled"] else discord.Colour.green(),
         )
         embed.add_field(
@@ -3271,7 +3281,8 @@ class ChannelSummary(commands.Cog):
                 "`/summary time <30m|2h|1d>` — time window with opener completion\n"
                 "`/summary settings` — Manage Messages settings panel\n\n"
                 "A temporary channel message shows collection, Agent, and Embed progress without hidden reasoning.\n\n"
-                + DISCLOSURE_TEXT
+                "**Data-export disclosure:** see `/summary settings` before enabling, or `[p]summary help` "
+                f"for the full privacy statement. {DISCLOSURE_HTTP}"
             ),
             colour=discord.Colour.blurple(),
         )
@@ -3609,7 +3620,7 @@ class ChannelSummary(commands.Cog):
             title="ChannelSummary · privacy",
             description=(
                 DISCLOSURE_TEXT
-                + " The Cog stores only configuration and successful channel checkpoints; it does not store "
+                + "\n**Stored:** only configuration and successful channel checkpoints; the Cog does not store "
                 "prompts, messages, searches, provider responses, or summaries."
             ),
             colour=discord.Colour.orange(),
