@@ -71,7 +71,9 @@ guild enables it. The bot needs View Channel, Read Message History, Send
 Messages, and Embed Links. A per-user cooldown, atomic guild request quota,
 bounded guild/provider concurrency, and a persistent per-channel new-message
 checkpoint limit API cost and repeated output. Defaults require 20 new human
-messages after a successful summary before that channel can run another.
+messages after a successful summary before that channel can run another;
+members with guild-level Manage Messages are exempt from that checkpoint, but
+the cooldown, quota, and concurrency limits still apply to them.
 
 Summary Embeds preserve validated `<@user_id>` speaker attribution but use
 `AllowedMentions.none()`, so they do not notify anyone. Discord jump links are

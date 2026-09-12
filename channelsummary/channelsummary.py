@@ -2939,14 +2939,19 @@ class ChannelSummary(commands.Cog):
                     invocation_id=invocation_id,
                     progress_id=None,
                 )
+                # Guild-level Manage Messages (the same bar as the settings panel and
+                # `[p]summaryset checkpoint reset`) skips the new-message gate; cooldown,
+                # quota, and concurrency still apply to them.
+                manager = bool(getattr(getattr(ctx.author, "guild_permissions", None), "manage_messages", False))
                 if not await self._checkpoint_ready(
                     ctx.channel,
                     snapshot.id,
-                    int(settings["new_messages_required"]),
+                    0 if manager else int(settings["new_messages_required"]),
                     invocation_id,
                 ):
                     raise commands.UserFeedbackCheckFailure(
-                        f"This channel needs {settings['new_messages_required']} new human messages after its last successful summary."
+                        f"This channel needs {settings['new_messages_required']} new human messages after its last "
+                        "successful summary. Members with guild-level Manage Messages are exempt."
                     )
                 user_reservation = self._reserve_user_attempt(
                     ctx.guild.id,
