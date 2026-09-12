@@ -3489,6 +3489,55 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(sentinel.casefold(), rendered)
             self.assertNotIn(str(sentinel_id), rendered)
 
+    async def test_guild_manage_messages_bypasses_checkpoint_gate(self) -> None:
+        for manager, expected_required in ((True, 0), (False, 20)):
+            with self.subTest(manager=manager):
+                cog = object.__new__(ChannelSummary)
+                cog._channel_locks = __import__("collections").defaultdict(__import__("asyncio").Lock)
+                cog._guild_semaphores = {}
+                cog._user_attempts = {}
+                guild_scope = MagicMock()
+                guild_scope.all = AsyncMock(
+                    return_value={
+                        **GUILD_DEFAULTS,
+                        "enabled": True,
+                        "disclosure_version": DISCLOSURE_VERSION,
+                        "provider_profile": "main",
+                        "model": "model-1",
+                        "web_enabled": False,
+                    }
+                )
+                cog.config = MagicMock()
+                cog.config.guild.return_value = guild_scope
+                cog.get_profile = AsyncMock(return_value=profile("generic_responses"))
+                cog.get_api_key = AsyncMock(return_value="provider-secret")
+                cog._select_web_backend = AsyncMock(return_value=("off", None))
+                snapshot = FakeMessage(333333333333333333, 444444444444444444, "snapshot", 36)
+                cog._snapshot_message = AsyncMock(return_value=(snapshot, 1))
+                cog._checkpoint_ready = AsyncMock(return_value=False)
+                channel = MagicMock(spec=discord.TextChannel)
+                channel.id = 987654321098765432
+                channel.permissions_for.return_value = SimpleNamespace(
+                    view_channel=True,
+                    read_message_history=True,
+                    send_messages=True,
+                    send_messages_in_threads=False,
+                    embed_links=True,
+                )
+                ctx = MagicMock()
+                ctx.guild = SimpleNamespace(id=123456789012345678, me=object())
+                ctx.channel = channel
+                ctx.author = SimpleNamespace(
+                    id=444444444444444444,
+                    guild_permissions=SimpleNamespace(manage_messages=manager),
+                )
+                ctx.message = SimpleNamespace(id=888888888888888888)
+                ctx.interaction = None
+                with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+                    await cog._execute_summary(ctx, "auto")
+                self.assertIn("Manage Messages are exempt", str(caught.exception))
+                self.assertEqual(cog._checkpoint_ready.await_args.args[2], expected_required)
+
     async def test_failed_slash_summary_updates_progress_and_cooldown(self) -> None:
         cog = object.__new__(ChannelSummary)
         cog._channel_locks = __import__("collections").defaultdict(__import__("asyncio").Lock)
