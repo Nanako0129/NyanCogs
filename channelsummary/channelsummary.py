@@ -89,7 +89,7 @@ GUILD_DEFAULTS: dict[str, Any] = {
     "channel_tool_max_calls": 6,
     "max_distinct_messages": 300,
     "max_input_chars": 120_000,
-    "max_output_tokens": MAX_OUTPUT_TOKENS,
+    "max_output_tokens": 16_000,
     "image_enabled": True,
     "image_detail": "auto",
     "max_images": 20,

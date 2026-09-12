@@ -1135,7 +1135,7 @@ class TestPayloads(unittest.TestCase):
                     self.assertEqual(payload["tool_choice"]["name"], "search_channel_history")
 
     def test_output_token_ceiling_is_shared_by_settings_and_payload(self) -> None:
-        self.assertEqual(GUILD_DEFAULTS["max_output_tokens"], 50_000)
+        self.assertEqual(GUILD_DEFAULTS["max_output_tokens"], 16_000)
         self.assertEqual(ChannelSummary._parse_setting_value("max_output_tokens", "50000"), 50_000)
         with self.assertRaises(ValueError):
             ChannelSummary._parse_setting_value("max_output_tokens", "50001")
