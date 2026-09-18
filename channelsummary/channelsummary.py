@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ipaddress
 import json
 import logging
@@ -38,7 +39,6 @@ MODEL_RE = re.compile(r"^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,99}$")
 SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 SAFE_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
 MAX_RESPONSE_BYTES = 2_097_152
-MAX_PROVIDER_ERROR_BYTES = 65_536
 # A 429 refuses the request before the model runs, so one summary can retry it a
 # few times. Every wait is spent from the run's own remaining budget, never added
 # to it, so these values cannot extend a summary past request_timeout_seconds.
@@ -49,13 +49,21 @@ RATE_LIMIT_MAX_DELAY_SECONDS = 30.0
 # reports a timeout instead of the rate limit that actually happened.
 RATE_LIMIT_HEADROOM_SECONDS = 5.0
 MAX_FIRECRAWL_RESPONSE_BYTES = 1_048_576
-MAX_REQUEST_BYTES = 1_048_576
+# Google AI Studio answers 413 above 20,000,000 bytes, measured 2026-09-19 through
+# OpenRouter: "23045606 bytes exceeds the 20000000 byte limit". Inlined image bytes
+# now travel inside this body, so the cap sits below that with room for the
+# transcript and JSON overhead. A provider with a smaller limit reports its own 413.
+MAX_REQUEST_BYTES = 18_000_000
 MAX_PROVIDER_PROFILES = 25
 MAX_OUTPUT_TOKENS = 50_000
 DISCLOSURE_VERSION = 3
-MAX_IMAGE_BYTES = 20 * 1024 * 1024
+# Base64 costs four bytes per three, so these raw budgets are what MAX_REQUEST_BYTES
+# can actually carry once encoded. They are far below the old URL-era limits because
+# the bytes now cross the wire instead of a link to them.
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
-MAX_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 20.0
 MAX_IMAGE_TOTAL_PIXELS = 100_000_000
 FIRECRAWL_ORIGIN = "https://api.firecrawl.dev"
 FIRECRAWL_HOST = "api.firecrawl.dev"
@@ -67,14 +75,16 @@ _FIRECRAWL_ATTEMPTS: deque[float] = deque()
 _FIRECRAWL_QUOTA_LOCK = asyncio.Lock()
 DISCLOSURE_HTTP = (
     "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP provider, API keys and "
-    "selected Discord data traverse the LAN unencrypted; signed URLs do too. Use HTTP only on a trusted LAN."
+    "selected Discord data, and inlined image bytes traverse the LAN unencrypted. Use HTTP only on a "
+    "trusted LAN."
 )
 # Same facts as before v3 acceptance, regrouped under bold labels so the settings
 # panel reads as a checklist instead of one paragraph. DISCLOSURE_VERSION stays 3.
 DISCLOSURE_TEXT = (
     "**To the LLM:** selected Discord message text, stable user/message IDs, timestamps, reply and embed "
-    "metadata. When images are enabled, image content and signed Discord CDN URLs may be resent to the LLM "
-    "across up to 20 stateless turns. Provider retention and training are unverified.\n"
+    "metadata. When images are enabled, the bot downloads the attachment and sends the image bytes inline, "
+    "so image content may be resent to the LLM across up to 20 stateless turns while no Discord CDN URL "
+    "leaves this bot. Provider retention and training are unverified.\n"
     "**Firecrawl mode:** private Discord-derived search queries and fetch URLs are sent to Firecrawl; "
     "Firecrawl-returned URLs, titles, snippets, and markdown are sent to the LLM and may be resent across "
     "up to 20 stateless turns. Firecrawl retention and training are unverified, and its credits may incur "
@@ -224,7 +234,6 @@ class ErrorCode(StrEnum):
     REQUEST_BYTE_LIMIT = "REQUEST_BYTE_LIMIT"
     REQUEST_TOO_LARGE = "REQUEST_TOO_LARGE"
     PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
-    PROVIDER_IMAGE_FETCH_TIMEOUT = "PROVIDER_IMAGE_FETCH_TIMEOUT"
     PROVIDER_AUTH = "PROVIDER_AUTH"
     PROVIDER_FORBIDDEN = "PROVIDER_FORBIDDEN"
     PROVIDER_RATE_LIMIT = "PROVIDER_RATE_LIMIT"
@@ -275,9 +284,6 @@ PUBLIC_ERRORS = {
     ),
     ErrorCode.REQUEST_TOO_LARGE: "The summary request exceeds its configured limit.",
     ErrorCode.PROVIDER_TIMEOUT: "The provider request timed out.",
-    ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT: (
-        "The provider timed out downloading an image twice. Retry later or disable image summaries."
-    ),
     ErrorCode.PROVIDER_AUTH: "The provider rejected its credentials.",
     ErrorCode.PROVIDER_FORBIDDEN: (
         "The provider refused this request. This usually means the account, model, or region is "
@@ -353,9 +359,16 @@ class Citation:
 
 @dataclass(frozen=True)
 class ImageInput:
+    """One attachment already downloaded and encoded as a `data:` URI.
+
+    The bytes are inlined rather than linked. A Discord CDN link is signed and
+    expires, and the provider fetching it is a second network hop this cog
+    cannot see, retry, or explain when it fails.
+    """
+
     message_id: int
     attachment_id: int
-    url: str
+    data_url: str
     detail: str
 
 
@@ -615,7 +628,7 @@ def build_payload(
                                 {"type": "input_text", "text": _image_marker(image)},
                                 {
                                     "type": "input_image",
-                                    "image_url": image.url,
+                                    "image_url": image.data_url,
                                     "detail": image.detail,
                                 },
                             )
@@ -664,7 +677,7 @@ def build_payload(
                         {"type": "text", "text": _image_marker(image)},
                         {
                             "type": "image_url",
-                            "image_url": {"url": image.url, "detail": image.detail},
+                            "image_url": {"url": image.data_url, "detail": image.detail},
                         },
                     )
                 ),
@@ -1180,6 +1193,16 @@ def _rate_limit_reason(headers: Mapping[str, str]) -> str:
     return "rate_limited_platform" if "X-RateLimit-Limit" in headers else "rate_limited_provider"
 
 
+def _log_image_skipped(reason: str, status: int) -> None:
+    """Record a dropped attachment with a fixed reason; no URL, name, or bytes."""
+    log.warning(
+        "channelsummary.image_skipped reason=%s status=%d",
+        reason,
+        status,
+        extra={"event": "image_skipped", "reason": reason, "status": status},
+    )
+
+
 def _log_provider_retry(
     profile: ProviderProfile, reason: str, attempt: int, status: int, started_at: float
 ) -> None:
@@ -1207,68 +1230,6 @@ def _log_provider_retry(
 
 def _reject_json_constant(_value: str) -> None:
     raise ValueError
-
-
-def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result = dict(pairs)
-    if len(result) != len(pairs):
-        raise ValueError
-    return result
-
-
-def _is_provider_image_fetch_timeout(raw: bytes) -> bool:
-    """Recognize only the observed bounded provider error without retaining it."""
-    if len(raw) > MAX_PROVIDER_ERROR_BYTES:
-        return False
-    try:
-        decoded = json.loads(
-            raw,
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_strict_json_object,
-        )
-        _walk_limits(decoded, max_string=MAX_PROVIDER_ERROR_BYTES)
-    except (ValueError, RecursionError, SummaryError):
-        return False
-    expected = {
-        "error": {
-            "type": "invalid_request_error",
-            "code": "invalid_value",
-            "param": "url",
-            "message": (
-                "Unable to download content from the provided URL before the timeout. Check that the URL is "
-                "publicly accessible and responds promptly, or upload the file and provide a file_id instead."
-            ),
-        }
-    }
-    return decoded == expected and all(
-        isinstance(value, str) for value in decoded["error"].values()
-    )
-
-
-def _has_local_input_image(payload: Mapping[str, Any]) -> bool:
-    items = payload.get("input")
-    if not isinstance(items, list):
-        return False
-    for item in items:
-        content = (
-            item.get("content")
-            if isinstance(item, dict)
-            and set(item) == {"role", "content"}
-            and item.get("role") == "user"
-            else None
-        )
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if (
-                isinstance(part, dict)
-                and set(part) == {"type", "image_url", "detail"}
-                and part.get("type") == "input_image"
-                and isinstance(part.get("image_url"), str)
-                and part.get("detail") in {"low", "auto", "high", "original"}
-            ):
-                return True
-    return False
 
 
 def parse_duration(value: str) -> timedelta:
@@ -1340,14 +1301,27 @@ def valid_image_url(attachment: discord.Attachment, channel_id: int) -> str | No
     return url
 
 
-def image_inputs(
+IMAGE_MIME_RULES = {
+    "image/png": ((".png",), b"\x89PNG\r\n\x1a\n"),
+    "image/jpeg": ((".jpg", ".jpeg"), b"\xff\xd8\xff"),
+    "image/webp": ((".webp",), b"RIFF"),
+}
+
+
+def eligible_images(
     messages: Iterable[discord.Message], channel_id: int, settings: Mapping[str, Any]
-) -> tuple[ImageInput, ...]:
-    """Select bounded live Discord image attachments in chronological order."""
+) -> tuple[tuple[discord.Message, Any, str, str], ...]:
+    """Select bounded live Discord image attachments in chronological order.
+
+    Returns (message, attachment, url, content_type) without any network I/O, so
+    the selection rules stay testable on their own. `MAX_IMAGE_BYTES` and
+    `MAX_IMAGE_TOTAL_BYTES` are applied to the attachment's declared size here and
+    re-applied to the downloaded bytes later, because the declared size is
+    attacker-adjacent metadata while the read limit is not.
+    """
     if not settings["image_enabled"] or not int(settings["max_images"]):
         return ()
-    suffixes = {"image/png": (".png",), "image/jpeg": (".jpg", ".jpeg"), "image/webp": (".webp",)}
-    result: list[ImageInput] = []
+    result: list[tuple[discord.Message, Any, str, str]] = []
     total_bytes = total_pixels = 0
     for message in sorted(messages, key=lambda item: item.id):
         for attachment in getattr(message, "attachments", ()):
@@ -1357,9 +1331,9 @@ def image_inputs(
             width = getattr(attachment, "width", None)
             height = getattr(attachment, "height", None)
             if (
-                content_type not in suffixes
+                content_type not in IMAGE_MIME_RULES
                 or not isinstance(filename, str)
-                or not filename.casefold().endswith(suffixes[content_type])
+                or not filename.casefold().endswith(IMAGE_MIME_RULES[content_type][0])
                 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (size, width, height))
             ):
                 continue
@@ -1373,19 +1347,23 @@ def image_inputs(
                 or total_pixels + pixels > MAX_IMAGE_TOTAL_PIXELS
             ):
                 continue
-            result.append(
-                ImageInput(
-                    message.id,
-                    attachment.id,
-                    url,
-                    str(settings["image_detail"]),
-                )
-            )
+            result.append((message, attachment, url, content_type))
             total_bytes += size
             total_pixels += pixels
             if len(result) >= int(settings["max_images"]):
                 return tuple(result)
     return tuple(result)
+
+
+def _encode_image(content_type: str, raw: bytes) -> str | None:
+    """A `data:` URI for bytes that really are the declared image type."""
+    if not raw or len(raw) > MAX_IMAGE_BYTES:
+        return None
+    if not raw.startswith(IMAGE_MIME_RULES[content_type][1]):
+        return None
+    if content_type == "image/webp" and raw[8:12] != b"WEBP":
+        return None
+    return f"data:{content_type};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
 def message_record(message: discord.Message) -> dict[str, Any]:
@@ -1922,6 +1900,77 @@ class ChannelSummary(commands.Cog):
             records, allow_private_lan=parts.scheme == "http"
         )
 
+    async def fetch_image_inputs(
+        self,
+        messages: Iterable[discord.Message],
+        channel_id: int,
+        settings: Mapping[str, Any],
+        cache: dict[int, str | None],
+    ) -> tuple[ImageInput, ...]:
+        """Download the selected attachments and inline them as `data:` URIs.
+
+        Called once per agent turn because the channel-history tool can add
+        messages, and a message added mid-run may carry an attachment the
+        earlier turns never saw. `cache` maps attachment id to its `data:` URI,
+        or to None for one that failed, so each attachment is downloaded at most
+        once across the whole run rather than once per turn.
+
+        One attachment that cannot be downloaded is skipped, not fatal. A
+        Discord CDN link is signed and expires, so a single stale or deleted
+        attachment used to end the whole summary with a message about the
+        provider rejecting the request; losing one image is the smaller failure.
+        Reads are bounded by `MAX_IMAGE_BYTES`, redirects are refused, and the
+        bytes must begin with the magic number for the type Discord declared.
+        """
+        selected = eligible_images(messages, channel_id, settings)
+        missing = [item for item in selected if item[1].id not in cache]
+        if missing:
+            timeout = aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
+            ) as session:
+                for _message, attachment, url, content_type in missing:
+                    cache[attachment.id] = await self._download_image(
+                        session, url, content_type
+                    )
+        detail = str(settings["image_detail"])
+        result: list[ImageInput] = []
+        total = 0
+        for message, attachment, _url, _content_type in selected:
+            data_url = cache.get(attachment.id)
+            if data_url is None:
+                continue
+            # Base64 is four bytes per three; the encoded length is what the
+            # request actually has to carry.
+            encoded = len(data_url)
+            if total + encoded > MAX_IMAGE_TOTAL_BYTES * 4 // 3:
+                _log_image_skipped("total_budget", 0)
+                break
+            total += encoded
+            result.append(ImageInput(message.id, attachment.id, data_url, detail))
+        return tuple(result)
+
+    async def _download_image(
+        self, session: aiohttp.ClientSession, url: str, content_type: str
+    ) -> str | None:
+        """One bounded attachment download, or None with a fixed-reason log."""
+        try:
+            async with session.get(url, allow_redirects=False) as response:
+                if response.status != 200:
+                    _log_image_skipped("http_status", response.status)
+                    return None
+                raw = await read_bounded_response(response, MAX_IMAGE_BYTES)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            _log_image_skipped("transport", 0)
+            return None
+        except SummaryError:
+            _log_image_skipped("too_large", 0)
+            return None
+        data_url = _encode_image(content_type, raw)
+        if data_url is None:
+            _log_image_skipped("content_mismatch", 0)
+        return data_url
+
     async def request_provider(
         self,
         profile: ProviderProfile,
@@ -1938,12 +1987,6 @@ class ChannelSummary(commands.Cog):
         if len(encoded) > MAX_REQUEST_BYTES:
             raise SummaryError(ErrorCode.REQUEST_BYTE_LIMIT)
         offered_functions, allow_hosted_web = _offered_capabilities(payload)
-        retry_image_fetch = (
-            profile.dialect in {"openai_responses", "openrouter_responses", "generic_responses"}
-            and payload.get("store") is False
-            and _has_local_input_image(payload)
-            and not allow_hosted_web
-        )
         endpoint = profile.endpoint
         headers = {
             "Authorization": f"Bearer {key}",
@@ -1974,7 +2017,6 @@ class ChannelSummary(commands.Cog):
                     trust_env=False,
                     cookie_jar=aiohttp.DummyCookieJar(),
                 ) as session:
-                    image_retry_used = False
                     rate_limit_retries = 0
                     while True:
                         async with session.post(
@@ -2014,25 +2056,6 @@ class ChannelSummary(commands.Cog):
                                 # failed generation, so retrying does not repeat a
                                 # provider charge the way the image retry below can.
                                 rate_limit_retries += 1
-                            elif response.status == 400 and retry_image_fetch:
-                                try:
-                                    error_raw = await read_bounded_response(
-                                        response, MAX_PROVIDER_ERROR_BYTES
-                                    )
-                                except SummaryError as error:
-                                    if error.code is ErrorCode.RESPONSE_TOO_LARGE:
-                                        raise SummaryError(_http_error(response.status)) from None
-                                    raise
-                                if not _is_provider_image_fetch_timeout(error_raw):
-                                    raise SummaryError(_http_error(response.status))
-                                if image_retry_used:
-                                    raise SummaryError(ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT)
-                                image_retry_used = True
-                                delay = 1
-                                # A retry may incur a second provider charge; never retry more than once.
-                                _log_provider_retry(
-                                    profile, "image_url_download_timeout", 2, 400, started_at
-                                )
                             else:
                                 raise SummaryError(_http_error(response.status))
                         await asyncio.sleep(delay)
@@ -2610,6 +2633,10 @@ class ChannelSummary(commands.Cog):
         max_turns = int(settings["agent_max_turns"])
         deadline = time.monotonic() + int(settings["request_timeout_seconds"])
         force_next = mode in {"auto", "time"} and state.boundary_backfills == 0
+        # Attachment id -> data URI, or None once a download has failed. Shared
+        # across turns so the tool adding a message mid-run still gets its image
+        # while nothing is downloaded twice.
+        image_cache: dict[int, str | None] = {}
         for turn in range(max_turns):
             turns_left = max_turns - turn
             working_input = self._agent_input(state, gap_minutes, tool_notes)
@@ -2639,7 +2666,9 @@ class ChannelSummary(commands.Cog):
                 web_backend=web_backend,
                 remaining_firecrawl_calls=offered_firecrawl,
                 approved_fetch_urls=tuple(approved_fetch_urls),
-                images=image_inputs(state.messages.values(), channel.id, settings),
+                images=await self.fetch_image_inputs(
+                    state.messages.values(), channel.id, settings, image_cache
+                ),
                 force_channel_history=force_history,
             )
             remaining_timeout = deadline - time.monotonic()

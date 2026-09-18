@@ -33,7 +33,6 @@ from .channelsummary import (
     FIRECRAWL_TOKEN_SERVICE,
     MAX_FIRECRAWL_CALLS_PER_RUN,
     MAX_FIRECRAWL_RESPONSE_BYTES,
-    MAX_PROVIDER_ERROR_BYTES,
     MAX_PROVIDER_PROFILES,
     MAX_RESPONSE_BYTES,
     PUBLIC_ERRORS,
@@ -42,7 +41,10 @@ from .channelsummary import (
     ChannelSummary,
     Citation,
     FunctionCall,
+    IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
     ImageInput,
+    MAX_IMAGE_BYTES,
+    MAX_IMAGE_TOTAL_BYTES,
     NormalizedResponse,
     ProviderProfile,
     RATE_LIMIT_HEADROOM_SECONDS,
@@ -52,7 +54,7 @@ from .channelsummary import (
     SummaryTopic,
     SummaryError,
     build_payload,
-    image_inputs,
+    eligible_images,
     message_record,
     normalize_origin,
     normalize_response,
@@ -70,6 +72,9 @@ from .channelsummary import (
     validate_web_fetch_arguments,
     validate_web_search_arguments,
 )
+
+
+FAKE_DATA_URL = "data:image/png;base64,iVBORw0KGgo="
 
 
 def profile(dialect: str) -> ProviderProfile:
@@ -258,21 +263,6 @@ class TestFirecrawlCapabilities(unittest.TestCase):
 
 
 class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
-    image_timeout_body = json.dumps(
-        {
-            "error": {
-                "type": "invalid_request_error",
-                "code": "invalid_value",
-                "param": "url",
-                "message": (
-                    "Unable to download content from the provided URL before the timeout. Check that the URL is "
-                    "publicly accessible and responds promptly, or upload the file and provide a file_id instead."
-                ),
-            }
-        },
-        separators=(",", ":"),
-    ).encode()
-
     @staticmethod
     def record(address: str) -> tuple[object, ...]:
         family = socket.AF_INET6 if ":" in address else socket.AF_INET
@@ -296,7 +286,7 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
                 ImageInput(
                     111111111111111111,
                     222222222222222222,
-                    "https://cdn.discordapp.com/attachments/private/image.png?secret=1",
+                    "data:image/png;base64,iVBORw0KGgo=",
                     "high",
                 ),
             ),
@@ -568,142 +558,6 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
         normalize.assert_not_called()
         resolver.close.assert_awaited_once()
 
-    async def test_exact_image_timeout_retries_once_with_one_transport_and_safe_log(self) -> None:
-        payload = self.image_payload()
-        sentinel = "PRIVATE_BODY_PROMPT_URL_ID_PROFILE_MODEL_HEADER_KEY_EXCEPTION"
-        payload["instructions"] = sentinel
-        payload["input"][0]["content"][2]["image_url"] = "https://example.com/" + sentinel
-        records: list[logging.LogRecord] = []
-        handler = logging.Handler()
-        handler.emit = records.append
-        target = logging.getLogger("red.nyancogs.channelsummary")
-        old_level, old_propagate, old_disabled = target.level, target.propagate, target.disabled
-        target.setLevel(logging.WARNING)
-        target.propagate = False
-        target.disabled = False
-        target.addHandler(handler)
-        try:
-            result = await self.request_with_transport(
-                profile("openai_responses"),
-                payload,
-                ((400, self.image_timeout_body), (200, b"{}")),
-            )
-        finally:
-            target.removeHandler(handler)
-            target.setLevel(old_level)
-            target.propagate = old_propagate
-            target.disabled = old_disabled
-
-        self.assertEqual(result.text, "ok")
-        transport = self.transport
-        self.assertEqual(transport.session.post.call_count, 2)
-        first, second = transport.session.post.call_args_list
-        self.assertEqual(first.args[0], profile("openai_responses").endpoint)
-        self.assertEqual(first.args, second.args)
-        self.assertIs(first.kwargs["data"], second.kwargs["data"])
-        self.assertIs(first.kwargs["headers"], second.kwargs["headers"])
-        self.assertFalse(first.kwargs["allow_redirects"])
-        self.assertFalse(second.kwargs["allow_redirects"])
-        self.assertIn(sentinel.encode(), first.kwargs["data"])
-        transport.cog._resolve_profile.assert_awaited_once()
-        transport.pinned.assert_called_once()
-        transport.connector.assert_called_once()
-        transport.client.assert_called_once()
-        transport.outer_timeout.assert_called_once_with(3_600)
-        transport.timeout_context.__aenter__.assert_awaited_once()
-        transport.timeout_context.__aexit__.assert_awaited_once()
-        transport.session_context.__aenter__.assert_awaited_once()
-        transport.session_context.__aexit__.assert_awaited_once()
-        transport.resolver.close.assert_awaited_once()
-        for context in transport.response_contexts:
-            context.__aenter__.assert_awaited_once()
-            context.__aexit__.assert_awaited_once()
-        transport.sleep.assert_awaited_once_with(1)
-        self.assertEqual(transport.read.await_args_list[0].args[1], MAX_PROVIDER_ERROR_BYTES)
-        self.assertEqual(len(transport.read.await_args_list[1].args), 1)
-        self.assertEqual(len(records), 1)
-        record = records[0]
-        standard = set(logging.LogRecord("baseline", 0, __file__, 0, "", (), None).__dict__)
-        self.assertEqual(
-            set(record.__dict__) - standard,
-            {"event", "reason", "dialect", "attempt", "status", "elapsed_ms"},
-        )
-        self.assertEqual(
-            record.getMessage(),
-            "channelsummary.provider_retry reason=image_url_download_timeout "
-            f"dialect=openai_responses attempt=2 status=400 elapsed_ms={record.elapsed_ms}",
-        )
-        self.assertIsInstance(record.elapsed_ms, int)
-        self.assertGreaterEqual(record.elapsed_ms, 0)
-        self.assertLessEqual(record.elapsed_ms, 3_600_000)
-        self.assertEqual(
-            (record.event, record.reason, record.dialect, record.attempt, record.status),
-            ("provider_retry", "image_url_download_timeout", "openai_responses", 2, 400),
-        )
-        self.assertIsNone(record.exc_info)
-        self.assertIsNone(record.exc_text)
-        self.assertNotIn(sentinel, record.getMessage() + repr(record.__dict__))
-
-    async def test_exact_image_timeout_twice_has_specific_actionable_error(self) -> None:
-        with self.assertRaises(SummaryError) as caught:
-            await self.request_with_transport(
-                profile("generic_responses"),
-                self.image_payload("generic_responses"),
-                ((400, self.image_timeout_body), (400, self.image_timeout_body)),
-            )
-
-        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT)
-        self.assertEqual(
-            str(caught.exception),
-            "The provider timed out downloading an image twice. "
-            "Retry later or disable image summaries.",
-        )
-        self.assertEqual(self.transport.session.post.call_count, 2)
-        self.transport.sleep.assert_awaited_once_with(1)
-        self.transport.resolver.close.assert_awaited_once()
-        self.transport.session_context.__aexit__.assert_awaited_once()
-
-    async def test_image_timeout_body_and_payload_negative_matrix_never_retries(self) -> None:
-        self.assertLessEqual(MAX_PROVIDER_ERROR_BYTES, 65_536)
-        exact = json.loads(self.image_timeout_body)
-        body_cases = {
-            "message_variation": self.image_timeout_body.replace(b"promptly", b"promptly!"),
-            "outer_extra": json.dumps({**exact, "extra": "x"}).encode(),
-            "outer_missing": b"{}",
-            "outer_wrong_type": b'{"error":"wrong"}',
-            "inner_extra": json.dumps({"error": {**exact["error"], "extra": "x"}}).encode(),
-            "inner_missing": json.dumps(
-                {"error": {key: value for key, value in exact["error"].items() if key != "param"}}
-            ).encode(),
-            "wrong_type": json.dumps({"error": {**exact["error"], "param": 1}}).encode(),
-            "malformed": b'{"error":',
-            "nan": b'{"error":{"type":NaN,"code":"invalid_value","param":"url","message":"x"}}',
-            "deep": b'{"error":' + b"[" * 34 + b"0" + b"]" * 34 + b"}",
-            "duplicate": self.image_timeout_body.replace(
-                b'{"error":{', b'{"error":{"type":"invalid_request_error",'
-            ),
-            "oversized": b" " * (MAX_PROVIDER_ERROR_BYTES + 1),
-        }
-        payload_cases = (
-            ("text_only", profile("openai_responses"), {**self.image_payload(), "input": "text"}),
-            ("generic_chat", profile("generic_chat"), self.image_payload("generic_chat")),
-            ("hosted_tools", profile("openai_responses"), self.image_payload(hosted=True)),
-            ("store_true", profile("openai_responses"), {**self.image_payload(), "store": True}),
-        )
-        cases = [
-            (name, profile("openai_responses"), self.image_payload(), body)
-            for name, body in body_cases.items()
-        ] + [
-            (name, provider, payload, self.image_timeout_body)
-            for name, provider, payload in payload_cases
-        ]
-        for name, provider, payload, body in cases:
-            with self.subTest(name=name), self.assertRaises(SummaryError) as caught:
-                await self.request_with_transport(provider, payload, ((400, body),))
-            self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_REJECTED)
-            self.assertEqual(self.transport.session.post.call_count, 1)
-            self.transport.sleep.assert_not_awaited()
-
     async def test_other_http_status_never_reads_body_or_retries(self) -> None:
         # 429 is retried on its own schedule now, so this uses a status that is
         # still terminal on the first response.
@@ -711,7 +565,7 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
             await self.request_with_transport(
                 profile("openai_responses"),
                 self.image_payload(),
-                ((500, self.image_timeout_body),),
+                ((500, b"{}"),),
             )
         self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_UNAVAILABLE)
         self.assertEqual(self.transport.session.post.call_count, 1)
@@ -851,10 +705,10 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_sleep_and_second_attempt_expiry_remain_provider_timeout(self) -> None:
         cases = (
-            ("sleep", ((400, self.image_timeout_body),), asyncio.TimeoutError()),
+            ("sleep", ((429, b"{}"), (200, b"{}")), asyncio.TimeoutError()),
             (
                 "attempt_two",
-                ((400, self.image_timeout_body), (200, asyncio.TimeoutError())),
+                ((429, b"{}"), (200, asyncio.TimeoutError())),
                 None,
             ),
         )
@@ -897,6 +751,7 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
             cog._firecrawl_fetch = AsyncMock()
             cog._reserve_guild_attempt = AsyncMock()
             cog._reserve_user_attempt = MagicMock()
+            cog._download_image = AsyncMock(return_value=FAKE_DATA_URL)
             result = await cog._run_agent(
                 SimpleNamespace(id=123456789012345678),
                 channel,
@@ -918,7 +773,7 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
         summary, citations, actual_model = await self.request_with_transport(
             profile("openai_responses"),
             self.image_payload(),
-            ((400, self.image_timeout_body), (200, b"{}")),
+            ((429, b"{}"), (200, b"{}")),
             normalized=normalized,
             operation=run,
         )
@@ -1276,7 +1131,7 @@ class TestPayloads(unittest.TestCase):
         self.assertNotIn("max_tool_calls", payload)
 
     def test_all_dialects_use_their_native_image_content_shape(self) -> None:
-        image = (ImageInput(11, 2, "https://cdn.discordapp.com/attachments/1/2/image.png?ex=signed", "high"),)
+        image = (ImageInput(11, 2, "data:image/png;base64,iVBORw0KGgo=", "high"),)
         for dialect in ("openai_responses", "openrouter_responses", "generic_responses"):
             with self.subTest(dialect=dialect):
                 content = self.build(dialect, images=image)["input"][0]["content"]
@@ -1287,7 +1142,7 @@ class TestPayloads(unittest.TestCase):
                 )
                 self.assertEqual(
                     content[2],
-                    {"type": "input_image", "image_url": image[0].url, "detail": "high"},
+                    {"type": "input_image", "image_url": image[0].data_url, "detail": "high"},
                 )
         content = self.build("generic_chat", images=image)["messages"][1]["content"]
         self.assertEqual(content[0], {"type": "text", "text": "input"})
@@ -1297,7 +1152,7 @@ class TestPayloads(unittest.TestCase):
         )
         self.assertEqual(
             content[2],
-            {"type": "image_url", "image_url": {"url": image[0].url, "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": image[0].data_url, "detail": "high"}},
         )
 
     def test_forced_channel_tool_is_required_and_exclusive_for_all_dialects(self) -> None:
@@ -1830,7 +1685,7 @@ class FakeChannel:
         return iterator()
 
 
-class TestImageBoundary(unittest.TestCase):
+class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
     def settings(self, **updates):
         return {**GUILD_DEFAULTS, **updates}
 
@@ -1839,9 +1694,10 @@ class TestImageBoundary(unittest.TestCase):
         attachment = fake_attachment(222222222222222222)
         message.attachments = [attachment]
 
+        selected = eligible_images([message], 987654321098765432, self.settings(image_detail="high"))
         self.assertEqual(
-            image_inputs([message], 987654321098765432, self.settings(image_detail="high")),
-            (ImageInput(message.id, attachment.id, attachment.url, "high"),),
+            [(item[0].id, item[1].id, item[2], item[3]) for item in selected],
+            [(message.id, attachment.id, attachment.url, "image/png")],
         )
         self.assertNotIn(attachment.url, json.dumps(message_record(message)))
 
@@ -1856,10 +1712,106 @@ class TestImageBoundary(unittest.TestCase):
         message.attachments = [attachment]
         message.embeds = [SimpleNamespace(title="x", description="x", url="http://10.0.0.1/a.png")]
 
-        selected = image_inputs([message], 987654321098765432, self.settings())
-        self.assertEqual(selected, (ImageInput(message.id, attachment.id, attachment.url, "auto"),))
-        self.assertTrue(selected[0].url.startswith("https://cdn.discordapp.com/attachments/"))
-        self.assertEqual(selected[0].url.split("/", 3)[2], "cdn.discordapp.com")
+        selected = eligible_images([message], 987654321098765432, self.settings())
+        self.assertEqual(len(selected), 1)
+        self.assertEqual((selected[0][0].id, selected[0][1].id), (message.id, attachment.id))
+        self.assertTrue(selected[0][2].startswith("https://cdn.discordapp.com/attachments/"))
+        self.assertEqual(selected[0][2].split("/", 3)[2], "cdn.discordapp.com")
+
+    async def test_fetch_downloads_once_per_attachment_and_reuses_the_cache(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        first = FakeMessage(111111111111111111, 444444444444444444, "a", 1)
+        first.attachments = [fake_attachment(222222222222222222)]
+        later = FakeMessage(111111111111111112, 444444444444444444, "b", 2)
+        later.attachments = [fake_attachment(222222222222222223)]
+        cog._download_image = AsyncMock(return_value=FAKE_DATA_URL)
+        cache: dict[int, str | None] = {}
+
+        first_turn = await cog.fetch_image_inputs([first], 987654321098765432, self.settings(), cache)
+        self.assertEqual(
+            first_turn, (ImageInput(first.id, 222222222222222222, FAKE_DATA_URL, "auto"),)
+        )
+        self.assertEqual(cog._download_image.await_count, 1)
+
+        # A message the channel-history tool added mid-run brings a new
+        # attachment; only that one is downloaded.
+        second_turn = await cog.fetch_image_inputs(
+            [first, later], 987654321098765432, self.settings(), cache
+        )
+        self.assertEqual([item.attachment_id for item in second_turn], [222222222222222222, 222222222222222223])
+        self.assertEqual(cog._download_image.await_count, 2)
+        self.assertEqual(sorted(cache), [222222222222222222, 222222222222222223])
+
+    async def test_one_unfetchable_attachment_is_skipped_not_fatal(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        message = FakeMessage(111111111111111111, 444444444444444444, "a", 1)
+        message.attachments = [fake_attachment(222222222222222222), fake_attachment(222222222222222223)]
+        cog._download_image = AsyncMock(side_effect=[None, FAKE_DATA_URL])
+        cache: dict[int, str | None] = {}
+
+        # The skip log lives in _download_image, which is replaced here; this
+        # test is about what the caller does with a None result.
+        selected = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), cache)
+        self.assertEqual([item.attachment_id for item in selected], [222222222222222223])
+        self.assertIsNone(cache[222222222222222222])
+
+        # A failed attachment is never retried on a later turn either.
+        again = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), cache)
+        self.assertEqual([item.attachment_id for item in again], [222222222222222223])
+        self.assertEqual(cog._download_image.await_count, 2)
+
+    async def test_encoded_total_budget_stops_before_the_request_cap(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        message = FakeMessage(111111111111111111, 444444444444444444, "a", 1)
+        message.attachments = [fake_attachment(222222222222222220 + index) for index in range(3)]
+        # Just under half the encoded budget each, so the third one cannot fit.
+        oversized = "data:image/png;base64," + "A" * (MAX_IMAGE_TOTAL_BYTES * 4 // 3 // 2 - 64)
+        cog._download_image = AsyncMock(return_value=oversized)
+        with self.assertLogs("red.nyancogs.channelsummary", level="WARNING") as logs:
+            selected = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), {})
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(logs.records[-1].reason, "total_budget")
+
+    def test_encoding_requires_the_bytes_to_match_the_declared_type(self) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + b"rest"
+        jpeg = b"\xff\xd8\xff" + b"rest"
+        webp = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"rest"
+        self.assertTrue(
+            channelsummary_module._encode_image("image/png", png).startswith("data:image/png;base64,")
+        )
+        self.assertTrue(channelsummary_module._encode_image("image/jpeg", jpeg))
+        self.assertTrue(channelsummary_module._encode_image("image/webp", webp))
+        for content_type, raw in (
+            ("image/png", jpeg),
+            ("image/jpeg", png),
+            ("image/webp", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"rest"),
+            ("image/png", b""),
+            ("image/png", b"\x89PNG\r\n\x1a\n" + b"x" * (MAX_IMAGE_BYTES + 1)),
+        ):
+            with self.subTest(content_type=content_type):
+                self.assertIsNone(channelsummary_module._encode_image(content_type, raw))
+
+    def test_no_discord_url_survives_into_the_request(self) -> None:
+        image = ImageInput(11, 22, FAKE_DATA_URL, "auto")
+        for dialect in ("openai_responses", "generic_chat"):
+            with self.subTest(dialect=dialect):
+                body = json.dumps(
+                    build_payload(
+                        profile(dialect),
+                        model="model-1",
+                        system="s",
+                        input_items="i",
+                        effort="medium",
+                        output_tokens=2_500,
+                        remaining_app_calls=0,
+                        remaining_hosted_calls=0,
+                        remaining_web_results=0,
+                        web_backend="off",
+                        images=(image,),
+                    )
+                )
+                self.assertNotIn("cdn.discordapp.com", body)
+                self.assertIn("data:image/png;base64,", body)
 
     def test_invalid_url_mime_suffix_dimensions_and_per_image_limits_are_skipped(self) -> None:
         valid_id = 222222222222222222
@@ -1877,12 +1829,12 @@ class TestImageBoundary(unittest.TestCase):
             fake_attachment(valid_id, size=0),
             fake_attachment(valid_id, width=0),
             fake_attachment(valid_id, height=0),
-            fake_attachment(valid_id, size=20 * 1024 * 1024 + 1),
+            fake_attachment(valid_id, size=4 * 1024 * 1024 + 1),
             fake_attachment(valid_id, width=5_001, height=5_000),
         )
         message = FakeMessage(111111111111111111, 444444444444444444, "x", 1)
         message.attachments = list(invalid)
-        self.assertEqual(image_inputs([message], 987654321098765432, self.settings()), ())
+        self.assertEqual(eligible_images([message], 987654321098765432, self.settings()), ())
 
     def test_count_and_aggregate_caps_keep_first_eligible_images_chronologically(self) -> None:
         messages = []
@@ -1890,24 +1842,24 @@ class TestImageBoundary(unittest.TestCase):
             message = FakeMessage(111111111111111111 + index, 444444444444444444, str(index), index)
             message.attachments = [fake_attachment(222222222222222222 + index)]
             messages.append(message)
-        selected = image_inputs(reversed(messages), 987654321098765432, self.settings())
+        selected = eligible_images(reversed(messages), 987654321098765432, self.settings())
         self.assertEqual(len(selected), 20)
-        self.assertIn("/222222222222222222/", selected[0].url)
-        self.assertIn("/222222222222222241/", selected[-1].url)
+        self.assertIn("/222222222222222222/", selected[0][2])
+        self.assertIn("/222222222222222241/", selected[-1][2])
 
         byte_limited = FakeMessage(333333333333333333, 444444444444444444, "bytes", 1)
         byte_limited.attachments = [
-            fake_attachment(333333333333333330 + index, size=20 * 1024 * 1024)
+            fake_attachment(333333333333333330 + index, size=4 * 1024 * 1024)
             for index in range(3)
         ]
-        self.assertEqual(len(image_inputs([byte_limited], 987654321098765432, self.settings())), 2)
+        self.assertEqual(len(eligible_images([byte_limited], 987654321098765432, self.settings())), 2)
 
         pixel_limited = FakeMessage(444444444444444444, 444444444444444444, "pixels", 1)
         pixel_limited.attachments = [
             fake_attachment(444444444444444440 + index, width=5_000, height=5_000)
             for index in range(5)
         ]
-        self.assertEqual(len(image_inputs([pixel_limited], 987654321098765432, self.settings())), 4)
+        self.assertEqual(len(eligible_images([pixel_limited], 987654321098765432, self.settings())), 4)
 
 
 class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
@@ -2927,6 +2879,13 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         }
         cog = object.__new__(ChannelSummary)
         cog._reserve_guild_attempt = AsyncMock()
+        # This test is about the cumulative deadline, so the whole image fetch is
+        # replaced: a real one opens an aiohttp session, and creating one calls
+        # time.monotonic, which this test patches with a fixed list. Image
+        # selection, caching and byte limits have their own tests.
+        cog.fetch_image_inputs = AsyncMock(
+            side_effect=[(), (ImageInput(older.id, 777777777777777777, FAKE_DATA_URL, "auto"),)]
+        )
         cog.request_provider = AsyncMock(
             side_effect=[
                 NormalizedResponse(None, None, (FunctionCall("call", "search_channel_history", args),), (), None, 0),
@@ -3958,7 +3917,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
 
 class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
     policy = "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations"
-    warning = "API keys and selected Discord data traverse the LAN unencrypted"
+    warning = "traverse the LAN unencrypted"
 
     async def test_provider_add_reports_validation_without_mutation(self) -> None:
         cog = object.__new__(ChannelSummary)
@@ -4169,10 +4128,7 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
     def test_retry_adds_only_the_specific_public_error_without_migrating_disclosure(self) -> None:
         self.assertEqual(DISCLOSURE_VERSION, 3)
         self.assertEqual(set(PUBLIC_ERRORS), set(ErrorCode))
-        self.assertEqual(
-            PUBLIC_ERRORS[ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT],
-            "The provider timed out downloading an image twice. Retry later or disable image summaries.",
-        )
+        self.assertNotIn("PROVIDER_IMAGE_FETCH_TIMEOUT", {code.value for code in ErrorCode})
 
     def test_forbidden_is_not_reported_as_a_credential_failure(self) -> None:
         forbidden = PUBLIC_ERRORS[ErrorCode.PROVIDER_FORBIDDEN].casefold()
@@ -4207,7 +4163,8 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("private Discord-derived search queries", normalized)
                 self.assertIn("fetch URLs", normalized)
                 self.assertIn("URLs, titles, snippets, and markdown", normalized)
-                self.assertIn("signed Discord CDN URLs", normalized)
+                self.assertIn("sends the image bytes inline", normalized)
+                self.assertIn("no Discord CDN URL leaves this bot", normalized)
                 self.assertIn("up to 20 stateless turns", normalized)
                 self.assertIn("retention and training are unverified", normalized)
                 self.assertIn("at most 5 Firecrawl calls", normalized)
