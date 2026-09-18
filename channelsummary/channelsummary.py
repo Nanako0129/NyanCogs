@@ -12,6 +12,7 @@ import socket
 import ssl
 import time
 from collections import defaultdict, deque
+from io import BytesIO
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -22,6 +23,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
+from PIL import Image, UnidentifiedImageError
 from redbot.core import Config, checks, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import pagify
@@ -57,13 +59,26 @@ MAX_REQUEST_BYTES = 18_000_000
 MAX_PROVIDER_PROFILES = 25
 MAX_OUTPUT_TOKENS = 50_000
 DISCLOSURE_VERSION = 3
-# Base64 costs four bytes per three, so these raw budgets are what MAX_REQUEST_BYTES
-# can actually carry once encoded. They are far below the old URL-era limits because
-# the bytes now cross the wire instead of a link to them.
-MAX_IMAGE_BYTES = 4 * 1024 * 1024
+# What one attachment may be downloaded as. Generous, because the bytes that
+# reach the provider are the re-encoded ones, not these.
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
-MAX_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
+# Pillow refuses to decode past this, so a small file claiming huge dimensions
+# cannot turn into gigabytes of decoded pixels.
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+MAX_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 20.0
+# Every attachment is downscaled and re-encoded before it is inlined. Measured
+# 2026-09-19 on gemini-3.8-flash through OpenRouter: 2048x2048, 1024x1024,
+# 768x768 and 512x512 all cost 1093 input tokens, so resolution buys nothing in
+# token price and only costs request bytes. 1024 keeps detail for providers that
+# do tile by resolution while cutting a phone photo by roughly an order of
+# magnitude. Re-encoding also drops EXIF, so camera GPS never reaches a provider.
+IMAGE_MAX_EDGE = 1024
+IMAGE_JPEG_QUALITY = 85
+# What the encoded images together may add to one request, well under
+# MAX_REQUEST_BYTES so the transcript always has room.
+MAX_INLINE_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_IMAGE_TOTAL_PIXELS = 100_000_000
 FIRECRAWL_ORIGIN = "https://api.firecrawl.dev"
 FIRECRAWL_HOST = "api.firecrawl.dev"
@@ -74,17 +89,18 @@ MAX_FIRECRAWL_CALLS_PER_RUN = 5
 _FIRECRAWL_ATTEMPTS: deque[float] = deque()
 _FIRECRAWL_QUOTA_LOCK = asyncio.Lock()
 DISCLOSURE_HTTP = (
-    "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP provider, API keys and "
-    "selected Discord data, and inlined image bytes traverse the LAN unencrypted. Use HTTP only on a "
+    "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP provider, "
+    "API keys, selected Discord data, and inlined image bytes traverse the LAN unencrypted. Use HTTP only "
     "trusted LAN."
 )
 # Same facts as before v3 acceptance, regrouped under bold labels so the settings
 # panel reads as a checklist instead of one paragraph. DISCLOSURE_VERSION stays 3.
 DISCLOSURE_TEXT = (
     "**To the LLM:** selected Discord message text, stable user/message IDs, timestamps, reply and embed "
-    "metadata. When images are enabled, the bot downloads the attachment and sends the image bytes inline, "
-    "so image content may be resent to the LLM across up to 20 stateless turns while no Discord CDN URL "
-    "leaves this bot. Provider retention and training are unverified.\n"
+    "metadata. When images are enabled, the bot downloads each attachment, downscales and re-encodes it, "
+    "then sends those bytes inline, so image content may be resent to the LLM across up to 20 stateless "
+    "turns while no Discord CDN URL leaves this bot and EXIF metadata such as camera GPS is discarded "
+    "before sending. Provider retention and training are unverified.\n"
     "**Firecrawl mode:** private Discord-derived search queries and fetch URLs are sent to Firecrawl; "
     "Firecrawl-returned URLs, titles, snippets, and markdown are sent to the LLM and may be resent across "
     "up to 20 stateless turns. Firecrawl retention and training are unverified, and its credits may incur "
@@ -1301,10 +1317,12 @@ def valid_image_url(attachment: discord.Attachment, channel_id: int) -> str | No
     return url
 
 
-IMAGE_MIME_RULES = {
-    "image/png": ((".png",), b"\x89PNG\r\n\x1a\n"),
-    "image/jpeg": ((".jpg", ".jpeg"), b"\xff\xd8\xff"),
-    "image/webp": ((".webp",), b"RIFF"),
+# Content type Discord declared -> filenames that may claim it. What the bytes
+# really are is decided by Pillow when they are decoded, not by this table.
+IMAGE_SUFFIXES = {
+    "image/png": (".png",),
+    "image/jpeg": (".jpg", ".jpeg"),
+    "image/webp": (".webp",),
 }
 
 
@@ -1331,9 +1349,9 @@ def eligible_images(
             width = getattr(attachment, "width", None)
             height = getattr(attachment, "height", None)
             if (
-                content_type not in IMAGE_MIME_RULES
+                content_type not in IMAGE_SUFFIXES
                 or not isinstance(filename, str)
-                or not filename.casefold().endswith(IMAGE_MIME_RULES[content_type][0])
+                or not filename.casefold().endswith(IMAGE_SUFFIXES[content_type])
                 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (size, width, height))
             ):
                 continue
@@ -1355,15 +1373,50 @@ def eligible_images(
     return tuple(result)
 
 
-def _encode_image(content_type: str, raw: bytes) -> str | None:
-    """A `data:` URI for bytes that really are the declared image type."""
-    if not raw or len(raw) > MAX_IMAGE_BYTES:
+def _transcode_image(raw: bytes) -> tuple[str, bytes] | None:
+    """Decode, downscale to `IMAGE_MAX_EDGE`, and re-encode; None if not an image.
+
+    Pillow decoding is the validator: bytes that are not a real image of a type
+    it supports raise here, which replaces the magic-number check the URL era
+    needed. Images carrying transparency stay PNG so a screenshot is not
+    flattened onto an invented background; everything else becomes JPEG, which
+    is where the size reduction comes from. Re-encoding drops EXIF, so a phone
+    photo's GPS tags never reach a provider.
+
+    CPU-bound, so callers run it off the event loop.
+    """
+    try:
+        with Image.open(BytesIO(raw)) as image:
+            image.load()
+            has_alpha = image.mode in {"RGBA", "LA", "PA"} or "transparency" in image.info
+            image = image.convert("RGBA" if has_alpha else "RGB")
+            width, height = image.size
+            longest = max(width, height)
+            if longest > IMAGE_MAX_EDGE:
+                scale = IMAGE_MAX_EDGE / longest
+                image = image.resize(
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    Image.LANCZOS,
+                )
+            buffer = BytesIO()
+            if has_alpha:
+                image.save(buffer, format="PNG", optimize=True)
+                return "image/png", buffer.getvalue()
+            image.save(buffer, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
+            return "image/jpeg", buffer.getvalue()
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
         return None
-    if not raw.startswith(IMAGE_MIME_RULES[content_type][1]):
+
+
+def _encode_image(raw: bytes) -> str | None:
+    """A `data:` URI for one attachment, downscaled and re-encoded."""
+    if not raw:
         return None
-    if content_type == "image/webp" and raw[8:12] != b"WEBP":
+    transcoded = _transcode_image(raw)
+    if transcoded is None:
         return None
-    return f"data:{content_type};base64,{base64.b64encode(raw).decode('ascii')}"
+    content_type, encoded = transcoded
+    return f"data:{content_type};base64,{base64.b64encode(encoded).decode('ascii')}"
 
 
 def message_record(message: discord.Message) -> dict[str, Any]:
@@ -1929,10 +1982,8 @@ class ChannelSummary(commands.Cog):
             async with aiohttp.ClientSession(
                 timeout=timeout, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
             ) as session:
-                for _message, attachment, url, content_type in missing:
-                    cache[attachment.id] = await self._download_image(
-                        session, url, content_type
-                    )
+                for _message, attachment, url, _content_type in missing:
+                    cache[attachment.id] = await self._download_image(session, url)
         detail = str(settings["image_detail"])
         result: list[ImageInput] = []
         total = 0
@@ -1943,17 +1994,15 @@ class ChannelSummary(commands.Cog):
             # Base64 is four bytes per three; the encoded length is what the
             # request actually has to carry.
             encoded = len(data_url)
-            if total + encoded > MAX_IMAGE_TOTAL_BYTES * 4 // 3:
+            if total + encoded > MAX_INLINE_IMAGE_BYTES:
                 _log_image_skipped("total_budget", 0)
                 break
             total += encoded
             result.append(ImageInput(message.id, attachment.id, data_url, detail))
         return tuple(result)
 
-    async def _download_image(
-        self, session: aiohttp.ClientSession, url: str, content_type: str
-    ) -> str | None:
-        """One bounded attachment download, or None with a fixed-reason log."""
+    async def _download_image(self, session: aiohttp.ClientSession, url: str) -> str | None:
+        """Download one attachment and re-encode it, or None with a fixed log."""
         try:
             async with session.get(url, allow_redirects=False) as response:
                 if response.status != 200:
@@ -1966,9 +2015,11 @@ class ChannelSummary(commands.Cog):
         except SummaryError:
             _log_image_skipped("too_large", 0)
             return None
-        data_url = _encode_image(content_type, raw)
+        # Decoding and resizing a 25 MP image blocks long enough to stall the
+        # gateway heartbeat, so it never runs on the event loop.
+        data_url = await asyncio.to_thread(_encode_image, raw)
         if data_url is None:
-            _log_image_skipped("content_mismatch", 0)
+            _log_image_skipped("not_an_image", 0)
         return data_url
 
     async def request_provider(

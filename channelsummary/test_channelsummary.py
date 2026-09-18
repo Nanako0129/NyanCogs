@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import inspect
 import json
 import logging
@@ -19,6 +21,7 @@ from unittest.mock import ANY, AsyncMock
 from unittest.mock import MagicMock, patch
 
 import discord
+from PIL import Image
 from redbot.core import commands
 
 from . import channelsummary as channelsummary_module
@@ -42,9 +45,10 @@ from .channelsummary import (
     Citation,
     FunctionCall,
     IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+    IMAGE_MAX_EDGE,
     ImageInput,
     MAX_IMAGE_BYTES,
-    MAX_IMAGE_TOTAL_BYTES,
+    MAX_INLINE_IMAGE_BYTES,
     NormalizedResponse,
     ProviderProfile,
     RATE_LIMIT_HEADROOM_SECONDS,
@@ -1765,31 +1769,90 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
         message = FakeMessage(111111111111111111, 444444444444444444, "a", 1)
         message.attachments = [fake_attachment(222222222222222220 + index) for index in range(3)]
         # Just under half the encoded budget each, so the third one cannot fit.
-        oversized = "data:image/png;base64," + "A" * (MAX_IMAGE_TOTAL_BYTES * 4 // 3 // 2 - 64)
+        oversized = "data:image/png;base64," + "A" * (MAX_INLINE_IMAGE_BYTES // 2 - 64)
         cog._download_image = AsyncMock(return_value=oversized)
         with self.assertLogs("red.nyancogs.channelsummary", level="WARNING") as logs:
             selected = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), {})
         self.assertEqual(len(selected), 2)
         self.assertEqual(logs.records[-1].reason, "total_budget")
 
-    def test_encoding_requires_the_bytes_to_match_the_declared_type(self) -> None:
-        png = b"\x89PNG\r\n\x1a\n" + b"rest"
-        jpeg = b"\xff\xd8\xff" + b"rest"
-        webp = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"rest"
-        self.assertTrue(
-            channelsummary_module._encode_image("image/png", png).startswith("data:image/png;base64,")
+    @staticmethod
+    def sample_png(width: int, height: int, *, alpha: bool = False) -> bytes:
+        image = Image.new("RGBA" if alpha else "RGB", (width, height))
+        image.putdata(
+            [
+                ((x * 7) % 256, (y * 13) % 256, (x + y) % 256) + ((128,) if alpha else ())
+                for y in range(height)
+                for x in range(width)
+            ]
         )
-        self.assertTrue(channelsummary_module._encode_image("image/jpeg", jpeg))
-        self.assertTrue(channelsummary_module._encode_image("image/webp", webp))
-        for content_type, raw in (
-            ("image/png", jpeg),
-            ("image/jpeg", png),
-            ("image/webp", b"RIFF" + b"\x00" * 4 + b"WAVE" + b"rest"),
-            ("image/png", b""),
-            ("image/png", b"\x89PNG\r\n\x1a\n" + b"x" * (MAX_IMAGE_BYTES + 1)),
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def test_large_images_are_downscaled_and_reencoded_as_jpeg(self) -> None:
+        raw = self.sample_png(2048, 1024)
+        data_url = channelsummary_module._encode_image(raw)
+        self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+        decoded = base64.b64decode(data_url.split(",", 1)[1])
+        with Image.open(io.BytesIO(decoded)) as out:
+            # Long edge capped, aspect ratio kept.
+            self.assertEqual(out.size, (IMAGE_MAX_EDGE, IMAGE_MAX_EDGE // 2))
+            self.assertLessEqual(max(out.size), IMAGE_MAX_EDGE)
+
+
+    def test_transparency_survives_as_png_and_small_images_are_not_upscaled(self) -> None:
+        raw = self.sample_png(64, 48, alpha=True)
+        data_url = channelsummary_module._encode_image(raw)
+        self.assertTrue(data_url.startswith("data:image/png;base64,"))
+        with Image.open(io.BytesIO(base64.b64decode(data_url.split(",", 1)[1]))) as out:
+            self.assertEqual(out.size, (64, 48))
+            self.assertIn("A", out.getbands())
+
+    def test_exif_is_dropped_by_the_re_encode(self) -> None:
+        image = Image.new("RGB", (32, 32))
+        exif = image.getexif()
+        exif[0x9286] = "secret location note"
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", exif=exif)
+        original = buffer.getvalue()
+        self.assertIn(b"secret location note", original)
+        decoded = base64.b64decode(
+            channelsummary_module._encode_image(original).split(",", 1)[1]
+        )
+        self.assertNotIn(b"secret location note", decoded)
+
+    async def test_transcoding_runs_off_the_event_loop(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        raw = self.sample_png(2048, 2048)
+        response = MagicMock()
+        response.status = 200
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=response)
+        context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get.return_value = context
+        handed_off = []
+
+        async def recording_to_thread(func, *args):
+            handed_off.append(func)
+            return func(*args)
+
+        with (
+            patch("channelsummary.channelsummary.read_bounded_response", AsyncMock(return_value=raw)),
+            patch("channelsummary.channelsummary.asyncio.to_thread", new=recording_to_thread),
         ):
-            with self.subTest(content_type=content_type):
-                self.assertIsNone(channelsummary_module._encode_image(content_type, raw))
+            data_url = await cog._download_image(session, "https://cdn.discordapp.com/attachments/1/2/a.png")
+
+        self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+        # Decoding and resizing a 25 MP image on the event loop would stall the
+        # gateway heartbeat, so the work has to leave it.
+        self.assertEqual(handed_off, [channelsummary_module._encode_image])
+
+    def test_bytes_that_are_not_an_image_are_rejected(self) -> None:
+        for raw in (b"", b"not an image at all", b"\x89PNG\r\n\x1a\n" + b"truncated"):
+            with self.subTest(raw=raw[:12]):
+                self.assertIsNone(channelsummary_module._encode_image(raw))
 
     def test_no_discord_url_survives_into_the_request(self) -> None:
         image = ImageInput(11, 22, FAKE_DATA_URL, "auto")
@@ -1829,7 +1892,7 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
             fake_attachment(valid_id, size=0),
             fake_attachment(valid_id, width=0),
             fake_attachment(valid_id, height=0),
-            fake_attachment(valid_id, size=4 * 1024 * 1024 + 1),
+            fake_attachment(valid_id, size=20 * 1024 * 1024 + 1),
             fake_attachment(valid_id, width=5_001, height=5_000),
         )
         message = FakeMessage(111111111111111111, 444444444444444444, "x", 1)
@@ -1849,7 +1912,7 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
 
         byte_limited = FakeMessage(333333333333333333, 444444444444444444, "bytes", 1)
         byte_limited.attachments = [
-            fake_attachment(333333333333333330 + index, size=4 * 1024 * 1024)
+            fake_attachment(333333333333333330 + index, size=20 * 1024 * 1024)
             for index in range(3)
         ]
         self.assertEqual(len(eligible_images([byte_limited], 987654321098765432, self.settings())), 2)
@@ -4163,8 +4226,9 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("private Discord-derived search queries", normalized)
                 self.assertIn("fetch URLs", normalized)
                 self.assertIn("URLs, titles, snippets, and markdown", normalized)
-                self.assertIn("sends the image bytes inline", normalized)
+                self.assertIn("re-encodes it, then sends those bytes inline", normalized)
                 self.assertIn("no Discord CDN URL leaves this bot", normalized)
+                self.assertIn("EXIF metadata such as camera GPS is discarded", normalized)
                 self.assertIn("up to 20 stateless turns", normalized)
                 self.assertIn("retention and training are unverified", normalized)
                 self.assertIn("at most 5 Firecrawl calls", normalized)

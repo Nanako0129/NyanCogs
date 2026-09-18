@@ -98,15 +98,17 @@ restart clears the in-memory pool, and multiple processes multiply the cap.
 Firecrawl cloud is trusted to control target DNS, redirects, and SSRF; DNS
 rebinding and split-horizon behavior remain residual vendor risk.
 
-When images are enabled, the bot downloads the attachment and sends the image
-bytes inline, so image content may be resent to the LLM across up to 20 stateless
-turns while no Discord CDN URL leaves this bot. Provider retention and training are
-unverified. Images are limited to 4 MiB and 25 MP each, 10 MiB and 100 MP total,
-and the first 20 eligible attachments in chronological order, because the bytes
-now travel inside the request instead of a link to them. ChannelSummary
+When images are enabled, the bot downloads each attachment, downscales it to a
+1024-pixel long edge and re-encodes it, then sends those bytes inline, so image
+content may be resent to the LLM across up to 20 stateless turns while no Discord
+CDN URL leaves this bot and EXIF metadata such as camera GPS is discarded before
+sending. Provider retention and training are unverified. Attachments are limited
+to 20 MiB and 25 MP each, 50 MiB and 100 MP total, and the first 20 eligible ones
+in chronological order; the re-encoded images together may add at most 12 MiB to
+a request. ChannelSummary
 does not persist messages, prompts, searches, provider responses, or summaries.
-With an HTTP provider, API keys and selected Discord data traverse the LAN
-unencrypted, as do inlined image bytes. Use HTTP only on a trusted LAN. Its complete
+With an HTTP provider, API keys, selected Discord data, and inlined image bytes
+traverse the LAN unencrypted. Use HTTP only on a trusted LAN. Its complete
 statement is in
 [`channelsummary/info.json`](channelsummary/info.json).
 
