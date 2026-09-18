@@ -44,6 +44,9 @@ from .channelsummary import (
     ImageInput,
     NormalizedResponse,
     ProviderProfile,
+    RATE_LIMIT_HEADROOM_SECONDS,
+    RATE_LIMIT_MAX_DELAY_SECONDS,
+    RATE_LIMIT_MAX_RETRIES,
     RunState,
     SummaryTopic,
     SummaryError,
@@ -316,8 +319,11 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
         resolver = MagicMock()
         resolver.close = AsyncMock()
         response_contexts = []
-        for status, body in responses:
-            response = SimpleNamespace(status=status, body=body)
+        for entry in responses:
+            status, body = entry[0], entry[1]
+            response = SimpleNamespace(
+                status=status, body=body, headers=entry[2] if len(entry) > 2 else {}
+            )
             context = MagicMock()
             context.__aenter__ = AsyncMock(return_value=response)
             context.__aexit__ = AsyncMock(return_value=False)
@@ -698,16 +704,105 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
             self.transport.sleep.assert_not_awaited()
 
     async def test_other_http_status_never_reads_body_or_retries(self) -> None:
+        # 429 is retried on its own schedule now, so this uses a status that is
+        # still terminal on the first response.
         with self.assertRaises(SummaryError) as caught:
             await self.request_with_transport(
                 profile("openai_responses"),
                 self.image_payload(),
-                ((429, self.image_timeout_body),),
+                ((500, self.image_timeout_body),),
             )
-        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_RATE_LIMIT)
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_UNAVAILABLE)
         self.assertEqual(self.transport.session.post.call_count, 1)
         self.transport.read.assert_not_awaited()
         self.transport.sleep.assert_not_awaited()
+
+    async def test_rate_limit_retries_with_backoff_then_succeeds(self) -> None:
+        with self.assertLogs("red.nyancogs.channelsummary", level="WARNING") as logs:
+            result = await self.request_with_transport(
+                profile("openai_responses"),
+                self.image_payload(),
+                ((429, b""), (429, b""), (200, b'{"ok":true}')),
+            )
+        self.assertEqual(result, NormalizedResponse("ok", None, (), (), "model-1", 0))
+        self.assertEqual(self.transport.session.post.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in self.transport.sleep.await_args_list], [2.0, 4.0]
+        )
+        record = logs.records[0]
+        self.assertEqual(
+            (record.event, record.reason, record.status, record.attempt),
+            ("provider_retry", "rate_limited", 429, 2),
+        )
+        self.assertEqual(logs.records[1].attempt, 3)
+
+    async def test_rate_limit_gives_up_after_a_bounded_number_of_retries(self) -> None:
+        with self.assertRaises(SummaryError) as caught, self.assertLogs(
+            "red.nyancogs.channelsummary", level="WARNING"
+        ):
+            await self.request_with_transport(
+                profile("openai_responses"),
+                self.image_payload(),
+                tuple((429, b"") for _ in range(5)),
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_RATE_LIMIT)
+        self.assertEqual(self.transport.session.post.call_count, RATE_LIMIT_MAX_RETRIES + 1)
+        self.assertEqual(
+            [call.args[0] for call in self.transport.sleep.await_args_list], [2.0, 4.0, 8.0]
+        )
+
+    async def test_retry_after_is_honoured_and_an_unwaitable_one_fails_immediately(self) -> None:
+        result = await self.request_with_transport(
+            profile("openai_responses"),
+            self.image_payload(),
+            ((429, b"", {"Retry-After": "1"}), (200, b'{"ok":true}')),
+        )
+        self.assertEqual(result.text, "ok")
+        self.assertEqual([call.args[0] for call in self.transport.sleep.await_args_list], [1.0])
+
+        with self.assertRaises(SummaryError) as caught:
+            await self.request_with_transport(
+                profile("openai_responses"),
+                self.image_payload(),
+                ((429, b"", {"Retry-After": "3600"}), (200, b'{"ok":true}')),
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_RATE_LIMIT)
+        self.assertEqual(self.transport.session.post.call_count, 1)
+        self.transport.sleep.assert_not_awaited()
+
+    async def test_rate_limit_never_waits_past_the_runs_remaining_budget(self) -> None:
+        provider = profile("openai_responses")
+        payload = self.image_payload()
+        with self.assertRaises(SummaryError) as caught:
+            await self.request_with_transport(
+                provider,
+                payload,
+                ((429, b""), (200, b'{"ok":true}')),
+                operation=lambda cog: cog.request_provider(
+                    provider, payload, timeout_seconds=RATE_LIMIT_HEADROOM_SECONDS + 1
+                ),
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_RATE_LIMIT)
+        self.assertEqual(self.transport.session.post.call_count, 1)
+        self.transport.sleep.assert_not_awaited()
+
+    def test_rate_limit_delay_handles_every_retry_after_shape(self) -> None:
+        for header, prior, expected in (
+            (None, 0, 2.0),
+            (None, 1, 4.0),
+            (None, 9, RATE_LIMIT_MAX_DELAY_SECONDS),
+            ("0", 0, 0.0),
+            (" 7 ", 0, 7.0),
+            (str(RATE_LIMIT_MAX_DELAY_SECONDS), 0, RATE_LIMIT_MAX_DELAY_SECONDS),
+            ("31", 0, None),
+            ("inf", 0, None),
+            ("-5", 0, 2.0),
+            ("nan", 0, 2.0),
+            ("Wed, 21 Oct 2026 07:28:00 GMT", 0, 2.0),
+            ("", 0, 2.0),
+        ):
+            with self.subTest(header=header):
+                self.assertEqual(channelsummary_module._rate_limit_delay(header, prior), expected)
 
     async def test_retry_sleep_and_second_attempt_expiry_remain_provider_timeout(self) -> None:
         cases = (

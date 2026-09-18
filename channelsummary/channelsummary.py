@@ -38,6 +38,15 @@ SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 SAFE_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
 MAX_RESPONSE_BYTES = 2_097_152
 MAX_PROVIDER_ERROR_BYTES = 65_536
+# A 429 refuses the request before the model runs, so one summary can retry it a
+# few times. Every wait is spent from the run's own remaining budget, never added
+# to it, so these values cannot extend a summary past request_timeout_seconds.
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_BASE_DELAY_SECONDS = 2.0
+RATE_LIMIT_MAX_DELAY_SECONDS = 30.0
+# Sleeping until there is no time left to send the retry wastes the wait and
+# reports a timeout instead of the rate limit that actually happened.
+RATE_LIMIT_HEADROOM_SECONDS = 5.0
 MAX_FIRECRAWL_RESPONSE_BYTES = 1_048_576
 MAX_REQUEST_BYTES = 1_048_576
 MAX_PROVIDER_PROFILES = 25
@@ -1109,6 +1118,58 @@ def _http_error(status: int) -> ErrorCode:
     return ErrorCode.PROVIDER_REJECTED
 
 
+def _rate_limit_delay(retry_after: str | None, prior_retries: int) -> float | None:
+    """Seconds to wait before retrying a 429, or None when waiting cannot help.
+
+    A `Retry-After` that parses to a non-negative number within the cap is
+    honoured as given, because the provider knows its own window better than a
+    fixed schedule does. One above the cap (infinity included) returns None:
+    the provider is asking for longer than a single summary may wait, so
+    failing now is honest and cheaper than sleeping first. Anything else, a
+    missing header, an HTTP-date, a negative or NaN, falls back to bounded
+    exponential backoff.
+    """
+    if retry_after is not None:
+        try:
+            seconds = float(retry_after.strip())
+        except (AttributeError, TypeError, ValueError):
+            pass
+        else:
+            if 0 <= seconds <= RATE_LIMIT_MAX_DELAY_SECONDS:
+                return seconds
+            if seconds > RATE_LIMIT_MAX_DELAY_SECONDS:
+                return None
+    return min(
+        RATE_LIMIT_BASE_DELAY_SECONDS * (2**prior_retries),
+        RATE_LIMIT_MAX_DELAY_SECONDS,
+    )
+
+
+def _log_provider_retry(
+    profile: ProviderProfile, reason: str, attempt: int, status: int, started_at: float
+) -> None:
+    """Record a bounded retry with fixed fields only; no body, URL, or token."""
+    dialect = profile.dialect if profile.dialect in DIALECT_PATHS else "unknown"
+    elapsed_ms = min(max(int((time.monotonic() - started_at) * 1_000), 0), 3_600_000)
+    log.warning(
+        "channelsummary.provider_retry reason=%s "
+        "dialect=%s attempt=%d status=%d elapsed_ms=%d",
+        reason,
+        dialect,
+        attempt,
+        status,
+        elapsed_ms,
+        extra={
+            "event": "provider_retry",
+            "reason": reason,
+            "dialect": dialect,
+            "attempt": attempt,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+        },
+    )
+
+
 def _reject_json_constant(_value: str) -> None:
     raise ValueError
 
@@ -1878,7 +1939,9 @@ class ChannelSummary(commands.Cog):
                     trust_env=False,
                     cookie_jar=aiohttp.DummyCookieJar(),
                 ) as session:
-                    for attempt in (1, 2):
+                    image_retry_used = False
+                    rate_limit_retries = 0
+                    while True:
                         async with session.post(
                             endpoint,
                             data=encoded,
@@ -1888,41 +1951,47 @@ class ChannelSummary(commands.Cog):
                             if 200 <= response.status < 300:
                                 raw = await read_bounded_response(response)
                                 break
-                            if response.status != 400 or not retry_image_fetch:
-                                raise SummaryError(_http_error(response.status))
-                            try:
-                                error_raw = await read_bounded_response(
-                                    response, MAX_PROVIDER_ERROR_BYTES
+                            if response.status == 429:
+                                delay = _rate_limit_delay(
+                                    getattr(response, "headers", {}).get("Retry-After"),
+                                    rate_limit_retries,
                                 )
-                            except SummaryError as error:
-                                if error.code is ErrorCode.RESPONSE_TOO_LARGE:
-                                    raise SummaryError(_http_error(response.status)) from None
-                                raise
-                            if not _is_provider_image_fetch_timeout(error_raw):
+                                remaining = timeout_seconds - (time.monotonic() - started_at)
+                                if (
+                                    delay is None
+                                    or rate_limit_retries >= RATE_LIMIT_MAX_RETRIES
+                                    or remaining - delay < RATE_LIMIT_HEADROOM_SECONDS
+                                ):
+                                    raise SummaryError(ErrorCode.PROVIDER_RATE_LIMIT)
+                                rate_limit_retries += 1
+                                # A 429 is a refusal to accept the request, not a
+                                # failed generation, so retrying does not repeat a
+                                # provider charge the way the image retry below can.
+                                _log_provider_retry(
+                                    profile, "rate_limited", rate_limit_retries + 1, 429, started_at
+                                )
+                            elif response.status == 400 and retry_image_fetch:
+                                try:
+                                    error_raw = await read_bounded_response(
+                                        response, MAX_PROVIDER_ERROR_BYTES
+                                    )
+                                except SummaryError as error:
+                                    if error.code is ErrorCode.RESPONSE_TOO_LARGE:
+                                        raise SummaryError(_http_error(response.status)) from None
+                                    raise
+                                if not _is_provider_image_fetch_timeout(error_raw):
+                                    raise SummaryError(_http_error(response.status))
+                                if image_retry_used:
+                                    raise SummaryError(ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT)
+                                image_retry_used = True
+                                delay = 1
+                                # A retry may incur a second provider charge; never retry more than once.
+                                _log_provider_retry(
+                                    profile, "image_url_download_timeout", 2, 400, started_at
+                                )
+                            else:
                                 raise SummaryError(_http_error(response.status))
-                            if attempt == 2:
-                                raise SummaryError(ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT)
-                            # A retry may incur a second provider charge; never retry more than once.
-                            dialect = profile.dialect if profile.dialect in DIALECT_PATHS else "unknown"
-                            elapsed_ms = min(
-                                max(int((time.monotonic() - started_at) * 1_000), 0),
-                                3_600_000,
-                            )
-                            log.warning(
-                                "channelsummary.provider_retry reason=image_url_download_timeout "
-                                "dialect=%s attempt=2 status=400 elapsed_ms=%d",
-                                dialect,
-                                elapsed_ms,
-                                extra={
-                                    "event": "provider_retry",
-                                    "reason": "image_url_download_timeout",
-                                    "dialect": dialect,
-                                    "attempt": 2,
-                                    "status": 400,
-                                    "elapsed_ms": elapsed_ms,
-                                },
-                            )
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(delay)
         except asyncio.TimeoutError:
             raise SummaryError(ErrorCode.PROVIDER_TIMEOUT) from None
         except aiohttp.ClientError:
