@@ -46,7 +46,6 @@ from .channelsummary import (
     Citation,
     FunctionCall,
     IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
-    IMAGE_MAX_EDGE,
     ImageInput,
     MAX_IMAGE_BYTES,
     MAX_INLINE_IMAGE_BYTES,
@@ -1793,18 +1792,17 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
 
     def test_large_images_are_downscaled_and_reencoded_as_jpeg(self) -> None:
         raw = self.sample_png(2048, 1024)
-        data_url = channelsummary_module._encode_image(raw)
+        data_url = channelsummary_module._encode_image(raw, 1024)
         self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
         decoded = base64.b64decode(data_url.split(",", 1)[1])
         with Image.open(io.BytesIO(decoded)) as out:
             # Long edge capped, aspect ratio kept.
-            self.assertEqual(out.size, (IMAGE_MAX_EDGE, IMAGE_MAX_EDGE // 2))
-            self.assertLessEqual(max(out.size), IMAGE_MAX_EDGE)
+            self.assertEqual(out.size, (1024, 512))
 
 
     def test_transparency_survives_as_png_and_small_images_are_not_upscaled(self) -> None:
         raw = self.sample_png(64, 48, alpha=True)
-        data_url = channelsummary_module._encode_image(raw)
+        data_url = channelsummary_module._encode_image(raw, 1024)
         self.assertTrue(data_url.startswith("data:image/png;base64,"))
         with Image.open(io.BytesIO(base64.b64decode(data_url.split(",", 1)[1]))) as out:
             self.assertEqual(out.size, (64, 48))
@@ -1819,7 +1817,7 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
         original = buffer.getvalue()
         self.assertIn(b"secret location note", original)
         decoded = base64.b64decode(
-            channelsummary_module._encode_image(original).split(",", 1)[1]
+            channelsummary_module._encode_image(original, 1024).split(",", 1)[1]
         )
         self.assertNotIn(b"secret location note", decoded)
 
@@ -1880,17 +1878,48 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
             patch("channelsummary.channelsummary.read_bounded_response", AsyncMock(return_value=raw)),
             patch("channelsummary.channelsummary.asyncio.to_thread", new=recording_to_thread),
         ):
-            data_url = await cog._download_image(session, "https://cdn.discordapp.com/attachments/1/2/a.png", 20.0)
+            data_url = await cog._download_image(session, "https://cdn.discordapp.com/attachments/1/2/a.png", 20.0, 1024)
 
         self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
         # Decoding and resizing a 25 MP image on the event loop would stall the
         # gateway heartbeat, so the work has to leave it.
         self.assertEqual(handed_off, [channelsummary_module._encode_image])
 
+    def test_image_max_edge_is_a_guild_setting_with_a_4k_default(self) -> None:
+        self.assertEqual(GUILD_DEFAULTS["image_max_edge"], 3840)
+        self.assertEqual(ChannelSummary._parse_setting_value("image_max_edge", "4096"), 4096)
+        self.assertEqual(ChannelSummary._parse_setting_value("image_max_edge", "256"), 256)
+        for value in ("255", "4097"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ChannelSummary._parse_setting_value("image_max_edge", value)
+
+    def test_the_configured_edge_is_what_the_transcode_applies(self) -> None:
+        raw = self.sample_png(4000, 2000)
+        for max_edge, expected in ((3840, (3840, 1920)), (1024, (1024, 512)), (256, (256, 128))):
+            with self.subTest(max_edge=max_edge):
+                data_url = channelsummary_module._encode_image(raw, max_edge)
+                decoded = base64.b64decode(data_url.split(",", 1)[1])
+                with Image.open(io.BytesIO(decoded)) as out:
+                    self.assertEqual(out.size, expected)
+
+    async def test_the_guild_setting_reaches_the_download(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        message = FakeMessage(111111111111111111, 444444444444444444, "a", 1)
+        message.attachments = [fake_attachment(222222222222222222)]
+        cog._download_image = AsyncMock(return_value=FAKE_DATA_URL)
+        await cog.fetch_image_inputs(
+            [message],
+            987654321098765432,
+            self.settings(image_max_edge=1536),
+            {},
+            time.monotonic() + 600,
+        )
+        self.assertEqual(cog._download_image.await_args.args[3], 1536)
+
     def test_bytes_that_are_not_an_image_are_rejected(self) -> None:
         for raw in (b"", b"not an image at all", b"\x89PNG\r\n\x1a\n" + b"truncated"):
             with self.subTest(raw=raw[:12]):
-                self.assertIsNone(channelsummary_module._encode_image(raw))
+                self.assertIsNone(channelsummary_module._encode_image(raw, 1024))
 
     def test_no_discord_url_survives_into_the_request(self) -> None:
         image = ImageInput(11, 22, FAKE_DATA_URL, "auto")

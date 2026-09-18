@@ -71,17 +71,20 @@ IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 20.0
 # Starting a download with less than this left cannot finish one, and the wait
 # is spent holding the channel lock and the guild semaphore.
 IMAGE_DOWNLOAD_MIN_SECONDS = 2.0
-# Every attachment is downscaled and re-encoded before it is inlined. Measured
-# 2026-09-19 on gemini-3.8-flash through OpenRouter: 2048x2048, 1024x1024,
-# 768x768 and 512x512 all cost 1093 input tokens, so resolution buys nothing in
-# token price and only costs request bytes. 1024 keeps detail for providers that
-# do tile by resolution while cutting a phone photo by roughly an order of
-# magnitude. Re-encoding also drops EXIF, so camera GPS never reaches a provider.
-IMAGE_MAX_EDGE = 1024
+# Every attachment is downscaled to the guild's `image_max_edge` and re-encoded
+# before it is inlined. Measured 2026-09-19 on gemini-3.8-flash through
+# OpenRouter: 4K, 2048 and 1024 versions of one screenshot all cost 1121 input
+# tokens and all read back the same 4.3-pixel-tall verification code, so that
+# provider normalizes resolution and the extra pixels buy nothing there. Other
+# providers tile by resolution, and a real screenshot degrades faster than the
+# flat synthetic one that was measured, so the ceiling is a guild setting rather
+# than a number chosen here. Re-encoding also drops EXIF, so camera GPS never
+# reaches a provider.
 IMAGE_JPEG_QUALITY = 85
-# What the encoded images together may add to one request, well under
-# MAX_REQUEST_BYTES so the transcript always has room.
-MAX_INLINE_IMAGE_BYTES = 12 * 1024 * 1024
+# What the encoded images together may add to one request. Below
+# MAX_REQUEST_BYTES by more than `max_input_chars` can be, so the transcript
+# always has room no matter how large the images are.
+MAX_INLINE_IMAGE_BYTES = 16_000_000
 MAX_IMAGE_TOTAL_PIXELS = 100_000_000
 FIRECRAWL_ORIGIN = "https://api.firecrawl.dev"
 FIRECRAWL_HOST = "api.firecrawl.dev"
@@ -142,6 +145,7 @@ GUILD_DEFAULTS: dict[str, Any] = {
     "max_output_tokens": 16_000,
     "image_enabled": True,
     "image_detail": "auto",
+    "image_max_edge": 3840,
     "max_images": 20,
     "web_enabled": True,
     "web_mode": "auto",
@@ -171,6 +175,7 @@ SETTING_RULES: dict[str, tuple[type, Any, Any] | tuple[type, set[Any]]] = {
     "max_output_tokens": (int, 256, MAX_OUTPUT_TOKENS),
     "image_enabled": (bool, None, None),
     "image_detail": (str, {"low", "auto", "high", "original"}),
+    "image_max_edge": (int, 256, 4096),
     "max_images": (int, 0, 20),
     "web_enabled": (bool, None, None),
     "web_mode": (str, {"auto", "native", "firecrawl"}),
@@ -1376,8 +1381,8 @@ def eligible_images(
     return tuple(result)
 
 
-def _transcode_image(raw: bytes) -> tuple[str, bytes] | None:
-    """Decode, downscale to `IMAGE_MAX_EDGE`, and re-encode; None if not an image.
+def _transcode_image(raw: bytes, max_edge: int) -> tuple[str, bytes] | None:
+    """Decode, downscale to `max_edge`, and re-encode; None if not an image.
 
     Pillow decoding is the validator: bytes that are not a real image of a type
     it supports raise here, which replaces the magic-number check the URL era
@@ -1395,8 +1400,8 @@ def _transcode_image(raw: bytes) -> tuple[str, bytes] | None:
             image = image.convert("RGBA" if has_alpha else "RGB")
             width, height = image.size
             longest = max(width, height)
-            if longest > IMAGE_MAX_EDGE:
-                scale = IMAGE_MAX_EDGE / longest
+            if longest > max_edge:
+                scale = max_edge / longest
                 image = image.resize(
                     (max(1, round(width * scale)), max(1, round(height * scale))),
                     Image.LANCZOS,
@@ -1411,11 +1416,11 @@ def _transcode_image(raw: bytes) -> tuple[str, bytes] | None:
         return None
 
 
-def _encode_image(raw: bytes) -> str | None:
+def _encode_image(raw: bytes, max_edge: int) -> str | None:
     """A `data:` URI for one attachment, downscaled and re-encoded."""
     if not raw:
         return None
-    transcoded = _transcode_image(raw)
+    transcoded = _transcode_image(raw, max_edge)
     if transcoded is None:
         return None
     content_type, encoded = transcoded
@@ -1708,7 +1713,7 @@ SETTINGS_CATEGORIES = {
         "max_input_chars",
         "max_output_tokens",
     ),
-    "images": ("image_enabled", "image_detail", "max_images"),
+    "images": ("image_enabled", "image_detail", "image_max_edge", "max_images"),
     "web": (
         "web_enabled",
         "web_mode",
@@ -1995,7 +2000,10 @@ class ChannelSummary(commands.Cog):
                         _log_image_skipped("deadline", 0)
                         break
                     cache[attachment.id] = await self._download_image(
-                        session, url, min(IMAGE_DOWNLOAD_TIMEOUT_SECONDS, remaining)
+                        session,
+                        url,
+                        min(IMAGE_DOWNLOAD_TIMEOUT_SECONDS, remaining),
+                        int(settings["image_max_edge"]),
                     )
         detail = str(settings["image_detail"])
         result: list[ImageInput] = []
@@ -2015,7 +2023,7 @@ class ChannelSummary(commands.Cog):
         return tuple(result)
 
     async def _download_image(
-        self, session: aiohttp.ClientSession, url: str, timeout_seconds: float
+        self, session: aiohttp.ClientSession, url: str, timeout_seconds: float, max_edge: int
     ) -> str | None:
         """Download one attachment and re-encode it, or None with a fixed log."""
         try:
@@ -2036,7 +2044,7 @@ class ChannelSummary(commands.Cog):
             return None
         # Decoding and resizing a 25 MP image blocks long enough to stall the
         # gateway heartbeat, so it never runs on the event loop.
-        data_url = await asyncio.to_thread(_encode_image, raw)
+        data_url = await asyncio.to_thread(_encode_image, raw, max_edge)
         if data_url is None:
             _log_image_skipped("not_an_image", 0)
         return data_url
@@ -3467,7 +3475,7 @@ class ChannelSummary(commands.Cog):
             name="Images",
             value=(
                 f"enabled=`{settings['image_enabled']}` · detail=`{settings['image_detail']}` · "
-                f"maximum=`{settings['max_images']}`"
+                f"max edge=`{settings['image_max_edge']}px` · maximum=`{settings['max_images']}`"
             ),
             inline=False,
         )
@@ -3837,7 +3845,8 @@ class ChannelSummary(commands.Cog):
                 "`agent_max_turns` 1–20 · `channel_tool_max_calls` 0–12 · "
                 "`max_distinct_messages` 1–1000\n"
                 "`max_input_chars` 10000–250000 · `max_output_tokens` 256–50000\n"
-                "`image_enabled` true/false · `image_detail` low/auto/high/original · `max_images` 0–20\n"
+                "`image_enabled` true/false · `image_detail` low/auto/high/original\n"
+                "`image_max_edge` 256–4096 · `max_images` 0–20\n"
                 "`web_max_tool_calls` 0–15 · `web_max_results` 0–15 · "
                 "`web_fetch_max_chars` 2000–50000 · "
                 "`request_timeout_seconds` 15–3600\n"
