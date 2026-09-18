@@ -2184,6 +2184,9 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             "```json %s```" % body,
             "```json\n%s\n``` trailing" % body,
             "```json+evil\n%s\n```" % body,
+            # str.isalnum() would accept these; the tag must be ASCII.
+            "```中文\n%s\n```" % body,
+            "```٣٤\n%s\n```" % body,
             "```",
         ):
             with self.subTest(hostile=hostile[:24]), self.assertRaises(SummaryError) as caught:

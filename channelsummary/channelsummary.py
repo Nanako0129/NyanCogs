@@ -1538,8 +1538,8 @@ def _unfenced_json(raw: str) -> str:
     "The provider returned an invalid response."
 
     Only an exact wrapper is removed: the text must start and end with a fence,
-    and the opening fence may carry nothing but an alphanumeric language tag on
-    its own line. Anything else is returned unchanged and still fails the parse,
+    and the opening fence may carry nothing but an ASCII alphanumeric language
+    tag on its own line. Anything else is returned unchanged and still fails the parse,
     so this does not become a general "find some JSON in there" scan.
     """
     text = raw.strip()
@@ -1550,7 +1550,9 @@ def _unfenced_json(raw: str) -> str:
     if newline < 0:
         return raw
     tag = body[:newline].strip()
-    if tag and not tag.isalnum():
+    # ASCII only. str.isalnum() is true for Unicode letters and digits, so a
+    # "```中文" wrapper would have been unwrapped while claiming not to be.
+    if not re.fullmatch(r"[A-Za-z0-9]*", tag):
         return raw
     return body[newline + 1 :]
 
