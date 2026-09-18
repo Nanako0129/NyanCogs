@@ -2157,6 +2157,41 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("reply_to", record)
                 self.assertNotIn("reply_to", record["evidence"])
 
+    def test_fenced_summary_json_is_accepted_and_only_an_exact_fence_is_stripped(self) -> None:
+        valid = {
+            "overview": "done",
+            "topics": [
+                {
+                    "title": "Topic",
+                    "opener_message_id": str(self.messages[0].id),
+                    "opener_user_id": str(self.messages[0].author.id),
+                    "boundary_reason": "range_start",
+                    "summary": "record",
+                    "source_message_ids": [str(self.messages[0].id)],
+                }
+            ],
+        }
+        body = json.dumps(valid, indent=2)
+        known = {item.id: item for item in self.messages}
+        for wrapper in ("```json\n%s\n```", "```JSON\n%s\n```", "```\n%s\n```", "  ```json\n%s\n```  ", "%s"):
+            with self.subTest(wrapper=wrapper.strip()[:7]):
+                parsed = parse_agent_summary(wrapper % body, known)
+                self.assertEqual(parsed.overview, "done")
+        # Anything that is not an exact wrapper still fails, so this never
+        # becomes a "find some JSON in there" scan.
+        for hostile in (
+            "Here you go:\n```json\n%s\n```" % body,
+            "```json %s```" % body,
+            "```json\n%s\n``` trailing" % body,
+            "```json+evil\n%s\n```" % body,
+            "```",
+        ):
+            with self.subTest(hostile=hostile[:24]), self.assertRaises(SummaryError) as caught:
+                parse_agent_summary(hostile, known)
+            self.assertEqual(
+                caught.exception.reason, channelsummary_module._ResponseReason.SUMMARY_JSON_INVALID
+            )
+
     def test_system_prompt_declares_structured_authority_boundary(self) -> None:
         prompt = ChannelSummary._system_prompt("auto", 30)
         self.assertIn("top-level type, status, call_index, remaining_budget", prompt)
@@ -2182,6 +2217,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             prompt,
         )
         self.assertIn("Write dense, information-rich prose", prompt)
+        self.assertIn("no markdown code fence around it", prompt)
         self.assertIn("use several complete sentences rather than a one-line gist", prompt)
 
     def test_safe_summary_rendering_keeps_only_valid_user_mentions(self) -> None:
