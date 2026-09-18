@@ -63,8 +63,10 @@ DISCLOSURE_VERSION = 3
 # reach the provider are the re-encoded ones, not these.
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
-# Pillow refuses to decode past this, so a small file claiming huge dimensions
-# cannot turn into gigabytes of decoded pixels.
+# Pillow only raises above TWICE this value; between one and two times it emits
+# DecompressionBombWarning and decodes anyway, measured on Pillow 12.3. So this
+# setting alone would let a file declaring 50 MP through, and `_transcode_image`
+# checks the header dimensions itself before decoding.
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 MAX_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 20.0
@@ -97,7 +99,7 @@ _FIRECRAWL_QUOTA_LOCK = asyncio.Lock()
 DISCLOSURE_HTTP = (
     "HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP provider, "
     "API keys, selected Discord data, and inlined image bytes traverse the LAN unencrypted. Use HTTP only "
-    "trusted LAN."
+    "on a trusted LAN."
 )
 # Same facts as before v3 acceptance, regrouped under bold labels so the settings
 # panel reads as a checklist instead of one paragraph. DISCLOSURE_VERSION stays 3.
@@ -1395,10 +1397,16 @@ def _transcode_image(raw: bytes, max_edge: int) -> tuple[str, bytes] | None:
     """
     try:
         with Image.open(BytesIO(raw)) as image:
+            # Header dimensions, available before any pixel is decoded. Pillow's
+            # own guard does not fire until twice MAX_IMAGE_PIXELS, and the
+            # selection step only saw the dimensions Discord declared, not the
+            # ones inside the file.
+            width, height = image.size
+            if width * height > MAX_IMAGE_PIXELS:
+                return None
             image.load()
             has_alpha = image.mode in {"RGBA", "LA", "PA"} or "transparency" in image.info
             image = image.convert("RGBA" if has_alpha else "RGB")
-            width, height = image.size
             longest = max(width, height)
             if longest > max_edge:
                 scale = max_edge / longest

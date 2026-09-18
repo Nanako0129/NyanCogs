@@ -1916,6 +1916,18 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(cog._download_image.await_args.args[3], 1536)
 
+    def test_header_pixels_are_checked_before_decoding(self) -> None:
+        # Pillow only raises above twice Image.MAX_IMAGE_PIXELS; between one and
+        # two times it warns and decodes, so the cog checks the header itself.
+        raw = self.sample_png(400, 400)
+        with patch.object(channelsummary_module, "MAX_IMAGE_PIXELS", 400 * 400):
+            self.assertIsNotNone(channelsummary_module._encode_image(raw, 1024))
+        with patch.object(channelsummary_module, "MAX_IMAGE_PIXELS", 400 * 400 - 1):
+            self.assertIsNone(channelsummary_module._encode_image(raw, 1024))
+        # Pillow alone would have decoded this one: it is under twice the limit.
+        with patch.object(channelsummary_module, "MAX_IMAGE_PIXELS", (400 * 400) // 2 + 1):
+            self.assertIsNone(channelsummary_module._encode_image(raw, 1024))
+
     def test_bytes_that_are_not_an_image_are_rejected(self) -> None:
         for raw in (b"", b"not an image at all", b"\x89PNG\r\n\x1a\n" + b"truncated"):
             with self.subTest(raw=raw[:12]):
@@ -4305,6 +4317,27 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("process restart clears", normalized)
                 self.assertIn("multiple processes multiply", normalized)
                 self.assertIn("DNS rebinding and split-horizon", normalized)
+
+    def test_the_http_sentence_is_whole_and_identical_everywhere(self) -> None:
+        # Pinning phrases let "Use HTTP only trusted LAN." ship once; the whole
+        # sentence is pinned now, and pinned to be the same in every surface.
+        sentence = "Use HTTP only on a trusted LAN."
+        root = Path(__file__).resolve().parents[1]
+        texts = {
+            "runtime": " ".join(channelsummary_module.DISCLOSURE_HTTP.split()),
+            "readme": " ".join((root / "README.md").read_text(encoding="utf-8").split()),
+            "info": " ".join(
+                (root / "channelsummary" / "info.json").read_text(encoding="utf-8").split()
+            ),
+        }
+        for name, text in texts.items():
+            with self.subTest(surface=name):
+                self.assertIn(sentence, text)
+                self.assertNotIn("Use HTTP only trusted", text)
+        self.assertIn(
+            "API keys, selected Discord data, and inlined image bytes traverse the LAN unencrypted.",
+            texts["runtime"],
+        )
 
     def test_readme_and_info_disclose_unencrypted_http(self) -> None:
         root = Path(__file__).resolve().parents[1]
