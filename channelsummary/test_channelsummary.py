@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import socket
+import time
 import sys
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -1731,7 +1732,7 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
         cog._download_image = AsyncMock(return_value=FAKE_DATA_URL)
         cache: dict[int, str | None] = {}
 
-        first_turn = await cog.fetch_image_inputs([first], 987654321098765432, self.settings(), cache)
+        first_turn = await cog.fetch_image_inputs([first], 987654321098765432, self.settings(), cache, time.monotonic() + 600)
         self.assertEqual(
             first_turn, (ImageInput(first.id, 222222222222222222, FAKE_DATA_URL, "auto"),)
         )
@@ -1740,7 +1741,7 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
         # A message the channel-history tool added mid-run brings a new
         # attachment; only that one is downloaded.
         second_turn = await cog.fetch_image_inputs(
-            [first, later], 987654321098765432, self.settings(), cache
+            [first, later], 987654321098765432, self.settings(), cache, time.monotonic() + 600
         )
         self.assertEqual([item.attachment_id for item in second_turn], [222222222222222222, 222222222222222223])
         self.assertEqual(cog._download_image.await_count, 2)
@@ -1755,12 +1756,12 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
 
         # The skip log lives in _download_image, which is replaced here; this
         # test is about what the caller does with a None result.
-        selected = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), cache)
+        selected = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), cache, time.monotonic() + 600)
         self.assertEqual([item.attachment_id for item in selected], [222222222222222223])
         self.assertIsNone(cache[222222222222222222])
 
         # A failed attachment is never retried on a later turn either.
-        again = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), cache)
+        again = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), cache, time.monotonic() + 600)
         self.assertEqual([item.attachment_id for item in again], [222222222222222223])
         self.assertEqual(cog._download_image.await_count, 2)
 
@@ -1772,7 +1773,7 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
         oversized = "data:image/png;base64," + "A" * (MAX_INLINE_IMAGE_BYTES // 2 - 64)
         cog._download_image = AsyncMock(return_value=oversized)
         with self.assertLogs("red.nyancogs.channelsummary", level="WARNING") as logs:
-            selected = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), {})
+            selected = await cog.fetch_image_inputs([message], 987654321098765432, self.settings(), {}, time.monotonic() + 600)
         self.assertEqual(len(selected), 2)
         self.assertEqual(logs.records[-1].reason, "total_budget")
 
@@ -1822,6 +1823,43 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(b"secret location note", decoded)
 
+    async def test_the_download_batch_stops_at_the_run_deadline(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        message = FakeMessage(111111111111111111, 444444444444444444, "a", 1)
+        message.attachments = [fake_attachment(222222222222222220 + index) for index in range(3)]
+        cog._download_image = AsyncMock(return_value=FAKE_DATA_URL)
+
+        # Already past the deadline: nothing is downloaded, and no attachment is
+        # recorded as failed, so a later turn may still try.
+        cache: dict[int, str | None] = {}
+        with self.assertLogs("red.nyancogs.channelsummary", level="WARNING") as logs:
+            selected = await cog.fetch_image_inputs(
+                [message], 987654321098765432, self.settings(), cache, time.monotonic() - 1
+            )
+        self.assertEqual(selected, ())
+        self.assertEqual(cache, {})
+        cog._download_image.assert_not_awaited()
+        self.assertEqual(logs.records[-1].reason, "deadline")
+
+    async def test_each_download_is_capped_by_the_remaining_run_budget(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        message = FakeMessage(111111111111111111, 444444444444444444, "a", 1)
+        message.attachments = [fake_attachment(222222222222222222)]
+        cog._download_image = AsyncMock(return_value=FAKE_DATA_URL)
+
+        await cog.fetch_image_inputs(
+            [message], 987654321098765432, self.settings(), {}, time.monotonic() + 5
+        )
+        capped = cog._download_image.await_args.args[2]
+        self.assertGreater(capped, 0)
+        self.assertLessEqual(capped, 5)
+
+        cog._download_image.reset_mock()
+        await cog.fetch_image_inputs(
+            [message], 987654321098765432, self.settings(), {}, time.monotonic() + 600
+        )
+        self.assertEqual(cog._download_image.await_args.args[2], IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
+
     async def test_transcoding_runs_off_the_event_loop(self) -> None:
         cog = object.__new__(ChannelSummary)
         raw = self.sample_png(2048, 2048)
@@ -1842,7 +1880,7 @@ class TestImageBoundary(unittest.IsolatedAsyncioTestCase):
             patch("channelsummary.channelsummary.read_bounded_response", AsyncMock(return_value=raw)),
             patch("channelsummary.channelsummary.asyncio.to_thread", new=recording_to_thread),
         ):
-            data_url = await cog._download_image(session, "https://cdn.discordapp.com/attachments/1/2/a.png")
+            data_url = await cog._download_image(session, "https://cdn.discordapp.com/attachments/1/2/a.png", 20.0)
 
         self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
         # Decoding and resizing a 25 MP image on the event loop would stall the

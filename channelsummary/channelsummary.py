@@ -68,6 +68,9 @@ MAX_IMAGE_PIXELS = 25_000_000
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 MAX_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 20.0
+# Starting a download with less than this left cannot finish one, and the wait
+# is spent holding the channel lock and the guild semaphore.
+IMAGE_DOWNLOAD_MIN_SECONDS = 2.0
 # Every attachment is downscaled and re-encoded before it is inlined. Measured
 # 2026-09-19 on gemini-3.8-flash through OpenRouter: 2048x2048, 1024x1024,
 # 768x768 and 512x512 all cost 1093 input tokens, so resolution buys nothing in
@@ -1959,6 +1962,7 @@ class ChannelSummary(commands.Cog):
         channel_id: int,
         settings: Mapping[str, Any],
         cache: dict[int, str | None],
+        deadline: float,
     ) -> tuple[ImageInput, ...]:
         """Download the selected attachments and inline them as `data:` URIs.
 
@@ -1978,12 +1982,21 @@ class ChannelSummary(commands.Cog):
         selected = eligible_images(messages, channel_id, settings)
         missing = [item for item in selected if item[1].id not in cache]
         if missing:
-            timeout = aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
             async with aiohttp.ClientSession(
-                timeout=timeout, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
+                trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
             ) as session:
                 for _message, attachment, url, _content_type in missing:
-                    cache[attachment.id] = await self._download_image(session, url)
+                    # The run deadline bounds the whole batch, not each request.
+                    # Twenty attachments at the per-request timeout would run far
+                    # past a short request_timeout_seconds while holding the
+                    # channel lock and the guild semaphore.
+                    remaining = deadline - time.monotonic()
+                    if remaining < IMAGE_DOWNLOAD_MIN_SECONDS:
+                        _log_image_skipped("deadline", 0)
+                        break
+                    cache[attachment.id] = await self._download_image(
+                        session, url, min(IMAGE_DOWNLOAD_TIMEOUT_SECONDS, remaining)
+                    )
         detail = str(settings["image_detail"])
         result: list[ImageInput] = []
         total = 0
@@ -2001,10 +2014,16 @@ class ChannelSummary(commands.Cog):
             result.append(ImageInput(message.id, attachment.id, data_url, detail))
         return tuple(result)
 
-    async def _download_image(self, session: aiohttp.ClientSession, url: str) -> str | None:
+    async def _download_image(
+        self, session: aiohttp.ClientSession, url: str, timeout_seconds: float
+    ) -> str | None:
         """Download one attachment and re-encode it, or None with a fixed log."""
         try:
-            async with session.get(url, allow_redirects=False) as response:
+            async with session.get(
+                url,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            ) as response:
                 if response.status != 200:
                     _log_image_skipped("http_status", response.status)
                     return None
@@ -2718,7 +2737,7 @@ class ChannelSummary(commands.Cog):
                 remaining_firecrawl_calls=offered_firecrawl,
                 approved_fetch_urls=tuple(approved_fetch_urls),
                 images=await self.fetch_image_inputs(
-                    state.messages.values(), channel.id, settings, image_cache
+                    state.messages.values(), channel.id, settings, image_cache, deadline
                 ),
                 force_channel_history=force_history,
             )
