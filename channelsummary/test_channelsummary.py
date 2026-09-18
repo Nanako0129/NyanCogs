@@ -1021,10 +1021,11 @@ class TestFirecrawlBackend(unittest.IsolatedAsyncioTestCase):
             with self.subTest(status=status, body=body), self.assertRaises(SummaryError) as caught:
                 await self._captured_request(status, content_type, body)
             self.assertEqual(caught.exception.code, code)
-            public = str(caught.exception)
-            self.assertNotIn("firecrawl-secret", public)
-            self.assertNotIn("sensitive query", public)
-            self.assertNotIn("vendor body", public)
+            # The public text must be exactly the fixed string for that code.
+            # This supersedes per-sentinel assertNotIn checks: it fails on any
+            # leak from any source, including this case's own response body,
+            # rather than only on the substrings someone remembered to list.
+            self.assertEqual(str(caught.exception), PUBLIC_ERRORS[code])
 
     async def test_search_validates_unexposed_items_before_granting_capabilities(self) -> None:
         cog = object.__new__(ChannelSummary)
