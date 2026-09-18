@@ -1018,14 +1018,19 @@ class TestFirecrawlBackend(unittest.IsolatedAsyncioTestCase):
             (200, "application/json", b'{"success":false,"data":{}}', ErrorCode.RESPONSE_INVALID),
         )
         for status, content_type, body, code in cases:
-            with self.subTest(status=status, body=body), self.assertRaises(SummaryError) as caught:
-                await self._captured_request(status, content_type, body)
-            self.assertEqual(caught.exception.code, code)
-            # The public text must be exactly the fixed string for that code.
-            # This supersedes per-sentinel assertNotIn checks: it fails on any
-            # leak from any source, including this case's own response body,
-            # rather than only on the substrings someone remembered to list.
-            self.assertEqual(str(caught.exception), PUBLIC_ERRORS[code])
+            # Both assertions stay inside the subTest. Outside it, the first
+            # failing case aborted the loop and every later case went unrun,
+            # so one broken status could hide the rest.
+            with self.subTest(status=status, body=body):
+                with self.assertRaises(SummaryError) as caught:
+                    await self._captured_request(status, content_type, body)
+                self.assertEqual(caught.exception.code, code)
+                # The public text must be exactly the fixed string for that
+                # code. This supersedes per-sentinel assertNotIn checks: it
+                # fails on any leak from any source, including this case's own
+                # response body, rather than only on the substrings someone
+                # remembered to list.
+                self.assertEqual(str(caught.exception), PUBLIC_ERRORS[code])
 
     async def test_search_validates_unexposed_items_before_granting_capabilities(self) -> None:
         cog = object.__new__(ChannelSummary)
