@@ -1541,6 +1541,13 @@ def _unfenced_json(raw: str) -> str:
     and the opening fence may carry nothing but an ASCII alphanumeric language
     tag on its own line. Anything else is returned unchanged and still fails the parse,
     so this does not become a general "find some JSON in there" scan.
+
+    The closing fence deliberately does not have to sit on its own line. A model
+    that writes the object followed immediately by the fence produced the same
+    object as one that puts the fence on a new line, and rejecting the first
+    would reintroduce the failure this function exists to remove. Tolerance
+    there costs nothing: whatever the fence contained still faces every field,
+    ID and bound check in `parse_agent_summary()`.
     """
     text = raw.strip()
     if len(text) < 8 or not text.startswith("```") or not text.endswith("```"):

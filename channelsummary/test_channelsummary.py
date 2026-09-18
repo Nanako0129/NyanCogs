@@ -2173,7 +2173,17 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         }
         body = json.dumps(valid, indent=2)
         known = {item.id: item for item in self.messages}
-        for wrapper in ("```json\n%s\n```", "```JSON\n%s\n```", "```\n%s\n```", "  ```json\n%s\n```  ", "%s"):
+        for wrapper in (
+            "```json\n%s\n```",
+            "```JSON\n%s\n```",
+            "```\n%s\n```",
+            "  ```json\n%s\n```  ",
+            # The closing fence need not be on its own line: the object is the
+            # same either way, and rejecting this would fail a summary that
+            # parses. Deliberate, not an oversight.
+            "```json\n%s```",
+            "%s",
+        ):
             with self.subTest(wrapper=wrapper.strip()[:7]):
                 parsed = parse_agent_summary(wrapper % body, known)
                 self.assertEqual(parsed.overview, "done")
