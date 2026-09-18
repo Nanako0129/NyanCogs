@@ -732,9 +732,41 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
         record = logs.records[0]
         self.assertEqual(
             (record.event, record.reason, record.status, record.attempt),
-            ("provider_retry", "rate_limited", 429, 2),
+            ("provider_retry", "rate_limited_provider", 429, 1),
         )
-        self.assertEqual(logs.records[1].attempt, 3)
+        self.assertEqual(logs.records[1].attempt, 2)
+
+    async def test_rate_limit_records_whose_limit_refused_the_request(self) -> None:
+        for headers, expected in (
+            ({}, "rate_limited_provider"),
+            ({"Retry-After": "1"}, "rate_limited_provider"),
+            ({"X-RateLimit-Limit": "20", "X-RateLimit-Remaining": "0"}, "rate_limited_platform"),
+        ):
+            with self.subTest(headers=headers):
+                with self.assertLogs("red.nyancogs.channelsummary", level="WARNING") as logs:
+                    await self.request_with_transport(
+                        profile("openai_responses"),
+                        self.image_payload(),
+                        ((429, b"", headers), (200, b'{"ok":true}')),
+                    )
+                self.assertEqual(logs.records[0].reason, expected)
+                # Only header presence is used; nothing the provider wrote is logged.
+                rendered = logs.records[0].getMessage() + repr(logs.records[0].__dict__)
+                self.assertNotIn("provider_code", rendered)
+
+    async def test_rate_limit_is_recorded_even_when_no_retry_follows(self) -> None:
+        with self.assertRaises(SummaryError), self.assertLogs(
+            "red.nyancogs.channelsummary", level="WARNING"
+        ) as logs:
+            await self.request_with_transport(
+                profile("openai_responses"),
+                self.image_payload(),
+                ((429, b"", {"Retry-After": "3600", "X-RateLimit-Limit": "20"}),),
+            )
+        self.assertEqual(
+            [(r.reason, r.attempt) for r in logs.records], [("rate_limited_platform", 1)]
+        )
+        self.transport.sleep.assert_not_awaited()
 
     async def test_rate_limit_gives_up_after_a_bounded_number_of_retries(self) -> None:
         with self.assertRaises(SummaryError) as caught, self.assertLogs(

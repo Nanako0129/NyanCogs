@@ -1145,6 +1145,18 @@ def _rate_limit_delay(retry_after: str | None, prior_retries: int) -> float | No
     )
 
 
+def _rate_limit_reason(headers: Mapping[str, str]) -> str:
+    """Name which side refused the request, from headers alone.
+
+    OpenRouter documents that a 429 it raises itself carries `X-RateLimit-Limit`,
+    `X-RateLimit-Remaining` and `X-RateLimit-Reset`, while an upstream provider's
+    refusal arrives without them and reports `error.metadata.provider_code` in a
+    body this cog never reads. Only the presence of a header name is used, so
+    nothing the provider wrote is recorded.
+    """
+    return "rate_limited_platform" if "X-RateLimit-Limit" in headers else "rate_limited_provider"
+
+
 def _log_provider_retry(
     profile: ProviderProfile, reason: str, attempt: int, status: int, started_at: float
 ) -> None:
@@ -1952,24 +1964,33 @@ class ChannelSummary(commands.Cog):
                                 raw = await read_bounded_response(response)
                                 break
                             if response.status == 429:
+                                rate_headers = getattr(response, "headers", {})
                                 delay = _rate_limit_delay(
-                                    getattr(response, "headers", {}).get("Retry-After"),
-                                    rate_limit_retries,
+                                    rate_headers.get("Retry-After"), rate_limit_retries
                                 )
                                 remaining = timeout_seconds - (time.monotonic() - started_at)
-                                if (
+                                giving_up = (
                                     delay is None
                                     or rate_limit_retries >= RATE_LIMIT_MAX_RETRIES
                                     or remaining - delay < RATE_LIMIT_HEADROOM_SECONDS
-                                ):
+                                )
+                                # Whose limit this was, recorded even when no retry
+                                # follows, so the answer does not need a live
+                                # investigation later. Header names are protocol,
+                                # not response content.
+                                _log_provider_retry(
+                                    profile,
+                                    _rate_limit_reason(rate_headers),
+                                    rate_limit_retries + 1,
+                                    429,
+                                    started_at,
+                                )
+                                if giving_up:
                                     raise SummaryError(ErrorCode.PROVIDER_RATE_LIMIT)
-                                rate_limit_retries += 1
                                 # A 429 is a refusal to accept the request, not a
                                 # failed generation, so retrying does not repeat a
                                 # provider charge the way the image retry below can.
-                                _log_provider_retry(
-                                    profile, "rate_limited", rate_limit_retries + 1, 429, started_at
-                                )
+                                rate_limit_retries += 1
                             elif response.status == 400 and retry_image_fetch:
                                 try:
                                     error_raw = await read_bounded_response(
