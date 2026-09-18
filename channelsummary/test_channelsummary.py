@@ -1004,6 +1004,12 @@ class TestFirecrawlBackend(unittest.IsolatedAsyncioTestCase):
     async def test_status_content_type_and_json_errors_are_fixed_and_secret_free(self) -> None:
         cases = (
             (401, "text/html", b"secret vendor body", ErrorCode.PROVIDER_AUTH),
+            (
+                403,
+                "application/json",
+                b'{"error":{"message":"This model is not available in your region."}}',
+                ErrorCode.PROVIDER_FORBIDDEN,
+            ),
             (429, "application/json", b"{}", ErrorCode.PROVIDER_RATE_LIMIT),
             (503, "application/json", b"{}", ErrorCode.PROVIDER_UNAVAILABLE),
             (200, "text/html", b"{}", ErrorCode.RESPONSE_INVALID),
@@ -3996,6 +4002,13 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
             PUBLIC_ERRORS[ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT],
             "The provider timed out downloading an image twice. Retry later or disable image summaries.",
         )
+
+    def test_forbidden_is_not_reported_as_a_credential_failure(self) -> None:
+        forbidden = PUBLIC_ERRORS[ErrorCode.PROVIDER_FORBIDDEN].casefold()
+        self.assertNotEqual(forbidden, PUBLIC_ERRORS[ErrorCode.PROVIDER_AUTH].casefold())
+        self.assertNotIn("credential", forbidden)
+        for term in ("account", "model", "region"):
+            self.assertIn(term, forbidden)
 
     async def test_runtime_and_files_disclose_v3_exports_and_shared_pool(self) -> None:
         cog = object.__new__(ChannelSummary)
