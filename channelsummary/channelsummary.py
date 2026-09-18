@@ -13,6 +13,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote, urlsplit
@@ -1118,23 +1119,45 @@ def _http_error(status: int) -> ErrorCode:
     return ErrorCode.PROVIDER_REJECTED
 
 
+def _retry_after_seconds(retry_after: str) -> float | None:
+    """A `Retry-After` value as seconds from now, or None when it is neither form.
+
+    RFC 9110 allows delta-seconds or an HTTP-date, and a provider may send
+    either, so both are converted here and one policy is applied to the result
+    by the caller. A date already in the past clamps to zero, which is what the
+    header means and matches a literal `Retry-After: 0`.
+    """
+    text = retry_after.strip()
+    try:
+        return float(text)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max((when - datetime.now(UTC)).total_seconds(), 0.0)
+
+
 def _rate_limit_delay(retry_after: str | None, prior_retries: int) -> float | None:
     """Seconds to wait before retrying a 429, or None when waiting cannot help.
 
-    A `Retry-After` that parses to a non-negative number within the cap is
-    honoured as given, because the provider knows its own window better than a
-    fixed schedule does. One above the cap (infinity included) returns None:
-    the provider is asking for longer than a single summary may wait, so
-    failing now is honest and cheaper than sleeping first. Anything else, a
-    missing header, an HTTP-date, a negative or NaN, falls back to bounded
-    exponential backoff.
+    A `Retry-After` resolving to a non-negative delay within the cap is honoured
+    as given, in either of the forms RFC 9110 allows, because the provider knows
+    its own window better than a fixed schedule does. One above the cap, an
+    infinity or a distant date included, returns None: the provider is asking
+    for longer than a single summary may wait, so failing now is honest and
+    cheaper than sleeping first. Anything else, a missing header, an
+    unparseable value, a negative or NaN, falls back to bounded exponential
+    backoff.
     """
     if retry_after is not None:
-        try:
-            seconds = float(retry_after.strip())
-        except (AttributeError, TypeError, ValueError):
-            pass
-        else:
+        seconds = _retry_after_seconds(retry_after)
+        if seconds is not None:
             if 0 <= seconds <= RATE_LIMIT_MAX_DELAY_SECONDS:
                 return seconds
             if seconds > RATE_LIMIT_MAX_DELAY_SECONDS:

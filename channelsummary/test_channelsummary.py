@@ -10,6 +10,7 @@ import socket
 import sys
 import unittest
 from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping
@@ -830,11 +831,23 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
             ("inf", 0, None),
             ("-5", 0, 2.0),
             ("nan", 0, 2.0),
-            ("Wed, 21 Oct 2026 07:28:00 GMT", 0, 2.0),
+            ("not a date", 0, 2.0),
             ("", 0, 2.0),
+            # RFC 9110 allows an HTTP-date; a distant one is past the cap.
+            ("Wed, 21 Oct 2026 07:28:00 GMT", 0, None),
+            ("Mon, 01 Jan 2001 00:00:00 GMT", 0, 0.0),
         ):
             with self.subTest(header=header):
                 self.assertEqual(channelsummary_module._rate_limit_delay(header, prior), expected)
+
+    def test_rate_limit_delay_honours_a_near_future_http_date(self) -> None:
+        soon = datetime.now(UTC) + timedelta(seconds=5)
+        delay = channelsummary_module._rate_limit_delay(format_datetime(soon, usegmt=True), 0)
+        self.assertIsNotNone(delay)
+        self.assertGreater(delay, 3.0)
+        self.assertLessEqual(delay, 5.0)
+        # Falling back to backoff here would retry before the window resets.
+        self.assertNotEqual(delay, 2.0)
 
     async def test_retry_sleep_and_second_attempt_expiry_remain_provider_timeout(self) -> None:
         cases = (
