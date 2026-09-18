@@ -13,6 +13,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote, urlsplit
@@ -38,6 +39,15 @@ SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 SAFE_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
 MAX_RESPONSE_BYTES = 2_097_152
 MAX_PROVIDER_ERROR_BYTES = 65_536
+# A 429 refuses the request before the model runs, so one summary can retry it a
+# few times. Every wait is spent from the run's own remaining budget, never added
+# to it, so these values cannot extend a summary past request_timeout_seconds.
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_BASE_DELAY_SECONDS = 2.0
+RATE_LIMIT_MAX_DELAY_SECONDS = 30.0
+# Sleeping until there is no time left to send the retry wastes the wait and
+# reports a timeout instead of the rate limit that actually happened.
+RATE_LIMIT_HEADROOM_SECONDS = 5.0
 MAX_FIRECRAWL_RESPONSE_BYTES = 1_048_576
 MAX_REQUEST_BYTES = 1_048_576
 MAX_PROVIDER_PROFILES = 25
@@ -1109,6 +1119,92 @@ def _http_error(status: int) -> ErrorCode:
     return ErrorCode.PROVIDER_REJECTED
 
 
+def _retry_after_seconds(retry_after: str) -> float | None:
+    """A `Retry-After` value as seconds from now, or None when it is neither form.
+
+    RFC 9110 allows delta-seconds or an HTTP-date, and a provider may send
+    either, so both are converted here and one policy is applied to the result
+    by the caller. A date already in the past clamps to zero, which is what the
+    header means and matches a literal `Retry-After: 0`.
+    """
+    text = retry_after.strip()
+    try:
+        return float(text)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max((when - datetime.now(UTC)).total_seconds(), 0.0)
+
+
+def _rate_limit_delay(retry_after: str | None, prior_retries: int) -> float | None:
+    """Seconds to wait before retrying a 429, or None when waiting cannot help.
+
+    A `Retry-After` resolving to a non-negative delay within the cap is honoured
+    as given, in either of the forms RFC 9110 allows, because the provider knows
+    its own window better than a fixed schedule does. One above the cap, an
+    infinity or a distant date included, returns None: the provider is asking
+    for longer than a single summary may wait, so failing now is honest and
+    cheaper than sleeping first. Anything else, a missing header, an
+    unparseable value, a negative or NaN, falls back to bounded exponential
+    backoff.
+    """
+    if retry_after is not None:
+        seconds = _retry_after_seconds(retry_after)
+        if seconds is not None:
+            if 0 <= seconds <= RATE_LIMIT_MAX_DELAY_SECONDS:
+                return seconds
+            if seconds > RATE_LIMIT_MAX_DELAY_SECONDS:
+                return None
+    return min(
+        RATE_LIMIT_BASE_DELAY_SECONDS * (2**prior_retries),
+        RATE_LIMIT_MAX_DELAY_SECONDS,
+    )
+
+
+def _rate_limit_reason(headers: Mapping[str, str]) -> str:
+    """Name which side refused the request, from headers alone.
+
+    OpenRouter documents that a 429 it raises itself carries `X-RateLimit-Limit`,
+    `X-RateLimit-Remaining` and `X-RateLimit-Reset`, while an upstream provider's
+    refusal arrives without them and reports `error.metadata.provider_code` in a
+    body this cog never reads. Only the presence of a header name is used, so
+    nothing the provider wrote is recorded.
+    """
+    return "rate_limited_platform" if "X-RateLimit-Limit" in headers else "rate_limited_provider"
+
+
+def _log_provider_retry(
+    profile: ProviderProfile, reason: str, attempt: int, status: int, started_at: float
+) -> None:
+    """Record a bounded retry with fixed fields only; no body, URL, or token."""
+    dialect = profile.dialect if profile.dialect in DIALECT_PATHS else "unknown"
+    elapsed_ms = min(max(int((time.monotonic() - started_at) * 1_000), 0), 3_600_000)
+    log.warning(
+        "channelsummary.provider_retry reason=%s "
+        "dialect=%s attempt=%d status=%d elapsed_ms=%d",
+        reason,
+        dialect,
+        attempt,
+        status,
+        elapsed_ms,
+        extra={
+            "event": "provider_retry",
+            "reason": reason,
+            "dialect": dialect,
+            "attempt": attempt,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+        },
+    )
+
+
 def _reject_json_constant(_value: str) -> None:
     raise ValueError
 
@@ -1878,7 +1974,9 @@ class ChannelSummary(commands.Cog):
                     trust_env=False,
                     cookie_jar=aiohttp.DummyCookieJar(),
                 ) as session:
-                    for attempt in (1, 2):
+                    image_retry_used = False
+                    rate_limit_retries = 0
+                    while True:
                         async with session.post(
                             endpoint,
                             data=encoded,
@@ -1888,41 +1986,56 @@ class ChannelSummary(commands.Cog):
                             if 200 <= response.status < 300:
                                 raw = await read_bounded_response(response)
                                 break
-                            if response.status != 400 or not retry_image_fetch:
-                                raise SummaryError(_http_error(response.status))
-                            try:
-                                error_raw = await read_bounded_response(
-                                    response, MAX_PROVIDER_ERROR_BYTES
+                            if response.status == 429:
+                                rate_headers = getattr(response, "headers", {})
+                                delay = _rate_limit_delay(
+                                    rate_headers.get("Retry-After"), rate_limit_retries
                                 )
-                            except SummaryError as error:
-                                if error.code is ErrorCode.RESPONSE_TOO_LARGE:
-                                    raise SummaryError(_http_error(response.status)) from None
-                                raise
-                            if not _is_provider_image_fetch_timeout(error_raw):
+                                remaining = timeout_seconds - (time.monotonic() - started_at)
+                                giving_up = (
+                                    delay is None
+                                    or rate_limit_retries >= RATE_LIMIT_MAX_RETRIES
+                                    or remaining - delay < RATE_LIMIT_HEADROOM_SECONDS
+                                )
+                                # Whose limit this was, recorded even when no retry
+                                # follows, so the answer does not need a live
+                                # investigation later. Header names are protocol,
+                                # not response content.
+                                _log_provider_retry(
+                                    profile,
+                                    _rate_limit_reason(rate_headers),
+                                    rate_limit_retries + 1,
+                                    429,
+                                    started_at,
+                                )
+                                if giving_up:
+                                    raise SummaryError(ErrorCode.PROVIDER_RATE_LIMIT)
+                                # A 429 is a refusal to accept the request, not a
+                                # failed generation, so retrying does not repeat a
+                                # provider charge the way the image retry below can.
+                                rate_limit_retries += 1
+                            elif response.status == 400 and retry_image_fetch:
+                                try:
+                                    error_raw = await read_bounded_response(
+                                        response, MAX_PROVIDER_ERROR_BYTES
+                                    )
+                                except SummaryError as error:
+                                    if error.code is ErrorCode.RESPONSE_TOO_LARGE:
+                                        raise SummaryError(_http_error(response.status)) from None
+                                    raise
+                                if not _is_provider_image_fetch_timeout(error_raw):
+                                    raise SummaryError(_http_error(response.status))
+                                if image_retry_used:
+                                    raise SummaryError(ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT)
+                                image_retry_used = True
+                                delay = 1
+                                # A retry may incur a second provider charge; never retry more than once.
+                                _log_provider_retry(
+                                    profile, "image_url_download_timeout", 2, 400, started_at
+                                )
+                            else:
                                 raise SummaryError(_http_error(response.status))
-                            if attempt == 2:
-                                raise SummaryError(ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT)
-                            # A retry may incur a second provider charge; never retry more than once.
-                            dialect = profile.dialect if profile.dialect in DIALECT_PATHS else "unknown"
-                            elapsed_ms = min(
-                                max(int((time.monotonic() - started_at) * 1_000), 0),
-                                3_600_000,
-                            )
-                            log.warning(
-                                "channelsummary.provider_retry reason=image_url_download_timeout "
-                                "dialect=%s attempt=2 status=400 elapsed_ms=%d",
-                                dialect,
-                                elapsed_ms,
-                                extra={
-                                    "event": "provider_retry",
-                                    "reason": "image_url_download_timeout",
-                                    "dialect": dialect,
-                                    "attempt": 2,
-                                    "status": 400,
-                                    "elapsed_ms": elapsed_ms,
-                                },
-                            )
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(delay)
         except asyncio.TimeoutError:
             raise SummaryError(ErrorCode.PROVIDER_TIMEOUT) from None
         except aiohttp.ClientError:
