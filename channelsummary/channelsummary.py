@@ -28,7 +28,12 @@ from redbot.core.utils.views import SetApiView
 
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
+# "@" is allowed so routing aliases reach the provider unchanged: OpenRouter
+# presets are addressed as "@preset/<slug>", and pinned model revisions are
+# written "<model>@<version>". The value is JSON-serialized into the request
+# body, so the character carries no injection risk; this rule exists to bound
+# the length and keep control characters and whitespace out.
+MODEL_RE = re.compile(r"^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,99}$")
 SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 SAFE_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
 MAX_RESPONSE_BYTES = 2_097_152
