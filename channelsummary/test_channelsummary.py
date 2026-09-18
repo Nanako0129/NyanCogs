@@ -157,6 +157,31 @@ class TestConfiguration(unittest.TestCase):
                 validate_profile("openai", raw)
             self.assertEqual(caught.exception.code, ErrorCode.PROFILE_INVALID)
 
+    def test_model_allowlist_accepts_routing_aliases_and_still_bounds_the_value(self) -> None:
+        base = {
+            "dialect": "openrouter_responses",
+            "origin": "https://openrouter.ai",
+            "token_service": "channelsummary_openrouter",
+        }
+        accepted = ["@preset/gemini-fast", "gemini-2.5-pro@002", "google/gemini-3.8-flash", "a"]
+        parsed = validate_profile("router", {**base, "models": accepted})
+        self.assertEqual(list(parsed.models), accepted)
+        rejected = [
+            "",
+            "-leading-dash",
+            "has space",
+            "new\nline",
+            "semi;colon",
+            "quote\"mark",
+            "back\\slash",
+            "null\x00byte",
+            "@" * 101,
+        ]
+        for model in rejected:
+            with self.subTest(model=model), self.assertRaises(SummaryError) as caught:
+                validate_profile("router", {**base, "models": [model]})
+            self.assertEqual(caught.exception.code, ErrorCode.PROFILE_INVALID)
+
 
 class TestFirecrawlCapabilities(unittest.TestCase):
     def test_strict_public_url_accepts_only_exact_public_http_urls(self) -> None:
