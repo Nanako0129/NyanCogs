@@ -1029,6 +1029,12 @@ class TestFirecrawlBackend(unittest.IsolatedAsyncioTestCase):
     async def test_status_content_type_and_json_errors_are_fixed_and_secret_free(self) -> None:
         cases = (
             (401, "text/html", b"secret vendor body", ErrorCode.PROVIDER_AUTH),
+            (
+                403,
+                "application/json",
+                b'{"error":{"message":"This model is not available in your region."}}',
+                ErrorCode.PROVIDER_FORBIDDEN,
+            ),
             (429, "application/json", b"{}", ErrorCode.PROVIDER_RATE_LIMIT),
             (503, "application/json", b"{}", ErrorCode.PROVIDER_UNAVAILABLE),
             (200, "text/html", b"{}", ErrorCode.RESPONSE_INVALID),
@@ -1037,13 +1043,19 @@ class TestFirecrawlBackend(unittest.IsolatedAsyncioTestCase):
             (200, "application/json", b'{"success":false,"data":{}}', ErrorCode.RESPONSE_INVALID),
         )
         for status, content_type, body, code in cases:
-            with self.subTest(status=status, body=body), self.assertRaises(SummaryError) as caught:
-                await self._captured_request(status, content_type, body)
-            self.assertEqual(caught.exception.code, code)
-            public = str(caught.exception)
-            self.assertNotIn("firecrawl-secret", public)
-            self.assertNotIn("sensitive query", public)
-            self.assertNotIn("vendor body", public)
+            # Both assertions stay inside the subTest. Outside it, the first
+            # failing case aborted the loop and every later case went unrun,
+            # so one broken status could hide the rest.
+            with self.subTest(status=status, body=body):
+                with self.assertRaises(SummaryError) as caught:
+                    await self._captured_request(status, content_type, body)
+                self.assertEqual(caught.exception.code, code)
+                # The public text must be exactly the fixed string for that
+                # code. This supersedes per-sentinel assertNotIn checks: it
+                # fails on any leak from any source, including this case's own
+                # response body, rather than only on the substrings someone
+                # remembered to list.
+                self.assertEqual(str(caught.exception), PUBLIC_ERRORS[code])
 
     async def test_search_validates_unexposed_items_before_granting_capabilities(self) -> None:
         cog = object.__new__(ChannelSummary)
@@ -4021,6 +4033,13 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
             PUBLIC_ERRORS[ErrorCode.PROVIDER_IMAGE_FETCH_TIMEOUT],
             "The provider timed out downloading an image twice. Retry later or disable image summaries.",
         )
+
+    def test_forbidden_is_not_reported_as_a_credential_failure(self) -> None:
+        forbidden = PUBLIC_ERRORS[ErrorCode.PROVIDER_FORBIDDEN].casefold()
+        self.assertNotEqual(forbidden, PUBLIC_ERRORS[ErrorCode.PROVIDER_AUTH].casefold())
+        self.assertNotIn("credential", forbidden)
+        for term in ("account", "model", "region"):
+            self.assertIn(term, forbidden)
 
     async def test_runtime_and_files_disclose_v3_exports_and_shared_pool(self) -> None:
         cog = object.__new__(ChannelSummary)

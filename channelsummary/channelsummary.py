@@ -216,6 +216,7 @@ class ErrorCode(StrEnum):
     PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
     PROVIDER_IMAGE_FETCH_TIMEOUT = "PROVIDER_IMAGE_FETCH_TIMEOUT"
     PROVIDER_AUTH = "PROVIDER_AUTH"
+    PROVIDER_FORBIDDEN = "PROVIDER_FORBIDDEN"
     PROVIDER_RATE_LIMIT = "PROVIDER_RATE_LIMIT"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     PROVIDER_REJECTED = "PROVIDER_REJECTED"
@@ -268,6 +269,10 @@ PUBLIC_ERRORS = {
         "The provider timed out downloading an image twice. Retry later or disable image summaries."
     ),
     ErrorCode.PROVIDER_AUTH: "The provider rejected its credentials.",
+    ErrorCode.PROVIDER_FORBIDDEN: (
+        "The provider refused this request. This usually means the account, model, or region is "
+        "not permitted rather than a bad key."
+    ),
     ErrorCode.PROVIDER_RATE_LIMIT: "The provider rate limit was reached.",
     ErrorCode.PROVIDER_UNAVAILABLE: "The provider is unavailable.",
     ErrorCode.PROVIDER_REJECTED: "The provider rejected the request.",
@@ -1090,8 +1095,13 @@ async def read_bounded_response(response: Any, max_bytes: int = MAX_RESPONSE_BYT
 
 
 def _http_error(status: int) -> ErrorCode:
-    if status in {401, 403}:
+    if status == 401:
         return ErrorCode.PROVIDER_AUTH
+    # 403 is not a credential failure. Providers use it for account, model, and
+    # region policy on a key they already accepted, so folding it into
+    # PROVIDER_AUTH points the reader at the key and away from the real cause.
+    if status == 403:
+        return ErrorCode.PROVIDER_FORBIDDEN
     if status == 429:
         return ErrorCode.PROVIDER_RATE_LIMIT
     if status >= 500:
