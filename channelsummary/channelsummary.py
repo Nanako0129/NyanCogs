@@ -1704,6 +1704,49 @@ def parse_agent_summary(raw: str, known: Mapping[int, discord.Message]) -> Agent
     return AgentSummary(overview, tuple(topics))
 
 
+# Markdown spans a model writes inline: code, bold, italic, strikethrough. The
+# closing delimiter must match the opening one, and the span may not be empty or
+# start with whitespace, so "2 * 3 * 4" is arithmetic rather than a span. The
+# span must also sit between non-identifier characters, so "a_b_c" and
+# "anthropic_fm_proxy.py" are names rather than emphasis. CJK is not in that
+# class, which is exactly the case this exists for.
+WRAPPED_SPAN_RE = re.compile(
+    r"(?<![0-9A-Za-z_\\])(\*\*|__|~~|`|\*|_)(?!\s)(.+?)(?<!\s)\1(?![0-9A-Za-z_])"
+)
+# A full-width glyph already carries its own side bearing, so an ASCII space
+# next to one is wrong on either side: "`httpx` 、" and "、 `uvicorn`" both read
+# as a typographic error in Chinese.
+FULLWIDTH_PUNCTUATION = "、。，．！？；：（）［］｛｝「」『』《》〈〉【】〔〕…—～·"
+# ASCII punctuation that has to stay attached to what precedes or follows it.
+NO_SPACE_BEFORE = FULLWIDTH_PUNCTUATION + ".,!?;:)]}\"'"
+NO_SPACE_AFTER = FULLWIDTH_PUNCTUATION + "([{\"'"
+
+
+def space_wrapped_spans(text: str) -> str:
+    """Separate inline markdown spans from the text they are jammed against.
+
+    Discord renders `code` pressed straight up against a CJK character with no
+    gap, which is what prompted this. The rule is the usual CJK one: put a space
+    between the span and a neighbouring word character, but never between it and
+    punctuation that has to stay attached.
+    """
+    result: list[str] = []
+    end = 0
+    for match in WRAPPED_SPAN_RE.finditer(text):
+        before = text[end : match.start()]
+        result.append(before)
+        previous = before[-1] if before else (result[-2][-1] if len(result) > 1 and result[-2] else "")
+        if previous and not previous.isspace() and previous not in NO_SPACE_AFTER:
+            result.append(" ")
+        result.append(match.group(0))
+        end = match.end()
+        following = text[end : end + 1]
+        if following and not following.isspace() and following not in NO_SPACE_BEFORE:
+            result.append(" ")
+    result.append(text[end:])
+    return "".join(result)
+
+
 def sanitize_summary_text(text: str, allowed_user_ids: set[int]) -> str:
     text = clean_evidence(text, 24_000)
     placeholders: dict[str, str] = {}
@@ -1722,6 +1765,8 @@ def sanitize_summary_text(text: str, allowed_user_ids: set[int]) -> str:
     text = re.sub(r"https?://\S+", "[link omitted]", text, flags=re.IGNORECASE)
     text = re.sub(r"<@&\d+>|<#\d+>", "[mention omitted]", text)
     text = re.sub(r"@(everyone|here)", r"＠\1", text, flags=re.IGNORECASE)
+    # Before escaping: the delimiters are still recognisable as markdown here.
+    text = space_wrapped_spans(text)
     text = discord.utils.escape_markdown(text)
     for token, mention in placeholders.items():
         text = text.replace(token, mention)
