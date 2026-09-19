@@ -77,6 +77,11 @@ messages after a successful summary before that channel can run another;
 members with guild-level Manage Messages are exempt from that checkpoint, but
 the cooldown, quota, and concurrency limits still apply to them.
 
+The Embed footer reports what the summary consumed: input and output tokens,
+reasoning tokens when the provider separates them, and the price when the
+provider reports one. OpenRouter does; OpenAI does not, and no figure is
+computed from a local price table.
+
 Summary Embeds preserve validated `<@user_id>` speaker attribution but use
 `AllowedMentions.none()`, so they do not notify anyone. Discord jump links are
 constructed locally from supplied messages. Native-mode web links are rendered
