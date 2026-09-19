@@ -3,7 +3,19 @@
 
 reviews:
   auto_review:
-    # 0 disables the pause entirely, which is the schema's documented sentinel
+    # This repository is reviewed by GitHub Copilot, not CodeRabbit.
+    #
+    # CodeRabbit's OSS tier requires a public repository with fewer than 10
+    # stars to have its reviews triggered by hand, and this one has 4. So
+    # automatic review here stops on 2026-10-02 when the Advanced trial ends,
+    # whatever this file says. Turning it off now states the arrangement
+    # rather than letting it lapse into it, and avoids two reviewers on the
+    # same pull request for the remaining trial days.
+    #
+    # An on-demand '@coderabbitai review' comment still works.
+    enabled: false
+    # Inert while enabled is false; kept so re-enabling does not silently
+    # fall back to the default of 5. 0 disables the pause entirely, which is the schema's documented sentinel
     # ("Set to 0 to disable"), not a large number chosen by hand. At the default
     # of 5, automatic review stops silently once a pull request has five
     # reviewed commits, and a poller waiting on the verdict reads that pause as
