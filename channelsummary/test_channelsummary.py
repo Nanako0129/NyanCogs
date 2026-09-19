@@ -2429,7 +2429,19 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             # Full-width punctuation carries its own side bearing; an ASCII
             # space next to one is a typographic error in Chinese.
             ("透過 `fastapi`、`uvicorn` 建立", "透過 `fastapi`、`uvicorn` 建立"),
-            ("腳本（`proxy.py`）使用", "腳本（`proxy.py`）使用"),
+            # A bracket encloses rather than separates, so the span inside one
+            # gets a gap. Reported as still cramped after the first pass.
+            ("腳本（`proxy.py`）使用", "腳本（ `proxy.py` ）使用"),
+            ("CLI（`fm`）。", "CLI（ `fm` ）。"),
+            ("他說「`exit`」就好", "他說「 `exit` 」就好"),
+            # Terminal marks stay closed up: a space before 、 。 ， is wrong.
+            ("上傳了 `a.zip`，表示", "上傳了 `a.zip`，表示"),
+            # A span at either end of the string gains nothing. "" is a
+            # substring of every string, so an unguarded membership test added a
+            # space here.
+            ("`only`", "`only`"),
+            ("`head` 後面", "`head` 後面"),
+            ("前面 `tail`", "前面 `tail`"),
             ("執行`exit`。", "執行 `exit`。"),
             # ASCII punctuation that has to stay attached.
             ("See `config.toml` (and `env`) now.", "See `config.toml` (and `env`) now."),
