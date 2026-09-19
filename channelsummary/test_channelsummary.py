@@ -1277,7 +1277,11 @@ class TestResponseBoundary(unittest.TestCase):
         raw = {
             "model": "gpt-5.6",
             "output": [
-                {"type": "reasoning", "id": "reason_1", "summary": []},
+                {
+                    "type": "reasoning",
+                    "id": "reason_1",
+                    "summary": [{"type": "summary_text", "text": "HIDDEN CHAIN OF THOUGHT"}],
+                },
                 {"type": "web_search_call", "id": "web_1", "status": "completed"},
                 {
                     "type": "message",
@@ -1299,7 +1303,13 @@ class TestResponseBoundary(unittest.TestCase):
         self.assertEqual(result.text, "summary")
         self.assertEqual(result.hosted_calls, 1)
         self.assertEqual(result.citations[0].url, "https://example.com/a")
-        self.assertNotIn("reason", repr(result))
+        # The reasoning item is discarded. Asserting on its content rather than
+        # on the word "reason": a token count named reasoning_tokens is a number,
+        # not the chain of thought, and pinning the substring made adding one
+        # fail a test that was never about field names.
+        self.assertNotIn("HIDDEN CHAIN OF THOUGHT", repr(result))
+        self.assertNotIn("reason_1", repr(result))
+        self.assertIsNone(result.refusal)
 
     def test_invalid_envelope_is_classified_without_changing_public_error(self) -> None:
         with self.assertRaises(SummaryError) as caught:
@@ -3551,6 +3561,119 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[1. example.com](https://example.com/source)", embeds[0].description)
         self.assertIn("實際引用 3 則", embeds[0].footer.text)
         self.assertIn("model: gpt-5.6-luna｜effort: high", embeds[0].footer.text)
+
+    async def test_usage_accumulates_across_turns_and_reaches_the_footer(self) -> None:
+        message = self.messages[0]
+        final = {
+            "overview": "done",
+            "topics": [
+                {
+                    "title": "Topic",
+                    "opener_message_id": str(message.id),
+                    "opener_user_id": str(message.author.id),
+                    "boundary_reason": "explicit_start",
+                    "summary": "done",
+                    "source_message_ids": [str(message.id)],
+                }
+            ],
+        }
+        args = '{"query":"","author_id":"","before_message_id":"","after_message_id":"","start_unix":0,"end_unix":0,"limit":10}'
+        cog = object.__new__(ChannelSummary)
+        cog._reserve_guild_attempt = AsyncMock()
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cog._search_channel_history = AsyncMock(
+            return_value=json.dumps({"status": "ok", "results": []}, separators=(",", ":"))
+        )
+        cog.request_provider = AsyncMock(
+            side_effect=[
+                NormalizedResponse(
+                    None, None, (FunctionCall("c", "search_channel_history", args),), (), None, 0,
+                    channelsummary_module.ProviderUsage(100, 200, 50, 0.001),
+                ),
+                NormalizedResponse(
+                    json.dumps(final), None, (), (), "model-1", 0,
+                    channelsummary_module.ProviderUsage(300, 400, 60, 0.002),
+                ),
+            ]
+        )
+        state = RunState(message.id, {message.id}, {message.id: message}, hard_start_id=message.id)
+        await cog._run_agent(
+            SimpleNamespace(id=123456789012345678),
+            self.channel,
+            profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False},
+            state,
+            "from",
+            None,
+        )
+        self.assertEqual((state.input_tokens, state.output_tokens, state.reasoning_tokens), (400, 600, 110))
+        self.assertAlmostEqual(state.cost, 0.003)
+        self.assertTrue(state.cost_reported)
+        footer = ChannelSummary._footer(
+            {**GUILD_DEFAULTS, "model": "model-1"}, state, {message.id}, "model-1"
+        )
+        self.assertIn("tokens 輸入 400｜輸出 600（推理 110）｜費用 US$0.003000", footer)
+
+    def test_spend_line_reports_only_what_the_provider_said(self) -> None:
+        empty = RunState(1, set(), {})
+        self.assertEqual(ChannelSummary._spend_line(empty), "")
+
+        priced = RunState(
+            1, set(), {}, provider_calls=2, input_tokens=4_070, output_tokens=10_496,
+            reasoning_tokens=9_789, cost=0.0424125, cost_reported=True,
+        )
+        self.assertEqual(
+            ChannelSummary._spend_line(priced),
+            "tokens 輸入 4,070｜輸出 10,496（推理 9,789）｜費用 US$0.042412｜2 次呼叫",
+        )
+
+        # A provider that reports tokens but no price gets no invented figure.
+        unpriced = RunState(1, set(), {}, provider_calls=1, input_tokens=1_200, output_tokens=800)
+        line = ChannelSummary._spend_line(unpriced)
+        self.assertEqual(line, "tokens 輸入 1,200｜輸出 800｜1 次呼叫")
+        self.assertNotIn("US$", line)
+
+    def test_usage_is_read_from_both_dialect_shapes_and_bounded(self) -> None:
+        responses = channelsummary_module._provider_usage(
+            {
+                "usage": {
+                    "input_tokens": 4_070,
+                    "output_tokens": 10_496,
+                    "output_tokens_details": {"reasoning_tokens": 9_789},
+                    "cost": 0.0424125,
+                }
+            }
+        )
+        self.assertEqual(
+            (responses.input_tokens, responses.output_tokens, responses.reasoning_tokens, responses.cost),
+            (4_070, 10_496, 9_789, 0.0424125),
+        )
+        chat = channelsummary_module._provider_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 34,
+                    "completion_tokens_details": {"reasoning_tokens": 5},
+                }
+            }
+        )
+        self.assertEqual((chat.input_tokens, chat.output_tokens, chat.reasoning_tokens, chat.cost), (12, 34, 5, None))
+
+        # Provider-supplied, therefore not trusted.
+        for usage in (
+            None,
+            "not a mapping",
+            {"input_tokens": -1, "output_tokens": True, "cost": -0.5},
+            {"input_tokens": 10**12, "cost": 10**9},
+            {"cost": float("nan")},
+            {"cost": "0.04"},
+            {"output_tokens_details": "not a mapping"},
+        ):
+            with self.subTest(usage=usage):
+                parsed = channelsummary_module._provider_usage({"usage": usage})
+                self.assertEqual(parsed.input_tokens, 0)
+                self.assertEqual(parsed.output_tokens, 0)
+                self.assertIsNone(parsed.cost)
 
     def test_embed_page_limit_is_explicit(self) -> None:
         pages = split_embed_text(["x" * 3_900 for _ in range(10)])

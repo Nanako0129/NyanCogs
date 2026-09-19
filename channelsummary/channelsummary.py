@@ -410,6 +410,17 @@ class ImageInput:
 
 
 @dataclass(frozen=True)
+class ProviderUsage:
+    """What one provider call reported it consumed. Provider-supplied, so bounded."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    # None when the provider reports no price. OpenRouter does; OpenAI does not.
+    cost: float | None = None
+
+
+@dataclass(frozen=True)
 class NormalizedResponse:
     text: str | None
     refusal: str | None
@@ -417,6 +428,7 @@ class NormalizedResponse:
     citations: tuple[Citation, ...]
     model: str | None
     hosted_calls: int
+    usage: ProviderUsage = ProviderUsage()
 
 
 @dataclass(frozen=True)
@@ -445,6 +457,11 @@ class RunState:
     hosted_calls: int = 0
     firecrawl_calls: int = 0
     provider_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cost: float = 0.0
+    cost_reported: bool = False
     hard_start_id: int = 0
     boundary_backfills: int = 0
     boundary_reason: str | None = None
@@ -1054,7 +1071,15 @@ def _normalize_responses(
             stage=_ResponseStage.PROVIDER_ENVELOPE,
             reason=_ResponseReason.TOOL_OR_CITATION_CONTRACT_INVALID,
         )
-    return NormalizedResponse(text, refusal, tuple(calls), tuple(citations), _bounded_model(raw.get("model")), hosted)
+    return NormalizedResponse(
+        text,
+        refusal,
+        tuple(calls),
+        tuple(citations),
+        _bounded_model(raw.get("model")),
+        hosted,
+        _provider_usage(raw),
+    )
 
 
 def _normalize_chat(
@@ -1142,7 +1167,15 @@ def _normalize_chat(
             stage=_ResponseStage.PROVIDER_ENVELOPE,
             reason=_ResponseReason.TOOL_OR_CITATION_CONTRACT_INVALID,
         )
-    return NormalizedResponse(text, refusal, tuple(calls), tuple(citations), _bounded_model(raw.get("model")), 0)
+    return NormalizedResponse(
+        text,
+        refusal,
+        tuple(calls),
+        tuple(citations),
+        _bounded_model(raw.get("model")),
+        0,
+        _provider_usage(raw),
+    )
 
 
 async def read_bounded_response(response: Any, max_bytes: int = MAX_RESPONSE_BYTES) -> bytes:
@@ -1152,6 +1185,58 @@ async def read_bounded_response(response: Any, max_bytes: int = MAX_RESPONSE_BYT
         if len(data) > max_bytes:
             raise SummaryError(ErrorCode.RESPONSE_TOO_LARGE)
     return bytes(data)
+
+
+MAX_REPORTED_TOKENS = 100_000_000
+# One summary costing more than this is a provider error or a decimal in the
+# wrong place, not a bill to display as if it were true.
+MAX_REPORTED_COST = 1_000.0
+
+
+def _bounded_token_count(value: Any) -> int:
+    """A provider-reported token count, or 0 when it is not a plain count."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value if 0 <= value <= MAX_REPORTED_TOKENS else 0
+
+
+def _bounded_cost(value: Any) -> float | None:
+    """A provider-reported price, or None when it is absent or implausible."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or not 0 <= number <= MAX_REPORTED_COST:
+        return None
+    return number
+
+
+def _provider_usage(raw: Mapping[str, Any]) -> ProviderUsage:
+    """Read the usage block without trusting any of it.
+
+    Responses dialects report `input_tokens`/`output_tokens`; Chat Completions
+    reports `prompt_tokens`/`completion_tokens`. `cost` is an OpenRouter
+    extension and is simply absent elsewhere. Every field is optional: a missing
+    or malformed one becomes 0 or None rather than failing the summary, because
+    a wrong number in the footer is not worth discarding a finished summary for.
+    """
+    usage = raw.get("usage")
+    if not isinstance(usage, Mapping):
+        return ProviderUsage()
+    details = usage.get("output_tokens_details")
+    reasoning = details.get("reasoning_tokens") if isinstance(details, Mapping) else None
+    if reasoning is None:
+        completion = usage.get("completion_tokens_details")
+        reasoning = completion.get("reasoning_tokens") if isinstance(completion, Mapping) else None
+    return ProviderUsage(
+        input_tokens=_bounded_token_count(
+            usage.get("input_tokens", usage.get("prompt_tokens"))
+        ),
+        output_tokens=_bounded_token_count(
+            usage.get("output_tokens", usage.get("completion_tokens"))
+        ),
+        reasoning_tokens=_bounded_token_count(reasoning),
+        cost=_bounded_cost(usage.get("cost")),
+    )
 
 
 def _http_error(status: int) -> ErrorCode:
@@ -2836,6 +2921,12 @@ class ChannelSummary(commands.Cog):
                 api_key=provider_key,
                 accept_citations=web_backend != "firecrawl",
             )
+            state.input_tokens += response.usage.input_tokens
+            state.output_tokens += response.usage.output_tokens
+            state.reasoning_tokens += response.usage.reasoning_tokens
+            if response.usage.cost is not None:
+                state.cost += response.usage.cost
+                state.cost_reported = True
             actual_model = response.model or actual_model
             if response.hosted_calls > remaining_hosted:
                 raise SummaryError(
@@ -3132,10 +3223,34 @@ class ChannelSummary(commands.Cog):
         end = max(message.created_at for message in considered).astimezone(zone)
         span = f"{start:%Y/%m/%d %H:%M}–{end:%H:%M} {settings['timezone']}"
         model = actual_model or f"requested:{settings['model']}"
-        return (
-            f"範圍 {len(state.base_ids)} 則｜Agent 加讀 {len(state.extra_ids)} 則｜實際引用 {len(cited_ids)} 則\n"
-            f"{span}｜model: {model}｜effort: {settings['reasoning_effort']}"
-        )
+        lines = [
+            f"範圍 {len(state.base_ids)} 則｜Agent 加讀 {len(state.extra_ids)} 則｜實際引用 {len(cited_ids)} 則",
+            f"{span}｜model: {model}｜effort: {settings['reasoning_effort']}",
+        ]
+        spend = ChannelSummary._spend_line(state)
+        if spend:
+            lines.append(spend)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _spend_line(state: RunState) -> str:
+        """What this summary consumed, or "" when the provider reported nothing.
+
+        Cost is shown only when a provider actually priced the call. OpenRouter
+        does; OpenAI does not, and inventing a figure from a price table this
+        cog does not maintain would be a number that looks measured and is not.
+        """
+        if not (state.input_tokens or state.output_tokens or state.cost_reported):
+            return ""
+        parts = [
+            f"tokens 輸入 {state.input_tokens:,}｜輸出 {state.output_tokens:,}"
+        ]
+        if state.reasoning_tokens:
+            parts.append(f"（推理 {state.reasoning_tokens:,}）")
+        line = "".join(parts)
+        if state.cost_reported:
+            line += f"｜費用 US${state.cost:.6f}"
+        return f"{line}｜{state.provider_calls} 次呼叫"
 
     def _render_embeds(
         self,
