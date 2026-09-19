@@ -1204,7 +1204,14 @@ def _bounded_cost(value: Any) -> float | None:
     """A provider-reported price, or None when it is absent or implausible."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        # json.loads produces an unbounded int, and float() refuses one past the
+        # double range. Bounding the value was not enough; the conversion itself
+        # had to be bounded, or a 400-digit cost raised OverflowError straight
+        # out of normalize_response, which catches only SummaryError.
+        return None
     if number != number or not 0 <= number <= MAX_REPORTED_COST:
         return None
     return number

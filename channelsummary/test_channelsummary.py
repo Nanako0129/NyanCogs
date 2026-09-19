@@ -3614,6 +3614,20 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("tokens 輸入 400｜輸出 600（推理 110）｜費用 US$0.003000", footer)
 
+    def test_an_unconvertible_cost_does_not_escape_normalization(self) -> None:
+        # The bound on the value was not a bound on the conversion: a 400-digit
+        # integer raised OverflowError out of normalize_response, which catches
+        # only SummaryError, so a finished summary died on a footer number.
+        raw = json.loads(
+            '{"model":"m","output":[{"type":"message","id":"m1","role":"assistant",'
+            '"content":[{"type":"output_text","text":"ok","annotations":[]}]}],'
+            '"usage":{"cost":' + "9" * 400 + "}}"
+        )
+        self.assertIsInstance(raw["usage"]["cost"], int)
+        result = normalize_response("openai_responses", raw)
+        self.assertEqual(result.text, "ok")
+        self.assertIsNone(result.usage.cost)
+
     def test_spend_line_reports_only_what_the_provider_said(self) -> None:
         empty = RunState(1, set(), {})
         self.assertEqual(ChannelSummary._spend_line(empty), "")
@@ -3666,6 +3680,10 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             {"input_tokens": -1, "output_tokens": True, "cost": -0.5},
             {"input_tokens": 10**12, "cost": 10**9},
             {"cost": float("nan")},
+            # json.loads yields an unbounded int; float() refuses one past the
+            # double range, and that OverflowError escaped normalize_response.
+            {"cost": 10**400},
+            {"cost": -(10**400)},
             {"cost": "0.04"},
             {"output_tokens_details": "not a mapping"},
         ):
