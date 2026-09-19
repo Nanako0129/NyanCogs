@@ -2409,6 +2409,52 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         self.assertIn("no markdown code fence around it", prompt)
         self.assertIn("use several complete sentences rather than a one-line gist", prompt)
 
+    def test_inline_spans_are_separated_from_the_text_they_touch(self) -> None:
+        for source, expected in (
+            # The reported case: code jammed against CJK on both sides.
+            ("將本機`:1976`端口轉為", "將本機 `:1976` 端口轉為"),
+            ("用`a`和`b`比較。", "用 `a` 和 `b` 比較。"),
+            ("他說**很重要**的事情", "他說 **很重要** 的事情"),
+            ("用~~舊的~~新的", "用 ~~舊的~~ 新的"),
+            # Full-width punctuation carries its own side bearing; an ASCII
+            # space next to one is a typographic error in Chinese.
+            ("透過 `fastapi`、`uvicorn` 建立", "透過 `fastapi`、`uvicorn` 建立"),
+            ("腳本（`proxy.py`）使用", "腳本（`proxy.py`）使用"),
+            ("執行`exit`。", "執行 `exit`。"),
+            # ASCII punctuation that has to stay attached.
+            ("See `config.toml` (and `env`) now.", "See `config.toml` (and `env`) now."),
+            ("run `a`, then `b`.", "run `a`, then `b`."),
+            # Already spaced, and not a span at all.
+            ("already has `spaces` here", "already has `spaces` here"),
+            ("2 * 3 * 4 = 24", "2 * 3 * 4 = 24"),
+            # A span has to sit between non-identifier characters, so names with
+            # underscores are left alone. The reported screenshot contained one.
+            ("a_b_c identifiers stay", "a_b_c identifiers stay"),
+            ("anthropic_fm_proxy.py 在`__init__`裡", "anthropic_fm_proxy.py 在 `__init__` 裡"),
+            ("路徑是 `/tmp/a_b.py`", "路徑是 `/tmp/a_b.py`"),
+            ("用`x`和__y__比較", "用 `x` 和 __y__ 比較"),
+            # A backtick run is captured whole. Matching one backtick of a pair
+            # put a space inside the closing run and corrupted the text.
+            ("將``foo``好", "將 ``foo`` 好"),
+            ("用```x```看", "用 ```x``` 看"),
+            # Syntax, not prose: a space next to an operator or separator is
+            # wrong, which is why the neighbour must be alphanumeric.
+            ("x=`value`", "x=`value`"),
+            ("路徑 a/`b`/c", "路徑 a/`b`/c"),
+            ("1+`n`+2", "1+`n`+2"),
+            ("設 `a`=1", "設 `a`=1"),
+            ("", ""),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(channelsummary_module.space_wrapped_spans(source), expected)
+
+    def test_spacing_runs_before_escaping_and_keeps_mentions_intact(self) -> None:
+        rendered = sanitize_summary_text(
+            "將本機`:1976`端口交給 <@444444444444444444> 處理", {444444444444444444}
+        )
+        self.assertIn("本機 \\`:1976\\` 端口", rendered)
+        self.assertIn("<@444444444444444444>", rendered)
+
     def test_safe_summary_rendering_keeps_only_valid_user_mentions(self) -> None:
         text = (
             "<@444444444444444444> [Discord Support](https://evil.example) "
