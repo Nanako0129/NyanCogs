@@ -1705,43 +1705,39 @@ def parse_agent_summary(raw: str, known: Mapping[int, discord.Message]) -> Agent
 
 
 # Markdown spans a model writes inline: code, bold, italic, strikethrough. The
-# closing delimiter must match the opening one, and the span may not be empty or
-# start with whitespace, so "2 * 3 * 4" is arithmetic rather than a span. The
-# span must also sit between non-identifier characters, so "a_b_c" and
+# closing delimiter must match the opening one, so a backtick run is captured
+# whole and closed by a run of the same length: without that, ``foo`` matched a
+# single backtick and a space was inserted into the closing run, corrupting the
+# text. The span may not be empty or start with whitespace, so "2 * 3 * 4" stays
+# arithmetic, and it must sit between non-identifier characters, so "a_b_c" and
 # "anthropic_fm_proxy.py" are names rather than emphasis. CJK is not in that
-# class, which is exactly the case this exists for.
+# class, which is the case this exists for.
 WRAPPED_SPAN_RE = re.compile(
-    r"(?<![0-9A-Za-z_\\])(\*\*|__|~~|`|\*|_)(?!\s)(.+?)(?<!\s)\1(?![0-9A-Za-z_])"
+    r"(?<![0-9A-Za-z_\\])(\*\*|__|~~|`+|\*|_)(?!\s)(.+?)(?<!\s)\1(?![0-9A-Za-z_])"
 )
-# A full-width glyph already carries its own side bearing, so an ASCII space
-# next to one is wrong on either side: "`httpx` 、" and "、 `uvicorn`" both read
-# as a typographic error in Chinese.
-FULLWIDTH_PUNCTUATION = "、。，．！？；：（）［］｛｝「」『』《》〈〉【】〔〕…—～·"
-# ASCII punctuation that has to stay attached to what precedes or follows it.
-NO_SPACE_BEFORE = FULLWIDTH_PUNCTUATION + ".,!?;:)]}\"'"
-NO_SPACE_AFTER = FULLWIDTH_PUNCTUATION + "([{\"'"
 
 
 def space_wrapped_spans(text: str) -> str:
     """Separate inline markdown spans from the text they are jammed against.
 
     Discord renders `code` pressed straight up against a CJK character with no
-    gap, which is what prompted this. The rule is the usual CJK one: put a space
-    between the span and a neighbouring word character, but never between it and
-    punctuation that has to stay attached.
+    gap, which is what prompted this. A space goes in only next to an
+    alphanumeric neighbour: that covers CJK, which is alphabetic, and excludes
+    everything a space would be wrong beside. Full-width punctuation carries its
+    own side bearing, so "`httpx` 、" is a typographic error, and "x=`value`" and
+    "a/`b`/c" are syntax rather than prose. An allowlist is used rather than a
+    list of punctuation to skip, because that list can never be complete.
     """
     result: list[str] = []
     end = 0
     for match in WRAPPED_SPAN_RE.finditer(text):
         before = text[end : match.start()]
         result.append(before)
-        previous = before[-1] if before else (result[-2][-1] if len(result) > 1 and result[-2] else "")
-        if previous and not previous.isspace() and previous not in NO_SPACE_AFTER:
+        if match.start() and text[match.start() - 1].isalnum():
             result.append(" ")
         result.append(match.group(0))
         end = match.end()
-        following = text[end : end + 1]
-        if following and not following.isspace() and following not in NO_SPACE_BEFORE:
+        if end < len(text) and text[end].isalnum():
             result.append(" ")
     result.append(text[end:])
     return "".join(result)

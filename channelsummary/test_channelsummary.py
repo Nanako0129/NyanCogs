@@ -2433,6 +2433,16 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             ("anthropic_fm_proxy.py 在`__init__`裡", "anthropic_fm_proxy.py 在 `__init__` 裡"),
             ("路徑是 `/tmp/a_b.py`", "路徑是 `/tmp/a_b.py`"),
             ("用`x`和__y__比較", "用 `x` 和 __y__ 比較"),
+            # A backtick run is captured whole. Matching one backtick of a pair
+            # put a space inside the closing run and corrupted the text.
+            ("將``foo``好", "將 ``foo`` 好"),
+            ("用```x```看", "用 ```x``` 看"),
+            # Syntax, not prose: a space next to an operator or separator is
+            # wrong, which is why the neighbour must be alphanumeric.
+            ("x=`value`", "x=`value`"),
+            ("路徑 a/`b`/c", "路徑 a/`b`/c"),
+            ("1+`n`+2", "1+`n`+2"),
+            ("設 `a`=1", "設 `a`=1"),
             ("", ""),
         ):
             with self.subTest(source=source):
