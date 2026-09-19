@@ -1809,27 +1809,41 @@ WRAPPED_SPAN_RE = re.compile(
 )
 
 
+# A span sitting immediately inside a full-width bracket still reads as cramped:
+# （`fm`） was reported as unfixed after the first spacing pass, because a bracket
+# encloses rather than separates. Terminal marks are deliberately absent here: a
+# space before 、 。 ， ！ ？ is a typographic error in Chinese, so "`zip`，" stays
+# closed up. Edit these two strings to change which marks get a gap.
+FULLWIDTH_OPENING = "（［｛「『《〈【〔〖〘〚"
+FULLWIDTH_CLOSING = "）］｝」』》〉】〕〗〙〛"
+
+
 def space_wrapped_spans(text: str) -> str:
     """Separate inline markdown spans from the text they are jammed against.
 
     Discord renders `code` pressed straight up against a CJK character with no
-    gap, which is what prompted this. A space goes in only next to an
-    alphanumeric neighbour: that covers CJK, which is alphabetic, and excludes
-    everything a space would be wrong beside. Full-width punctuation carries its
-    own side bearing, so "`httpx` 、" is a typographic error, and "x=`value`" and
-    "a/`b`/c" are syntax rather than prose. An allowlist is used rather than a
-    list of punctuation to skip, because that list can never be complete.
+    gap, which is what prompted this. A space goes in next to an alphanumeric
+    neighbour, which covers CJK because it is alphabetic, and next to a
+    full-width bracket that encloses the span. Everything else is left closed
+    up: "x=`value`" and "a/`b`/c" are syntax rather than prose, and "`httpx` 、"
+    is wrong. An allowlist is used rather than a list of punctuation to skip,
+    because that list can never be complete.
     """
     result: list[str] = []
     end = 0
     for match in WRAPPED_SPAN_RE.finditer(text):
         before = text[end : match.start()]
         result.append(before)
-        if match.start() and text[match.start() - 1].isalnum():
+        previous = text[match.start() - 1] if match.start() else ""
+        # `previous and` is load-bearing: "" is a substring of every string, so
+        # `"" in FULLWIDTH_OPENING` is True and a span at position 0 would gain a
+        # leading space.
+        if previous and (previous.isalnum() or previous in FULLWIDTH_OPENING):
             result.append(" ")
         result.append(match.group(0))
         end = match.end()
-        if end < len(text) and text[end].isalnum():
+        following = text[end] if end < len(text) else ""
+        if following and (following.isalnum() or following in FULLWIDTH_CLOSING):
             result.append(" ")
     result.append(text[end:])
     return "".join(result)
