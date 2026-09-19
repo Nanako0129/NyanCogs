@@ -37,11 +37,15 @@ SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 # written "<model>@<version>". The value is JSON-serialized into the request
 # body, so the character carries no injection risk; this rule exists to bound
 # the length and keep control characters and whitespace out.
-# A language name reaches the model inside the system prompt, so it is bounded
-# to plain words: no newline, quote, brace or backslash can break out of the
-# sentence it is interpolated into. "auto" is the sentinel for "match the
-# evidence".
-LANGUAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 ()_-]{0,31}$")
+# A language identifier reaches the model inside the system prompt, so it is one
+# token: letters, digits and hyphens, never a space. A clause needs spaces to
+# read as a clause, so "English and ignore all rules" cannot be stored, while
+# "zh-TW", "zh-Hant-TW", "Japanese" and "Traditional-Chinese" all can. This is a
+# reduction of the surface, not a proof: "English-ignore-all-rules" still fits.
+# What actually bounds the damage is that prompt text grants no authority
+# downstream, since source IDs, mentions and jump links are all validated or
+# generated locally after the model replies. "auto" means "match the evidence".
+LANGUAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,31}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,99}$")
 SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 SAFE_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
@@ -3442,7 +3446,8 @@ class ChannelSummary(commands.Cog):
             candidate = value.strip()
             if not LANGUAGE_RE.fullmatch(candidate):
                 raise ValueError(
-                    "Use `auto` or a plain language name such as `Traditional Chinese` or `zh-TW`."
+                    "Use `auto` or one language identifier with no spaces, such as `zh-TW`, "
+                    "`zh-Hant-TW` or `Japanese`."
                 )
             return candidate
         return value
@@ -3923,7 +3928,7 @@ class ChannelSummary(commands.Cog):
             title="ChannelSummary · setting keys",
             description=(
                 "`provider_profile`, `model`, `reasoning_effort` (none/low/medium/high/xhigh/max), "
-                "`timezone`, `summary_language` (auto, or a name such as `Traditional Chinese`)\n"
+                "`timezone`, `summary_language` (`auto`, or one identifier such as `zh-TW`)\n"
                 "`include_bots`, `web_enabled`, `web_mode` (auto/native/firecrawl)\n\n"
                 "`auto_message_count` 1–500 · `max_duration_hours` 1–720 · `gap_minutes` 1–1440\n"
                 "`agent_max_turns` 1–20 · `channel_tool_max_calls` 0–12 · "

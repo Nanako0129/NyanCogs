@@ -47,7 +47,8 @@ trusted LAN. Prefer HTTPS whenever it is available.
 Guild members with guild-level Manage Messages use `/summary settings` to pick
 a profile and model, adjust limits through the Select and Modal panel, review
 the data-export disclosure, and enable the Cog. Summaries are written in the dominant language of the
-messages by default; `summary_language` forces one instead. The equivalent text
+messages by default; `summary_language` forces one instead, as a single
+identifier with no spaces such as `zh-TW`, `zh-Hant-TW`, or `Japanese`. The equivalent text
 setting surface is `[p]summaryset set <key> <value>`; use
 `[p]summary help` for every key, range, provider command, and privacy detail.
 
