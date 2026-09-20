@@ -196,9 +196,17 @@ class TestReport(unittest.TestCase):
         self.assertIn("<#5>", rendered)
         self.assertIn("不會刪除、禁言或加反應", rendered)
 
-        # No index: the report still has to say where to look.
-        fallback = MessageWatch.report_embed(channel, items, None, ["敵意 0.95"])
-        self.assertIn("https://d/2", json.dumps(fallback.to_dict(), ensure_ascii=False))
+        # No index: the report says where to look without pointing at anyone.
+        # Linking one message here reads as an accusation of whoever wrote it.
+        fallback = json.dumps(
+            MessageWatch.report_embed(channel, items, None, ["敵意 0.95"]).to_dict(),
+            ensure_ascii=False,
+        )
+        self.assertIn("https://d/0", fallback)
+        self.assertIn("https://d/2", fallback)
+        for author in ("<@111>", "<@222>", "<@333>"):
+            with self.subTest(author=author):
+                self.assertNotIn(author, fallback)
 
 
 class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
@@ -240,6 +248,9 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
             (200, json.dumps({"answers": "not a mapping"}).encode()),
             (200, json.dumps({"no_answers": 1}).encode()),
             (200, b"x" * (module.MAX_RESPONSE_BYTES + 1)),
+            # Measured: 60,000 bytes of nesting is inside the byte cap and
+            # raises RecursionError, which is not a ValueError.
+            (200, (b"[" * 30000) + (b"]" * 30000)),
         ):
             with self.subTest(status=status, body=body[:20]):
                 self.assertIsNone(await self.request_with(status, body))
@@ -594,6 +605,48 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         await cog.flush(channel)
         cog.judge.assert_not_awaited()
         self.assertEqual(len(cog._pending[5]), 3)
+
+
+class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
+    async def test_watch_show_stays_inside_the_embed_field_limit(self) -> None:
+        # The guild that needs this surface most is the one watching enough
+        # channels to overflow the field, which Discord rejects outright.
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._last_judged = {}
+        cog._last_error = {item: (1_700_000_000.0, "report_forbidden") for item in range(80)}
+        settings = {**DEFAULT_GUILD, "report_channel": 77, "watched_channels": list(range(80))}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+
+        await MessageWatch.watch_show.callback(cog, ctx)
+        embed = ctx.send.await_args.kwargs["embed"]
+        field = next(f for f in embed.fields if f.name == "監看中的頻道")
+        self.assertLessEqual(len(field.value), module.EMBED_FIELD_LIMIT)
+        self.assertIn("未顯示", field.value)
+
+    async def test_watch_show_reports_the_last_problem_per_channel(self) -> None:
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._pending[5].extend(window(1, 2))
+        cog._last_judged = {5: 1_700_000_000.0}
+        cog._last_error = {5: (1_700_000_900.0, "report_forbidden")}
+        settings = {**DEFAULT_GUILD, "report_channel": 77, "watched_channels": [5]}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+
+        await MessageWatch.watch_show.callback(cog, ctx)
+        field = next(
+            f for f in ctx.send.await_args.kwargs["embed"].fields if f.name == "監看中的頻道"
+        )
+        self.assertIn("待判 `2`", field.value)
+        self.assertIn("report_forbidden", field.value)
 
 
 class TestEndToEnd(unittest.IsolatedAsyncioTestCase):

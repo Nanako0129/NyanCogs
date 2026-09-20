@@ -62,6 +62,9 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 # largest `window_size` (25) or a window could never fill.
 MAX_PENDING_MESSAGES = 64
 
+# Discord's own cap on one embed field value.
+EMBED_FIELD_LIMIT = 1024
+
 # Measured 2026-09-20 against jev-1.13.0 through the production key. Synthetic
 # cases separated at 0.93+ for scams and 0.95 for hostility, against 0.08 and
 # 0.03 for the cases designed to be mistaken for them (a warning *about* a
@@ -340,8 +343,13 @@ class MessageWatch(commands.Cog):
             return None
         try:
             decoded = json.loads(raw)
-        except ValueError:
-            log.warning("messagewatch: provider response was not JSON")
+        except (ValueError, RecursionError):
+            # RecursionError, because the byte cap does not bound nesting depth:
+            # measured on this interpreter, 60,000 bytes of nested arrays -- well
+            # inside MAX_RESPONSE_BYTES -- raises it, and it is not a ValueError,
+            # so it would escape this function's promise to return None on every
+            # failure and break the message handler instead.
+            log.warning("messagewatch: provider response was not usable JSON")
             return None
         answers = decoded.get("answers") if isinstance(decoded, Mapping) else None
         if not isinstance(answers, Mapping):
@@ -406,8 +414,16 @@ class MessageWatch(commands.Cog):
                 inline=False,
             )
         else:
+            # Both ends, not one message. The model crossed a threshold without
+            # naming a message, so pointing at a single one would read as an
+            # accusation of whoever happens to have written it.
             embed.add_field(
-                name="範圍", value=f"[最後一則]({window[-1]['jump_url']})", inline=False
+                name="範圍",
+                value=(
+                    f"[開頭]({window[0]['jump_url']}) → [結尾]({window[-1]['jump_url']})"
+                    f"（{len(window)} 則）"
+                ),
+                inline=False,
             )
         embed.set_footer(
             text=f"判斷依據 {len(window)} 則訊息。這是提示，不是裁決；本 Cog 不會刪除、禁言或加反應。"
@@ -449,9 +465,14 @@ class MessageWatch(commands.Cog):
         unjudged while a request was out -- lived in the state that seam needed.
 
         The cost is that ingestion for this channel pauses for the length of one
-        request. No message is lost: each arrives in its own task and appends
-        when the lock frees. What it buys is that `[p]watch disable` returning
-        means the export has stopped, which is what the disclosure promises.
+        request. The pause itself drops nothing -- each message arrives in its
+        own task and appends when the lock frees -- but the queue is bounded at
+        MAX_PENDING_MESSAGES, so a backlog longer than that during one request
+        does evict its oldest entries. That cap predates this change and is
+        deliberate; the point here is only that "nothing is lost" would be the
+        wrong thing to write down. What the pause buys is that `[p]watch
+        disable` returning means the export has stopped, which is what the
+        disclosure promises.
         """
         async with self._locks[channel.id]:
             guild = channel.guild
@@ -670,6 +691,15 @@ class MessageWatch(commands.Cog):
             if noted is not None:
                 parts.append(f"⚠️ `{noted[1]}` <t:{int(noted[0])}:R>")
             rows.append(" · ".join(parts))
+        hidden = 0
+        # Discord rejects an embed field value over EMBED_FIELD_LIMIT, and the
+        # guild that needs this surface most is the one watching enough channels
+        # to overflow it. Room is reserved for the line that says so.
+        while rows and len("\n".join(rows)) > EMBED_FIELD_LIMIT - 40:
+            rows.pop()
+            hidden += 1
+        if hidden:
+            rows.append(f"…另 {hidden} 個頻道未顯示")
         watched = "\n".join(rows) or "（無）"
         report = f"<#{settings['report_channel']}>" if settings["report_channel"] else "（未設定）"
         embed = discord.Embed(title="MessageWatch 設定", colour=discord.Colour.blurple())
