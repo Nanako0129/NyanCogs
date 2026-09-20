@@ -84,6 +84,19 @@ class TestOutboundPayload(unittest.TestCase):
         self.assertEqual(clean_text(""), "")
         self.assertEqual(len(clean_text("字" * (MAX_MESSAGE_CHARS + 500))), MAX_MESSAGE_CHARS)
 
+    def test_the_question_block_carries_no_identity_either(self) -> None:
+        # build_state is not the only thing that leaves: the scam_index option
+        # labels carry the alias and the message text too. The data statement
+        # test pins build_state's fields, so a new field added here alone would
+        # ship with the statement unchanged and every test green.
+        items = anonymise(window(111111111111111111, 222222222222222222))
+        body = json.dumps(build_questions(items), ensure_ascii=False)
+        for secret in ("111111111111111111", "222222222222222222", "jump_url", "https://d/"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, body)
+        criteria = build_questions(items)["scam_index"]["criteria"]
+        self.assertEqual(criteria["0"], f"u1：{items[0]['text']}")
+
     def test_scam_options_describe_the_message_they_select(self) -> None:
         # An ordinal describes nothing. With labels that said only "第 6 則訊息"
         # the model pointed one message off, 6 times out of 6 at confidence
@@ -194,7 +207,7 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
         cog.bot = MagicMock()
         return cog
 
-    async def request_with(self, status: int, body: bytes):
+    async def request_with(self, status: int, body: bytes, text: str = ""):
         response = MagicMock()
         response.status = status
         response.content.read = AsyncMock(return_value=body)
@@ -206,8 +219,11 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
         session_ctx = MagicMock()
         session_ctx.__aenter__ = AsyncMock(return_value=session)
         session_ctx.__aexit__ = AsyncMock(return_value=False)
+        items = anonymise(window(111)) if text else []
+        if items:
+            items[0]["text"] = text
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            return await self.cog().judge([], "c", "k")
+            return await self.cog().judge(items, "c", "k")
 
     async def test_a_good_answer_is_returned(self) -> None:
         body = json.dumps({"answers": {"any_scam": {"noul": 0.9}}}).encode()
@@ -227,6 +243,20 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(status=status, body=body[:20]):
                 self.assertIsNone(await self.request_with(status, body))
+
+    async def test_every_failure_is_logged_and_carries_no_message_content(self) -> None:
+        # Without this the failures are silent, and a moderator cannot tell a
+        # broken provider from a quiet week. The log must say what happened and
+        # must not repeat what people wrote.
+        secret = "這句話不可以出現在日誌裡"
+        for status, body in ((500, b"{}"), (429, b"{}"), (200, b"not json"),
+                             (200, json.dumps({"answers": "not a mapping"}).encode())):
+            with self.subTest(status=status):
+                with self.assertLogs(module.log, level="WARNING") as captured:
+                    self.assertIsNone(await self.request_with(status, body, text=secret))
+                blob = " ".join(captured.output)
+                self.assertNotIn(secret, blob)
+                self.assertIn("messagewatch:", blob)
 
     async def test_a_transport_error_returns_none(self) -> None:
         with patch(
@@ -342,9 +372,8 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         cog._pending = pending()
         cog._last_report = {}
         cog._locks = module.defaultdict(module.asyncio.Lock)
-        cog._judging = set()
-        # What the pre-send recheck sees, which a disable can change while a
-        # judgement is in flight.
+        cog._last_judged = {}
+        cog._last_error = {}
         scope.watched_channels = AsyncMock(return_value=settings["watched_channels"])
         cog._pending[5].extend(window(111, 222, 333))
         return cog
@@ -392,17 +421,23 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         # together here; with no overlap they never would be.
         self.assertEqual(second, ["m2", "m3", "m4", "m5"])
 
-    async def test_the_request_does_not_hold_the_ingestion_lock(self) -> None:
-        # Holding it would stall every later message in this channel for the
-        # whole provider timeout.
+    async def test_the_whole_flush_runs_under_the_channel_lock(self) -> None:
+        # The replaced version of this test asserted the opposite, and pinning
+        # that choice is what let three defects grow in the seam it created:
+        # the request ran outside the lock, so a second piece of shared state
+        # had to stand in for it and disable had to be re-checked twice. One
+        # rule, one lock. The cost is this channel's ingestion pausing for the
+        # length of one request, which is asserted here rather than implied.
         cog = self.cog(answers=self.QUIET)
-        channel, _ = self.channel()
+        channel, report = self.channel()
         observed = []
         cog.judge = AsyncMock(
-            side_effect=lambda *a, **k: observed.append(cog._locks[5].locked()) or self.QUIET
+            side_effect=lambda *a, **k: observed.append(cog._locks[5].locked()) or self.SCAM
         )
         await cog.flush(channel)
-        self.assertEqual(observed, [False])
+        self.assertEqual(observed, [True])
+        report.send.assert_awaited_once()
+        self.assertFalse(cog._locks[5].locked())
 
     async def test_a_quiet_window_reports_nothing(self) -> None:
         cog = self.cog(answers=self.QUIET)
@@ -461,7 +496,7 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         cog.config.guild.return_value.watched_channels = MagicMock(
             return_value=ValueContext(watched)
         )
-        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock(), typing=lambda: ValueContext(None))
         channel = SimpleNamespace(id=5, mention="<#5>")
 
         # Asserting the effects alone does not observe the lock, and a version
@@ -485,28 +520,13 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已清除", ctx.send.await_args.args[0])
         self.assertFalse(cog._locks[5].locked())
 
-    async def test_a_judgement_in_flight_when_the_channel_is_disabled_is_dropped(self) -> None:
-        # The request was already out when the moderator disabled the channel.
-        # The disclosure says disabling stops the sending immediately, and this
-        # is the case that promise is actually about.
-        cog = self.cog(answers=self.SCAM)
-        channel, report = self.channel()
-        scope = cog.config.guild.return_value
-
-        async def disabled_mid_request(*args, **kwargs):
-            scope.watched_channels = AsyncMock(return_value=[])
-            return self.SCAM
-
-        cog.judge = AsyncMock(side_effect=disabled_mid_request)
-        await cog.flush(channel)
-        cog.judge.assert_awaited_once()
-        report.send.assert_not_awaited()
-
-    async def test_only_one_judgement_per_channel_is_in_flight(self) -> None:
-        # on_message calls flush once per stride, so without the claim a busy
-        # channel opens a provider request every few messages, each waiting up
-        # to the full timeout against a shared quota.
-        cog = self.cog(answers=self.QUIET)
+    async def test_a_window_that_fills_during_a_request_is_still_judged(self) -> None:
+        # The design this replaced dropped that window: a flush arriving while
+        # a request was out returned immediately, and nothing ever came back
+        # for the queue. On a quiet channel a complete window could sit
+        # unjudged indefinitely -- the silent no-op this project cares about.
+        # Waiting on the lock is what makes it impossible.
+        cog = self.cog(answers=self.QUIET, cooldown_seconds=0)
         cog._pending[5].extend(window(4, 5, 6))
         channel, _ = self.channel()
         gate = module.asyncio.Event()
@@ -517,19 +537,56 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
 
         cog.judge = AsyncMock(side_effect=blocked)
         first = module.asyncio.create_task(cog.flush(channel))
-        try:
-            for _ in range(12):
-                await module.asyncio.sleep(0)
-            # Bounded, so dropping the claim fails this test instead of
-            # deadlocking the suite: without it this second call reaches the
-            # blocked provider and never returns.
-            await module.asyncio.wait_for(cog.flush(channel), timeout=2)
-            self.assertEqual(cog.judge.await_count, 1)
-        finally:
-            gate.set()
-            await first
-        # The claim is released, so the channel keeps working afterwards.
-        self.assertNotIn(5, cog._judging)
+        for _ in range(12):
+            await module.asyncio.sleep(0)
+        second = module.asyncio.create_task(cog.flush(channel))
+        for _ in range(12):
+            await module.asyncio.sleep(0)
+        self.assertEqual(cog.judge.await_count, 1)
+        self.assertFalse(second.done())
+        gate.set()
+        await module.asyncio.wait_for(module.asyncio.gather(first, second), timeout=5)
+        self.assertEqual(cog.judge.await_count, 2)
+
+    async def test_a_forbidden_report_channel_backs_off_instead_of_spinning(self) -> None:
+        # Without the backoff, every later window opens another paid request for
+        # a report that can never be delivered, silently, forever. A permission
+        # problem does not fix itself inside one cooldown.
+        cog = self.cog(answers=self.SCAM)
+        channel, report = self.channel()
+        report.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "no"))
+        with self.assertLogs(module.log, level="WARNING"):
+            await cog.flush(channel)
+        self.assertIn(5, cog._last_report)
+        self.assertEqual(cog._last_error[5][1], "report_forbidden")
+
+    async def test_a_silent_failure_is_recorded_for_watch_show(self) -> None:
+        # Seven failure paths return silently, and to a moderator they look
+        # exactly like a quiet week. This is where the difference is kept.
+        for override, key, reason in (
+            ({"report_channel": 0}, "k", "no_report_channel"),
+            ({}, None, "no_api_key"),
+        ):
+            with self.subTest(reason=reason):
+                cog = self.cog(answers=self.SCAM, **override)
+                cog.get_api_key = AsyncMock(return_value=key)
+                channel, _ = self.channel()
+                await cog.flush(channel)
+                self.assertEqual(cog._last_error[5][1], reason)
+
+        cog = self.cog(answers=None)
+        channel, _ = self.channel()
+        await cog.flush(channel)
+        self.assertEqual(cog._last_error[5][1], "provider_unavailable")
+        self.assertNotIn(5, cog._last_judged)
+
+    async def test_a_successful_judgement_clears_the_recorded_problem(self) -> None:
+        cog = self.cog(answers=self.QUIET)
+        cog._last_error[5] = (0.0, "provider_unavailable")
+        channel, _ = self.channel()
+        await cog.flush(channel)
+        self.assertNotIn(5, cog._last_error)
+        self.assertIn(5, cog._last_judged)
 
     async def test_a_partial_window_is_not_judged(self) -> None:
         cog = self.cog(answers=self.SCAM, window_size=8)
@@ -537,6 +594,80 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         await cog.flush(channel)
         cog.judge.assert_not_awaited()
         self.assertEqual(len(cog._pending[5]), 3)
+
+
+class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
+    """on_message into the real flush -- the path every fix was made on and no
+    test had ever walked. Both concurrency defects of review round 2 lived
+    here, and each was verified only at the seam it was written for."""
+
+    def cog(self, **overrides):
+        cog = object.__new__(MessageWatch)
+        cog.bot = MagicMock()
+        settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
+                    "watched_channels": [5], "report_channel": 77,
+                    "window_size": 4, "cooldown_seconds": 0, **overrides}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        scope.watched_channels = AsyncMock(return_value=settings["watched_channels"])
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        cog.get_api_key = AsyncMock(return_value="k")
+        cog._pending = pending()
+        cog._last_report = {}
+        cog._locks = module.defaultdict(module.asyncio.Lock)
+        cog._last_judged = {}
+        cog._last_error = {}
+        return cog
+
+    @staticmethod
+    def message(index: int):
+        report = MagicMock(spec=discord.TextChannel)
+        guild = MagicMock()
+        guild.id = 1
+        guild.get_channel.return_value = report
+        channel = SimpleNamespace(id=5, guild=guild, name="c", mention="<#5>")
+        return SimpleNamespace(
+            guild=guild, channel=channel, author=SimpleNamespace(id=40 + index, bot=False),
+            content=f"訊息 {index}", webhook_id=None, jump_url=f"https://d/{index}",
+        ), report
+
+    async def test_messages_flow_through_to_one_report(self) -> None:
+        cog = self.cog()
+        cog.judge = AsyncMock(return_value={"any_scam": {"noul": 0.97},
+                                            "scam_index": {"choice": "1"},
+                                            "is_hostile": {"noul": 0.01},
+                                            "heat": {"score": 0.2}})
+        report = None
+        for index in range(4):
+            message, report = self.message(index)
+            await cog.on_message(message)
+        cog.judge.assert_awaited_once()
+        report.send.assert_awaited_once()
+        # Half the window is kept, so the next exchange is not split from it.
+        self.assertEqual(len(cog._pending[5]), 2)
+        self.assertIn(5, cog._last_judged)
+
+    async def test_a_burst_produces_no_overlapping_requests(self) -> None:
+        # Eight handlers dispatched at once on one channel. Each judgement runs
+        # to completion before the next begins, because they share one lock.
+        cog = self.cog()
+        depth = 0
+        peak = 0
+
+        async def judging(*args, **kwargs):
+            nonlocal depth, peak
+            depth += 1
+            peak = max(peak, depth)
+            await module.asyncio.sleep(0)
+            depth -= 1
+            return {"any_scam": {"noul": 0.01}, "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}
+
+        cog.judge = AsyncMock(side_effect=judging)
+        messages = [self.message(index)[0] for index in range(8)]
+        await module.asyncio.gather(*(cog.on_message(message) for message in messages))
+        self.assertEqual(peak, 1)
+        self.assertGreaterEqual(cog.judge.await_count, 1)
 
 
 class TestDataStatement(unittest.TestCase):

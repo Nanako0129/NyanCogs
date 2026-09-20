@@ -146,6 +146,13 @@ request and never stored. Attachments, embeds and links are
 not fetched or resolved. `[p]watch disable` stops a channel immediately and
 drops anything pending for it.
 
+`[p]watch show` is the diagnostic surface: per watched channel it prints how
+many messages are pending, when that channel was last actually judged, and the
+last reason nothing happened. Without those, a channel whose report channel lost
+its permissions looks exactly like a quiet week, because every failure path in
+this cog returns silently. Failures are also logged to `red.nyancogs.messagewatch`
+with a reason and no message content.
+
 Hostility and heat are judged over a window rather than a message, because an
 argument is a property of an exchange. Consecutive windows overlap by half, so
 an exchange straddling a boundary is still judged together and every message is

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from collections import defaultdict, deque
@@ -149,7 +150,10 @@ QUESTIONS: dict[str, dict[str, Any]] = {
     },
 }
 
-log_name = "red.nyancogs.messagewatch"
+# Every failure in this cog is a silent return, and to a moderator seven of
+# them look exactly like a quiet week with nothing to report. The log is where
+# the difference is recorded; `[p]watch show` carries the short version.
+log = logging.getLogger("red.nyancogs.messagewatch")
 
 
 def _bounded_probability(value: Any) -> float | None:
@@ -265,12 +269,10 @@ class MessageWatch(commands.Cog):
         )
         self._last_report: dict[int, float] = {}
         self._locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-        # Channels with a request in flight. `on_message` calls `flush` once per
-        # stride, so without this a busy channel opens a provider request every
-        # few messages while each waits up to REQUEST_TIMEOUT_SECONDS, against a
-        # shared quota. One at a time per channel; the queue keeps filling and
-        # is bounded, so the next flush judges the newest window instead.
-        self._judging: set[int] = set()
+        # What `[p]watch show` reports back: when a channel was last actually
+        # judged, and why nothing happened the last time something did not.
+        self._last_judged: dict[int, float] = {}
+        self._last_error: dict[int, tuple[float, str]] = {}
 
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
         """Drop any pending message this user wrote that has not been sent yet."""
@@ -278,6 +280,10 @@ class MessageWatch(commands.Cog):
             for item in list(queue):
                 if item.get("author_id") == user_id:
                     queue.remove(item)
+
+    def _note(self, channel_id: int, reason: str) -> None:
+        """Record why this channel produced nothing, for `[p]watch show`."""
+        self._last_error[channel_id] = (time.time(), reason)
 
     async def get_api_key(self) -> str | None:
         tokens = await self.bot.get_shared_api_tokens(TOKEN_SERVICE)
@@ -302,6 +308,7 @@ class MessageWatch(commands.Cog):
             ensure_ascii=False,
         ).encode()
         if len(payload) > MAX_REQUEST_BYTES:
+            log.warning("messagewatch: request over %d bytes, window dropped", MAX_REQUEST_BYTES)
             return None
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
@@ -318,18 +325,29 @@ class MessageWatch(commands.Cog):
                     allow_redirects=False,
                 ) as response:
                     if response.status != 200:
+                        log.warning("messagewatch: provider returned HTTP %d", response.status)
                         return None
                     raw = await response.content.read(MAX_RESPONSE_BYTES + 1)
                     if len(raw) > MAX_RESPONSE_BYTES:
+                        log.warning("messagewatch: provider response over %d bytes", MAX_RESPONSE_BYTES)
                         return None
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except asyncio.TimeoutError:
+            log.warning("messagewatch: provider timed out after %.0fs", REQUEST_TIMEOUT_SECONDS)
+            return None
+        except aiohttp.ClientError as error:
+            # The class only; the message can carry the URL and its query.
+            log.warning("messagewatch: provider transport failure (%s)", type(error).__name__)
             return None
         try:
             decoded = json.loads(raw)
         except ValueError:
+            log.warning("messagewatch: provider response was not JSON")
             return None
         answers = decoded.get("answers") if isinstance(decoded, Mapping) else None
-        return answers if isinstance(answers, Mapping) else None
+        if not isinstance(answers, Mapping):
+            log.warning("messagewatch: provider response carried no answers mapping")
+            return None
+        return answers
 
     @staticmethod
     def findings(
@@ -418,78 +436,91 @@ class MessageWatch(commands.Cog):
         return window
 
     async def flush(self, channel: discord.TextChannel | discord.Thread) -> None:
-        """Judge one full window for this channel and report if it crosses."""
-        guild = channel.guild
-        settings = await self.config.guild(guild).all()
-        # `[p]watch disable` leaves the watched set before it clears the queue,
-        # so a window that filled just before it must not still be exported.
-        if channel.id not in set(settings["watched_channels"]):
-            self._pending.pop(channel.id, None)
-            return
-        report_id = int(settings["report_channel"])
-        if not report_id:
-            return
-        report_channel = guild.get_channel(report_id)
-        if report_channel is None:
-            return
-        key = await self.get_api_key()
-        if key is None:
-            return
+        """Judge one full window for this channel and report if it crosses.
 
-        # The lock covers the queue and nothing else. Holding it across the
-        # request would stall every later message in this channel for the whole
-        # provider timeout, so judging and reporting happen outside it.
-        # Checked and claimed with no await in between, so two handlers cannot
-        # both pass it. Everything below runs inside the claim.
-        if channel.id in self._judging:
-            return
-        self._judging.add(channel.id)
-        try:
-            async with self._locks[channel.id]:
-                window = self._take_window(channel.id, int(settings["window_size"]))
+        Everything this cog does to one channel happens under that channel's
+        lock, the provider request and the send included. That is the whole
+        concurrency rule, stated once in code instead of five times in
+        comments: a second full window waits here instead of being dropped,
+        `[p]watch disable` waits here instead of racing, and there is no second
+        piece of shared state to keep in step with this one. Three of the four
+        defects found in review round 2 lived in the seam that existed when the
+        request ran outside this lock, and a fourth -- a full window left
+        unjudged while a request was out -- lived in the state that seam needed.
+
+        The cost is that ingestion for this channel pauses for the length of one
+        request. No message is lost: each arrives in its own task and appends
+        when the lock frees. What it buys is that `[p]watch disable` returning
+        means the export has stopped, which is what the disclosure promises.
+        """
+        async with self._locks[channel.id]:
+            guild = channel.guild
+            settings = await self.config.guild(guild).all()
+            if channel.id not in set(settings["watched_channels"]):
+                self._pending.pop(channel.id, None)
+                return
+            report_id = int(settings["report_channel"])
+            if not report_id:
+                self._note(channel.id, "no_report_channel")
+                return
+            report_channel = guild.get_channel(report_id)
+            if report_channel is None:
+                self._note(channel.id, "report_channel_missing")
+                log.warning("messagewatch: report channel %d is gone in guild %d", report_id, guild.id)
+                return
+            key = await self.get_api_key()
+            if key is None:
+                self._note(channel.id, "no_api_key")
+                return
+
+            window = self._take_window(channel.id, int(settings["window_size"]))
             if window is None:
-                return
-            anonymise(window)
-
-            answers = await self.judge(window, getattr(channel, "name", str(channel.id)), key)
-            if answers is None:
-                return
-            index, reasons = self.findings(answers, settings, len(window))
-            if not reasons:
                 return
 
             cooldown = int(settings["cooldown_seconds"])
-            # This section holds the channel lock across the send, which costs
-            # one Discord round trip of ingestion latency, to serialise with
-            # `[p]watch disable`: that command leaves the watched set under this
-            # same lock, so a judgement already in flight when a channel is
-            # disabled stops here instead of delivering. The disclosure promises
-            # disabling stops the sending immediately, and a request that was
-            # already out is exactly the case that promise is about. Two
-            # concurrent reports are not what this guards -- the claim above
-            # already allows only one judgement per channel at a time.
-            async with self._locks[channel.id]:
-                if channel.id not in set(await self.config.guild(guild).watched_channels()):
-                    return
-                now = time.monotonic()
-                last = self._last_report.get(channel.id)
-                # One argument spans many windows; without this the moderator
-                # channel gets a report every few messages for one exchange.
-                if last is not None and now - last < cooldown:
-                    return
-                try:
-                    await report_channel.send(
-                        embed=self.report_embed(channel, window, index, reasons),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                except discord.HTTPException:
-                    return
-                # Recorded only once a report was delivered: a transport failure
-                # must not silence the channel for the whole cooldown with
-                # nothing sent.
-                self._last_report[channel.id] = now
-        finally:
-            self._judging.discard(channel.id)
+            last = self._last_report.get(channel.id)
+            # Checked before the request, not after it. One argument spans many
+            # windows, and inside the cooldown none of them can be reported, so
+            # judging them would be paying the provider for an answer that
+            # cannot be delivered.
+            if last is not None and time.monotonic() - last < cooldown:
+                return
+
+            anonymise(window)
+            answers = await self.judge(window, getattr(channel, "name", str(channel.id)), key)
+            if answers is None:
+                self._note(channel.id, "provider_unavailable")
+                return
+            self._last_judged[channel.id] = time.time()
+            self._last_error.pop(channel.id, None)
+
+            index, reasons = self.findings(answers, settings, len(window))
+            if not reasons:
+                return
+            try:
+                await report_channel.send(
+                    embed=self.report_embed(channel, window, index, reasons),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.Forbidden:
+                # A permission problem does not fix itself in five minutes, and
+                # without backing off, every later window opens another provider
+                # request for a report that can never be delivered. The cooldown
+                # is the backoff that already exists.
+                self._last_report[channel.id] = time.monotonic()
+                self._note(channel.id, "report_forbidden")
+                log.warning(
+                    "messagewatch: cannot post to report channel %d in guild %d", report_id, guild.id
+                )
+                return
+            except discord.HTTPException as error:
+                self._note(channel.id, "report_failed")
+                log.warning("messagewatch: report send failed (%s)", type(error).__name__)
+                return
+            # Recorded only once a report was delivered: a transport failure
+            # must not silence the channel for the whole cooldown with nothing
+            # sent.
+            self._last_report[channel.id] = time.monotonic()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -586,20 +617,23 @@ class MessageWatch(commands.Cog):
     @watch_group.command(name="disable")
     async def watch_disable(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         """Stop watching one channel and drop anything pending for it."""
-        # Leaving the watched set and clearing the queue happen under the one
-        # lock, so every other path stops at the same instant: an `on_message`
-        # handler re-reads the set inside this lock, and a `flush` with a
-        # judgement in flight re-reads it inside this lock before sending.
-        # Without all of them this command's own claim would be false.
-        async with self._locks[channel.id]:
-            async with self.config.guild(ctx.guild).watched_channels() as watched:
-                if channel.id not in watched:
-                    message = f"{channel.mention} 本來就沒有在監看。"
-                else:
-                    watched.remove(channel.id)
-                    self._pending.pop(channel.id, None)
-                    self._last_report.pop(channel.id, None)
-                    message = f"停止監看 {channel.mention}，未送出的暫存也已清除。"
+        # Waits for the channel lock, so if a judgement is in flight this
+        # command returns only once it has finished. That wait is the reason
+        # the disclosure's "disabling stops the sending immediately" is true:
+        # when this replies, nothing for this channel is still on its way out.
+        # `typing()` is there so a moderator sees the wait rather than silence.
+        async with ctx.typing():
+            async with self._locks[channel.id]:
+                async with self.config.guild(ctx.guild).watched_channels() as watched:
+                    if channel.id not in watched:
+                        message = f"{channel.mention} 本來就沒有在監看。"
+                    else:
+                        watched.remove(channel.id)
+                        self._pending.pop(channel.id, None)
+                        self._last_report.pop(channel.id, None)
+                        self._last_judged.pop(channel.id, None)
+                        self._last_error.pop(channel.id, None)
+                        message = f"停止監看 {channel.mention}，未送出的暫存也已清除。"
         await ctx.send(message)
 
     @watch_group.command(name="set")
@@ -624,7 +658,19 @@ class MessageWatch(commands.Cog):
     async def watch_show(self, ctx: commands.Context) -> None:
         """Show the effective settings for this guild."""
         settings = await self.config.guild(ctx.guild).all()
-        watched = ", ".join(f"<#{item}>" for item in settings["watched_channels"]) or "（無）"
+        # Not just the id list: without the last judgement time and the last
+        # reason, a channel that has been silently failing for a week looks
+        # exactly like one with nothing to report.
+        rows = []
+        for item in settings["watched_channels"]:
+            parts = [f"<#{item}>", f"待判 `{len(self._pending.get(item, ()))}`"]
+            judged = self._last_judged.get(item)
+            parts.append(f"上次判斷 <t:{int(judged)}:R>" if judged else "尚未判斷過")
+            noted = self._last_error.get(item)
+            if noted is not None:
+                parts.append(f"⚠️ `{noted[1]}` <t:{int(noted[0])}:R>")
+            rows.append(" · ".join(parts))
+        watched = "\n".join(rows) or "（無）"
         report = f"<#{settings['report_channel']}>" if settings["report_channel"] else "（未設定）"
         embed = discord.Embed(title="MessageWatch 設定", colour=discord.Colour.blurple())
         embed.add_field(
