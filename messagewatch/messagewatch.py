@@ -153,6 +153,13 @@ DEFAULT_CHANNEL = {
     # prompted the feature enforces with a role, not a delete.
     "actions": list(DEFAULT_ACTIONS),
     "action_role": 0,
+    # 0.0 means "use the guild's rule_threshold". Rules are per-channel but the
+    # threshold was per-guild, and the separation between violating and clean
+    # messages differs by ruleset -- measured 2026-09-20: a venting channel's
+    # rules put violations at 0.94-0.98 against clean replies at 0.05-0.08, so
+    # 0.85 works there, while the server-wide gender-identity rule put
+    # violations at 0.49-0.96 against 0.04-0.05, so 0.85 misses half of them.
+    "rule_threshold": 0.0,
 }
 
 # Measured 2026-09-20 against jev-1.13.0 with a real channel ruleset (the one
@@ -313,6 +320,18 @@ QUESTIONS: dict[str, dict[str, Any]] = {
 # them look exactly like a quiet week with nothing to report. The log is where
 # the difference is recorded; `[p]watch show` carries the short version.
 log = logging.getLogger("red.nyancogs.messagewatch")
+
+
+def effective_rule_threshold(channel_settings: Mapping[str, Any], settings: Mapping[str, Any]) -> float:
+    """The rule threshold `flush`, `rule threshold` and `rule list` all use.
+
+    0.0 stored on the channel means "inherit the guild value", not "report
+    everything" -- `channel_value or guild_value` gets that right and
+    `if channel_value is not None` does not, since 0.0 is a valid stored
+    value and not a missing one. One function decides this so flush and the
+    two commands that report it cannot drift apart on what "effective" means.
+    """
+    return float(channel_settings["rule_threshold"]) or float(settings["rule_threshold"])
 
 
 def _bounded_probability(value: Any) -> float | None:
@@ -1129,7 +1148,14 @@ class MessageWatch(commands.Cog):
             self._last_judged[channel.id] = time.time()
             self._last_error.pop(channel.id, None)
 
-            index, reasons, rule_index = self.findings(answers, settings, len(window), rules)
+            # findings() reads settings["rule_threshold"] and keeps that one
+            # signature; the per-channel override is folded in here, in the
+            # copy it is handed, rather than adding a second parameter that
+            # every other caller of findings() would have to also thread.
+            effective_settings = {
+                **settings, "rule_threshold": effective_rule_threshold(channel_settings, settings)
+            }
+            index, reasons, rule_index = self.findings(answers, effective_settings, len(window), rules)
             if not reasons:
                 return
             pointed = index if index is not None else rule_index
@@ -1616,6 +1642,7 @@ class MessageWatch(commands.Cog):
     ) -> None:
         """Show a channel's rules, exactly as the model is given them."""
         settings = await self.config.channel(channel).all()
+        guild_settings = await self.config.guild(ctx.guild).all()
         rules = list(settings["rules"])
         lines = [f"{number}. {rule}" for number, rule in enumerate(rules, start=1)]
         embed = discord.Embed(
@@ -1625,7 +1652,56 @@ class MessageWatch(commands.Cog):
         )
         if settings["purpose"]:
             embed.add_field(name="頻道用途", value=settings["purpose"], inline=False)
+        channel_threshold = float(settings["rule_threshold"])
+        effective = effective_rule_threshold(settings, guild_settings)
+        source = "沿用伺服器設定" if not channel_threshold else "此頻道獨立設定"
+        embed.add_field(name="違規門檻", value=f"`{effective}`（{source}）", inline=False)
         await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @watch_rule.command(name="threshold")
+    async def watch_rule_threshold(
+        self, ctx: commands.Context, channel: discord.TextChannel, value: str = ""
+    ) -> None:
+        """Set this channel's own rule-violation threshold, or show it.
+
+        `0` clears the override back to inheriting the guild's rule_threshold.
+        Rules are per-channel but the threshold was per-guild, and how well
+        one number separates violating from clean messages differs by
+        ruleset -- see DEFAULT_CHANNEL's comment for the measured numbers.
+        """
+        if not value:
+            settings = await self.config.channel(channel).all()
+            guild_settings = await self.config.guild(ctx.guild).all()
+            channel_threshold = float(settings["rule_threshold"])
+            effective = effective_rule_threshold(settings, guild_settings)
+            source = "沿用伺服器設定" if not channel_threshold else "此頻道獨立設定"
+            await ctx.send(
+                f"{channel.mention} 的違規門檻是 `{effective}`（{source}）。",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        try:
+            parsed = float(value)
+        except ValueError:
+            await ctx.send("違規門檻需要是數字。")
+            return
+        # Same NaN trap as watch_set: `not low <= parsed <= high` rejects NaN,
+        # while `parsed < low or parsed > high` would let it through and make
+        # every probability comparison against it false.
+        if not 0.0 <= parsed <= 1.0:
+            await ctx.send("違規門檻必須介於 `0.0` 與 `1.0`。")
+            return
+        await self.config.channel(channel).rule_threshold.set(parsed)
+        if parsed == 0.0:
+            await ctx.send(
+                f"{channel.mention} 的違規門檻改回沿用伺服器設定。",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await ctx.send(
+            f"{channel.mention} 的違規門檻設為 `{parsed}`。",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @watch_rule.command(name="remove")
     async def watch_rule_remove(
