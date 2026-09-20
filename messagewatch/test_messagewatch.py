@@ -1164,6 +1164,14 @@ class TestModlogAndRole(unittest.IsolatedAsyncioTestCase):
         # each one is recorded. Measured: Red raises
         # "<name> is not a valid action type."
         cog = object.__new__(MessageWatch)
+        # cog_load also starts the sweep now, so the instance has to be
+        # loadable and the loop has to be stopped. Cancelling alone was not
+        # enough: without a `bot`, `_before_sweep` raises before the cleanup
+        # runs and the task is collected with an unretrieved exception.
+        cog.bot = MagicMock()
+        cog.bot.wait_until_red_ready = AsyncMock()
+        cog._pending = pending()
+        self.addCleanup(cog._sweep.cancel)
         registered = []
         with patch("messagewatch.messagewatch.modlog.register_casetype",
                    new=AsyncMock(side_effect=lambda **kw: registered.append(kw["name"]))):
@@ -1178,6 +1186,10 @@ class TestModlogAndRole(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_already_registered_case_type_is_not_fatal(self) -> None:
         cog = object.__new__(MessageWatch)
+        cog.bot = MagicMock()
+        cog.bot.wait_until_red_ready = AsyncMock()
+        cog._pending = pending()
+        self.addCleanup(cog._sweep.cancel)
         with patch("messagewatch.messagewatch.modlog.register_casetype",
                    new=AsyncMock(side_effect=RuntimeError("already registered"))):
             await cog.cog_load()  # must not raise
