@@ -342,6 +342,10 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         cog._pending = pending()
         cog._last_report = {}
         cog._locks = module.defaultdict(module.asyncio.Lock)
+        cog._judging = set()
+        # What the pre-send recheck sees, which a disable can change while a
+        # judgement is in flight.
+        scope.watched_channels = AsyncMock(return_value=settings["watched_channels"])
         cog._pending[5].extend(window(111, 222, 333))
         return cog
 
@@ -451,15 +455,81 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         report.send.assert_not_awaited()
         self.assertEqual(len(cog._pending[5]), 0)
 
-    async def test_disable_clears_the_queue_under_the_lock(self) -> None:
+    async def test_disable_leaves_the_watched_set_and_clears_under_one_lock(self) -> None:
         cog = self.cog(answers=self.SCAM)
-        scope = cog.config.guild.return_value
-        scope.watched_channels = MagicMock(return_value=ValueContext([5]))
+        watched = [5]
+        cog.config.guild.return_value.watched_channels = MagicMock(
+            return_value=ValueContext(watched)
+        )
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
         channel = SimpleNamespace(id=5, mention="<#5>")
-        await MessageWatch.watch_disable.callback(cog, ctx, channel)
+
+        # Asserting the effects alone does not observe the lock, and a version
+        # that dropped it passed that way. Hold the lock and watch disable wait.
+        await cog._locks[5].acquire()
+        task = module.asyncio.create_task(
+            MessageWatch.watch_disable.callback(cog, ctx, channel)
+        )
+        try:
+            for _ in range(12):
+                await module.asyncio.sleep(0)
+            self.assertFalse(task.done())
+            self.assertEqual(watched, [5])
+            self.assertEqual(len(cog._pending[5]), 3)
+        finally:
+            cog._locks[5].release()
+        await task
+
+        self.assertEqual(watched, [])
         self.assertEqual(len(cog._pending[5]), 0)
         self.assertIn("已清除", ctx.send.await_args.args[0])
+        self.assertFalse(cog._locks[5].locked())
+
+    async def test_a_judgement_in_flight_when_the_channel_is_disabled_is_dropped(self) -> None:
+        # The request was already out when the moderator disabled the channel.
+        # The disclosure says disabling stops the sending immediately, and this
+        # is the case that promise is actually about.
+        cog = self.cog(answers=self.SCAM)
+        channel, report = self.channel()
+        scope = cog.config.guild.return_value
+
+        async def disabled_mid_request(*args, **kwargs):
+            scope.watched_channels = AsyncMock(return_value=[])
+            return self.SCAM
+
+        cog.judge = AsyncMock(side_effect=disabled_mid_request)
+        await cog.flush(channel)
+        cog.judge.assert_awaited_once()
+        report.send.assert_not_awaited()
+
+    async def test_only_one_judgement_per_channel_is_in_flight(self) -> None:
+        # on_message calls flush once per stride, so without the claim a busy
+        # channel opens a provider request every few messages, each waiting up
+        # to the full timeout against a shared quota.
+        cog = self.cog(answers=self.QUIET)
+        cog._pending[5].extend(window(4, 5, 6))
+        channel, _ = self.channel()
+        gate = module.asyncio.Event()
+
+        async def blocked(*args, **kwargs):
+            await gate.wait()
+            return self.QUIET
+
+        cog.judge = AsyncMock(side_effect=blocked)
+        first = module.asyncio.create_task(cog.flush(channel))
+        try:
+            for _ in range(12):
+                await module.asyncio.sleep(0)
+            # Bounded, so dropping the claim fails this test instead of
+            # deadlocking the suite: without it this second call reaches the
+            # blocked provider and never returns.
+            await module.asyncio.wait_for(cog.flush(channel), timeout=2)
+            self.assertEqual(cog.judge.await_count, 1)
+        finally:
+            gate.set()
+            await first
+        # The claim is released, so the channel keeps working afterwards.
+        self.assertNotIn(5, cog._judging)
 
     async def test_a_partial_window_is_not_judged(self) -> None:
         cog = self.cog(answers=self.SCAM, window_size=8)
@@ -515,6 +585,18 @@ class TestDataStatement(unittest.TestCase):
         ):
             with self.subTest(source=source):
                 self.assertIn(CHANNEL_CLAUSE, text)
+
+    def test_the_model_is_pinned_to_the_version_the_thresholds_were_measured_on(self) -> None:
+        # An alias moves on the vendor's schedule and the probabilities behind
+        # it change with it, which would leave the thresholds calibrated against
+        # something no longer being deployed.
+        from pathlib import Path
+
+        self.assertNotIn("latest", module.MODEL)
+        self.assertNotIn("preview", module.MODEL)
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        section = readme.split("## MessageWatch", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(module.MODEL, section)
 
     def test_the_statement_names_what_leaves_and_what_does_not(self) -> None:
         statement = self.statement()

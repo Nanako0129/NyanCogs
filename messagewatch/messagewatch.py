@@ -31,7 +31,13 @@ from redbot.core.utils.views import SetApiView
 
 TOKEN_SERVICE = "messagewatch_typesafe"
 API_URL = "https://api.typesafe.ai/v1/systemone"
-MODEL = "jev-latest"
+# Pinned, not the `jev-latest` alias. The thresholds below were measured
+# against this exact version, and TypeSafe's own guidance is to pin a version
+# when thresholds are tuned to it, because an alias moves on their schedule and
+# the probabilities behind it can change without a change here. Verified
+# 2026-09-20: a request with this id returns 200 and reports `jev-1.13.0`.
+# Moving it means re-measuring the thresholds, not just editing this line.
+MODEL = "jev-1.13.0"
 
 # Discord's own limit is 4000 for most users; anything longer is truncated
 # before it leaves, so one pasted log cannot dominate a request.
@@ -259,6 +265,12 @@ class MessageWatch(commands.Cog):
         )
         self._last_report: dict[int, float] = {}
         self._locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Channels with a request in flight. `on_message` calls `flush` once per
+        # stride, so without this a busy channel opens a provider request every
+        # few messages while each waits up to REQUEST_TIMEOUT_SECONDS, against a
+        # shared quota. One at a time per channel; the queue keeps filling and
+        # is bounded, so the next flush judges the newest window instead.
+        self._judging: set[int] = set()
 
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
         """Drop any pending message this user wrote that has not been sent yet."""
@@ -427,36 +439,57 @@ class MessageWatch(commands.Cog):
         # The lock covers the queue and nothing else. Holding it across the
         # request would stall every later message in this channel for the whole
         # provider timeout, so judging and reporting happen outside it.
-        async with self._locks[channel.id]:
-            window = self._take_window(channel.id, int(settings["window_size"]))
-        if window is None:
+        # Checked and claimed with no await in between, so two handlers cannot
+        # both pass it. Everything below runs inside the claim.
+        if channel.id in self._judging:
             return
-        anonymise(window)
-
-        answers = await self.judge(window, getattr(channel, "name", str(channel.id)), key)
-        if answers is None:
-            return
-        index, reasons = self.findings(answers, settings, len(window))
-        if not reasons:
-            return
-
-        now = time.monotonic()
-        last = self._last_report.get(channel.id)
-        cooldown = int(settings["cooldown_seconds"])
-        # One argument spans many windows; without this the moderator channel
-        # gets a report every few messages for the same exchange.
-        if last is not None and now - last < cooldown:
-            return
+        self._judging.add(channel.id)
         try:
-            await report_channel.send(
-                embed=self.report_embed(channel, window, index, reasons),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            return
-        # Recorded only once a report was delivered: a transport failure must
-        # not silence the channel for the whole cooldown with nothing sent.
-        self._last_report[channel.id] = now
+            async with self._locks[channel.id]:
+                window = self._take_window(channel.id, int(settings["window_size"]))
+            if window is None:
+                return
+            anonymise(window)
+
+            answers = await self.judge(window, getattr(channel, "name", str(channel.id)), key)
+            if answers is None:
+                return
+            index, reasons = self.findings(answers, settings, len(window))
+            if not reasons:
+                return
+
+            cooldown = int(settings["cooldown_seconds"])
+            # This section holds the channel lock across the send, which costs
+            # one Discord round trip of ingestion latency, to serialise with
+            # `[p]watch disable`: that command leaves the watched set under this
+            # same lock, so a judgement already in flight when a channel is
+            # disabled stops here instead of delivering. The disclosure promises
+            # disabling stops the sending immediately, and a request that was
+            # already out is exactly the case that promise is about. Two
+            # concurrent reports are not what this guards -- the claim above
+            # already allows only one judgement per channel at a time.
+            async with self._locks[channel.id]:
+                if channel.id not in set(await self.config.guild(guild).watched_channels()):
+                    return
+                now = time.monotonic()
+                last = self._last_report.get(channel.id)
+                # One argument spans many windows; without this the moderator
+                # channel gets a report every few messages for one exchange.
+                if last is not None and now - last < cooldown:
+                    return
+                try:
+                    await report_channel.send(
+                        embed=self.report_embed(channel, window, index, reasons),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    return
+                # Recorded only once a report was delivered: a transport failure
+                # must not silence the channel for the whole cooldown with
+                # nothing sent.
+                self._last_report[channel.id] = now
+        finally:
+            self._judging.discard(channel.id)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -553,19 +586,21 @@ class MessageWatch(commands.Cog):
     @watch_group.command(name="disable")
     async def watch_disable(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         """Stop watching one channel and drop anything pending for it."""
-        async with self.config.guild(ctx.guild).watched_channels() as watched:
-            if channel.id not in watched:
-                await ctx.send(f"{channel.mention} 本來就沒有在監看。")
-                return
-            watched.remove(channel.id)
-        # Under the lock, and after leaving the watched set: an `on_message`
-        # handler already holding the lock appends and this clears it, and one
-        # that takes the lock afterwards re-reads the set and appends nothing.
-        # Without both halves this command's own claim would be false.
+        # Leaving the watched set and clearing the queue happen under the one
+        # lock, so every other path stops at the same instant: an `on_message`
+        # handler re-reads the set inside this lock, and a `flush` with a
+        # judgement in flight re-reads it inside this lock before sending.
+        # Without all of them this command's own claim would be false.
         async with self._locks[channel.id]:
-            self._pending.pop(channel.id, None)
-        self._last_report.pop(channel.id, None)
-        await ctx.send(f"停止監看 {channel.mention}，未送出的暫存也已清除。")
+            async with self.config.guild(ctx.guild).watched_channels() as watched:
+                if channel.id not in watched:
+                    message = f"{channel.mention} 本來就沒有在監看。"
+                else:
+                    watched.remove(channel.id)
+                    self._pending.pop(channel.id, None)
+                    self._last_report.pop(channel.id, None)
+                    message = f"停止監看 {channel.mention}，未送出的暫存也已清除。"
+        await ctx.send(message)
 
     @watch_group.command(name="set")
     async def watch_set(self, ctx: commands.Context, key: str, value: str) -> None:
