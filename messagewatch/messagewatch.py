@@ -1871,20 +1871,26 @@ class MessageWatch(commands.Cog):
         # Discord already sent, and nothing leaves here. `flush` decides
         # whether the channel actually reads them.
         images = eligible_attachments(message)
-        if not text:
-            # A bare screenshot is the commonest shape a scam takes here and it
-            # carries no text at all, so dropping it at this gate made the
-            # image feature unreachable for the case it was built for. The
-            # channel read is on this branch only, so the ordinary path still
-            # costs one settings lookup.
-            if not images or not await self.config.channel(channel).images():
-                return
+        # A bare screenshot is the commonest shape a scam takes here and it
+        # carries no text at all, so dropping it at this gate made the image
+        # feature unreachable for the case it was built for.
+        if not text and not images:
+            return
         async with self._locks[channel.id]:
             # Re-read inside the lock. `[p]watch disable` leaves the watched set
             # and then clears the queue under this same lock, so a handler that
             # passed the check above before the disable must not append after
             # the clear and leave a disabled channel holding message text.
             if channel.id not in set(await self.config.guild(guild).watched_channels()):
+                return
+            # An image-only message is worth queueing only where the channel
+            # actually reads images; anywhere else it is an empty message that
+            # pushes real ones out of the window. Inside the lock because
+            # `[p]watch images off` takes this same lock: read outside it, a
+            # disable landing in between would still leave this item queued.
+            # Only on this branch, so an ordinary message with text still costs
+            # one settings lookup rather than two.
+            if not text and not await self.config.channel(channel).images():
                 return
             self._pending[channel.id].append(
                 {
@@ -1893,10 +1899,10 @@ class MessageWatch(commands.Cog):
                     "text": text,
                     "jump_url": getattr(message, "jump_url", ""),
                     "at": time.monotonic(),
-                    # Captured here because the queue holds dictionaries and
+                    # Captured above because the queue holds dictionaries and
                     # the Message with its attachments is gone by the time the
                     # window is judged.
-                    "images": eligible_attachments(message),
+                    "images": images,
                 }
             )
             # hasattr: several tests build a partial cog that skips __init__.

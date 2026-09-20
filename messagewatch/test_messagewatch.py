@@ -412,6 +412,21 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         await cog.on_message(self.message(content="", attachments=[shot]))
         self.assertEqual(len(cog._pending[5]), 0)
 
+    async def test_the_image_gate_is_read_inside_the_lock(self) -> None:
+        # `[p]watch images off` takes this same lock. Read outside it, a disable
+        # landing between the gate and the append would still leave an empty
+        # item queued for a channel that no longer reads images.
+        cog = self.cog(images=True)
+        held = []
+        cog.config.channel.return_value.images = AsyncMock(
+            side_effect=lambda: held.append(cog._locks[5].locked()) or True
+        )
+        shot = SimpleNamespace(content_type="image/png", filename="s.png", size=4000,
+                               width=800, height=600, id=991,
+                               url="https://cdn.discordapp.com/x.png")
+        await cog.on_message(self.message(content="", attachments=[shot]))
+        self.assertEqual(held, [True])
+
     async def test_the_ordinary_path_does_not_read_the_channel_settings(self) -> None:
         # The channel read sits on the image-only branch so a message with text
         # still costs one settings lookup, not two.
