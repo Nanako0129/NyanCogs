@@ -151,8 +151,9 @@ channel, those rules and its purpose note. A venting or confession channel is
 where this export costs the most: what people write there is what they expect
 will not be repeated. Discord user IDs, display names and
 avatars are never sent; authors become labels such as `u1` generated per
-request and never stored. Attachments, embeds and links are
-not fetched or resolved. `[p]watch disable` stops a channel immediately and
+request and never stored. Embeds and links are never fetched or
+resolved, and image attachments are fetched only in a channel where a manager
+turned image reading on. `[p]watch disable` stops a channel immediately and
 drops anything pending for it.
 
 Which buttons a report carries is per channel, and defaults to the two marks:
@@ -182,6 +183,46 @@ A report quotes the channel it came from, so a channel can send its findings
 somewhere other than the default with `[p]watch route`. A venting channel's
 reports carry what someone wrote there, and fewer people should see those than
 see a scam alert. Without a route, reports go to the guild-wide channel.
+
+A channel can have its image attachments read, off by default:
+
+```text
+[p]set api messagewatch_vision api_key <key>     # bot owner
+[p]watch vision api_base https://openrouter.ai   # bot owner
+[p]watch vision model <a model with image input> # bot owner
+[p]watch images #一般討論 on                      # guild manager
+```
+
+Only the **characters in the image** are asked for, verbatim — not a description
+of it. A scam here is a screenshot with text in it, the text is the evidence,
+and a description is open-ended generation whose errors nobody can check against
+the picture. The transcription goes into the same scam judgement that already
+exists, so it needs no rule of its own. That means the transcription travels
+twice: it is shown in the report, and it is sent on to TypeSafe with the message
+text, so words that existed only inside an image reach both providers. It is
+shown because the extraction is generated text with nothing calibrated behind
+it, and a moderator has to be able to check it rather than trust a verdict built
+on it.
+
+`[p]watch vision` is separate from `[p]watch set` because the latter takes only
+numbers — every threshold the cog has — and these two are strings. Both are
+stored globally and only the bot owner can write them: the API key they spend is
+bot-wide and the owner's, so an administrator of any guild the bot has joined who
+could set the endpoint would be able to send that bearer token, and every image,
+to a host of their own. Reading them stays open to the managers who have to
+configure a channel around them.
+
+Attachments are downscaled and re-encoded before they are sent, which discards
+EXIF including GPS tags. Results are cached by attachment id, so the same image
+reposted is paid for once; that cache holds at most 256 entries in memory, never
+touches disk, and is dropped on reload and on a data deletion request. There is no default model: picking one without
+measuring which reads CJK screenshots best would be a guess dressed as a
+default, so the cog sends nothing until a model and an endpoint are set.
+
+This is the heaviest thing the cog sends and the only thing it sends anywhere
+other than TypeSafe — an image can carry a face, a document, or a screenshot of
+someone else's private conversation. It is decided one channel at a time and
+the disclosure says so.
 
 A channel can also be judged against its own posted rules:
 

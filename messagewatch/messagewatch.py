@@ -16,17 +16,20 @@ half.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Iterable, Mapping, NamedTuple
 
 import aiohttp
 import discord
+from PIL import Image, UnidentifiedImageError
 from discord import app_commands
 from redbot.core import Config, checks, commands, modlog
 from redbot.core.bot import Red
@@ -81,6 +84,41 @@ IDLE_SWEEP_SECONDS = 60
 # Discord's own cap on one embed field value.
 EMBED_FIELD_LIMIT = 1024
 
+# Images. A scam in this guild is usually a screenshot with text in it, so what
+# is worth pulling out of an attachment is the text, verbatim, not a
+# description of the picture. A description is open-ended generation that fails
+# in ways nobody can check; the characters on the screen are narrow, and they
+# feed the scam judgement that already exists rather than needing a rule of
+# their own.
+#
+# This is the first thing the cog sends anywhere other than TypeSafe, and the
+# heaviest thing it has ever sent: an image can carry a face, a document, or a
+# screenshot of somebody's private conversation. Off unless a manager turns it
+# on for one channel.
+IMAGE_SUFFIXES = {
+    "image/png": (".png",),
+    "image/jpeg": (".jpg", ".jpeg"),
+    "image/webp": (".webp",),
+    "image/gif": (".gif",),
+}
+MAX_IMAGE_BYTES = 8_000_000
+MAX_IMAGE_PIXELS = 40_000_000
+IMAGE_MAX_EDGE = 1536  # Text stays legible far below the 4K ChannelSummary uses.
+IMAGE_JPEG_QUALITY = 82
+MAX_IMAGES_PER_WINDOW = 4
+IMAGE_TEXT_CHARS = 600
+IMAGE_TIMEOUT_SECONDS = 45.0
+# Keyed by attachment id, which is stable, unlike the signed CDN URL whose
+# query string changes on every fetch. Bounded so a busy channel cannot grow it
+# without limit; the oldest description goes first.
+IMAGE_CACHE_SIZE = 256
+IMAGE_TOKEN_SERVICE = "messagewatch_vision"
+IMAGE_PROMPT = (
+    "把這張圖片裡的所有文字逐字抄出來，保留原本的換行。"
+    "只輸出文字本身，不要描述畫面、不要加標題、不要解釋。"
+    "看不清楚的字用 ? 代替。圖片裡沒有文字就回空白。"
+)
+
 # Measured 2026-09-20 against jev-1.13.0 through the production key. Synthetic
 # cases separated at 0.93+ for scams and 0.95 for hostility, against 0.08 and
 # 0.03 for the cases designed to be mistaken for them (a warning *about* a
@@ -106,9 +144,11 @@ RULE_REASON_CHARS = 60
 
 # Buttons are addressed entirely through their own custom_id, so a report stays
 # usable after a restart with no view registration to keep in step. Discord caps
-# a custom_id at 100 characters: "mw" + action + kind + three snowflakes + five
-# separators is 71 at the widest, which CUSTOM_ID_LIMIT asserts at build time
-# rather than leaving to a rejected message nobody sees.
+# a custom_id at 100 characters: "mw" + the longest action + kind + three
+# snowflakes at Discord's own 64-bit ceiling (20 digits) + five separators
+# measures 72, which the test builds rather than derives. This comment said 71
+# until it was run. CUSTOM_ID_LIMIT asserts the bound at build time rather than
+# leaving it to a rejected message nobody sees.
 ACTION_PREFIX = "mw"
 CUSTOM_ID_LIMIT = 100
 
@@ -160,6 +200,9 @@ DEFAULT_CHANNEL = {
     # 0.85 works there, while the server-wide gender-identity rule put
     # violations at 0.49-0.96 against 0.04-0.05, so 0.85 misses half of them.
     "rule_threshold": 0.0,
+    # Off unless a manager turns it on here. Sending images is a materially
+    # heavier export than sending text, and the disclosure says so.
+    "images": False,
 }
 
 # Measured 2026-09-20 against jev-1.13.0 with a real channel ruleset (the one
@@ -185,6 +228,11 @@ DEFAULT_RULE_CONFIDENCE = 0.70
 # "estimate" rather than stating a cost as fact.
 DEFAULT_TOKEN_PRICE_PER_MILLION = 0.042
 
+DEFAULT_GLOBAL = {
+    "image_api_base": "",
+    "image_model": "",
+}
+
 DEFAULT_GUILD = {
     "report_channel": 0,
     "watched_channels": [],
@@ -202,6 +250,10 @@ DEFAULT_GUILD = {
     # precision data this cog can ever accumulate.
     "marks": {},
     "idle_seconds": DEFAULT_IDLE_SECONDS,
+    # No default model. Picking one without measuring which reads CJK
+    # screenshots best would be a guess dressed as a default, and the cog
+    # refuses to send images until both of these are set.
+
     # Aggregate counters only -- integers, never message text or an author --
     # so the data statement's "does not store message content" stays true for
     # this too. Accumulated in memory and flushed here periodically, not on
@@ -282,7 +334,7 @@ SETTING_RULES: dict[str, Setting] = {
 # exactly what it exists to re-ask about, and a guild that accepted version 1
 # never saw them. Bumping halts every guild until a manager accepts again,
 # which is why `[p]watch show` says so in its first field.
-DISCLOSURE_VERSION = 3
+DISCLOSURE_VERSION = 4
 DISCLOSURE_TEXT = (
     "**What leaves Discord:** in an enabled channel, the text of recent human messages is sent "
     "to TypeSafe continuously, together with the name of the channel, with nobody triggering "
@@ -290,9 +342,19 @@ DISCLOSURE_TEXT = (
     "people say in it. Where rules are configured for a channel, those rules and its purpose "
     "note go with every request too.\n"    "**Consider the channel:** a venting or confession channel is where this export costs the "
     "most, because what people write there is what they expect will not be repeated.\n"
+    "**Images:** off unless a manager enables it for a channel. When it is on, image "
+    "attachments in that channel are downloaded, re-encoded and sent to a separate vision "
+    "provider, which is asked only to transcribe the characters in them. That transcription "
+    "then travels twice: it is shown in the report, and it is also sent on to TypeSafe with "
+    "the message text as part of the same judgement, so text that was only ever inside an "
+    "image reaches both providers. An image can carry a face, a document, or a screenshot of "
+    "someone else's private conversation, so this is a heavier export than text and is "
+    "decided one channel at a time.\n"
     "**What does not:** Discord user IDs, display names and avatars are never sent. Authors are "
-    "replaced with labels such as u1 and u2, generated per request and never stored. Attachments, "
-    "embeds and links are not fetched or resolved.\n"
+    "replaced with labels such as u1 and u2, generated per request and never stored. Embeds and "
+    "links are not fetched or resolved. Image attachments are fetched only where a manager has "
+    "turned image reading on for that channel, and their transcribed text is held in memory until "
+    "the cog is unloaded.\n"
     "**Vendor:** TypeSafe states it does not train on customer input. Its retention terms and the "
     "accuracy of its judgements are unverified by this cog.\n"
     "**What the bot does with a result:** posts a report in the configured moderator channel. "
@@ -543,7 +605,15 @@ def build_state(
     state: dict[str, Any] = {
         "channel": channel_name,
         "recent_messages": [
-            {"i": index, "author": item["alias"], "text": item["text"]}
+            {
+                "i": index,
+                "author": item["alias"],
+                "text": item["text"],
+                # Only when an image was actually read. An absent key says
+                # nothing; a present empty one would claim the image had no
+                # text, which is a different statement.
+                **({"image_text": item["image_text"]} if item.get("image_text") else {}),
+            }
             for index, item in enumerate(window)
         ],
     }
@@ -560,6 +630,83 @@ def build_state(
             f"第 {number} 條" for number in range(1, len(rules) + 1)
         ]
     return state
+
+
+def eligible_attachments(message: Any) -> list[dict[str, Any]]:
+    """The image attachments worth reading, as plain data the queue can hold.
+
+    Called at ingest, because the queue stores dictionaries and the
+    `discord.Message` with its attachments is gone by the time a window is
+    judged. The declared size and dimensions come from Discord and are
+    attacker-adjacent, so they narrow the set here and the real bytes are
+    checked again after download.
+    """
+    found: list[dict[str, Any]] = []
+    for attachment in getattr(message, "attachments", ()) or ():
+        content_type = getattr(attachment, "content_type", None)
+        filename = getattr(attachment, "filename", None)
+        size = getattr(attachment, "size", None)
+        width = getattr(attachment, "width", None)
+        height = getattr(attachment, "height", None)
+        url = getattr(attachment, "url", None)
+        attachment_id = getattr(attachment, "id", None)
+        if content_type not in IMAGE_SUFFIXES or not isinstance(filename, str):
+            continue
+        if not filename.casefold().endswith(IMAGE_SUFFIXES[content_type]):
+            continue
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (size, width, height, attachment_id)
+        ):
+            continue
+        if not isinstance(url, str) or not url.startswith("https://"):
+            continue
+        if size > MAX_IMAGE_BYTES or width * height > MAX_IMAGE_PIXELS:
+            continue
+        found.append({"id": int(attachment_id), "url": url})
+        if len(found) >= MAX_IMAGES_PER_WINDOW:
+            break
+    return found
+
+
+def transcode_image(raw: bytes, max_edge: int = IMAGE_MAX_EDGE) -> tuple[str, bytes] | None:
+    """Decode, downscale and re-encode, or None when it is not a usable image.
+
+    Copied from ChannelSummary rather than shared, deliberately: these are two
+    separately installable cogs, and importing across them would make this one
+    stop working when the other is not installed.
+
+    Pillow decoding is the validator -- bytes that are not a real image raise
+    here. The size is read from the header before any pixel is decoded, because
+    Pillow's own bomb guard does not fire until twice MAX_IMAGE_PIXELS and the
+    ingest step only saw the dimensions Discord declared. Re-encoding drops
+    EXIF, so a phone photo's GPS tags never reach a provider.
+
+    CPU-bound; callers run it off the event loop.
+    """
+    try:
+        with Image.open(BytesIO(raw)) as image:
+            width, height = image.size
+            if width * height > MAX_IMAGE_PIXELS:
+                return None
+            image.load()
+            has_alpha = image.mode in {"RGBA", "LA", "PA"} or "transparency" in image.info
+            image = image.convert("RGBA" if has_alpha else "RGB")
+            longest = max(width, height)
+            if longest > max_edge:
+                scale = max_edge / longest
+                image = image.resize(
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    Image.LANCZOS,
+                )
+            buffer = BytesIO()
+            if has_alpha:
+                image.save(buffer, format="PNG", optimize=True)
+                return "image/png", buffer.getvalue()
+            image.save(buffer, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
+            return "image/jpeg", buffer.getvalue()
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
+        return None
 
 
 def build_custom_id(action: str, kind: str, channel_id: int, message_id: int, author_id: int) -> str:
@@ -710,6 +857,13 @@ class MessageWatch(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=0x4E59414E4D57415401, force_registration=True)
         self.config.register_guild(**DEFAULT_GUILD)
+        # The vision endpoint and model are global, not per guild. The API key
+        # they spend belongs to the bot owner and is shared across every guild,
+        # so a guild administrator able to set the endpoint could direct that
+        # bearer token -- and the images -- to a host of their choosing. Storing
+        # the destination at the same scope as the credential removes the class
+        # rather than guarding it.
+        self.config.register_global(**DEFAULT_GLOBAL)
         # Rules are per channel, not per guild: a venting channel's rules would
         # be absurd in a help channel, and it is the channel's own posted rules
         # that members agreed to.
@@ -747,6 +901,9 @@ class MessageWatch(commands.Cog):
         # call, so a failure never leaves a stale count behind for the caller
         # to silently attribute to a judgement that did not happen.
         self._last_input_tokens: int | None = None
+        # Attachment id -> extracted text. Ordered so the oldest goes first
+        # when it is full; the same meme reposted is paid for once.
+        self._image_cache: OrderedDict[int, str] = OrderedDict()
         # Usage deltas since the last Config flush, per guild id. In-memory
         # only, on purpose: a Config write per judged window would be a disk
         # write every few messages, so these ride on the 60-second sweep
@@ -785,6 +942,15 @@ class MessageWatch(commands.Cog):
                 )
         self._sweep.start()
 
+    def _forget_images(self) -> None:
+        """Drop every cached transcription.
+
+        The cache holds text taken out of members' images, keyed by attachment
+        id with no author attached -- so a deletion request cannot target one
+        person's entries, and the honest response is to drop all of them.
+        """
+        self._image_cache.clear()
+
     async def cog_unload(self) -> None:
         """Stop the sweep, so an unloaded cog stops judging.
 
@@ -795,10 +961,12 @@ class MessageWatch(commands.Cog):
         the only work the cog itself starts.
 
         The usage flush runs one last time here so a restart loses at most the
-        seconds since the last sweep tick, not the whole in-memory tail.
+        seconds since the last sweep tick, not the whole in-memory tail. The
+        transcription cache is dropped instead: it is the only member content
+        this cog holds, and an unloaded cog has no reason to keep it.
         """
         self._sweep.cancel()
-        # hasattr: some tests build a partial cog that skips __init__.
+        self._forget_images()
         await self._flush_usage()
 
     @tasks.loop(seconds=IDLE_SWEEP_SECONDS)
@@ -813,10 +981,6 @@ class MessageWatch(commands.Cog):
         cheap here regardless, since this already runs every IDLE_SWEEP_SECONDS
         whether or not anything is due.
         """
-        # hasattr, not a default set here: several tests build a partial cog
-        # with object.__new__ and call `_sweep` directly without going through
-        # __init__, and this loop already tolerates that everywhere else. A
-        # cog built through __init__ always has both.
         await self._flush_usage()
         await self._update_dashboards()
         for channel_id, queue in list(self._pending.items()):
@@ -851,11 +1015,18 @@ class MessageWatch(commands.Cog):
         self._sweep.restart()
 
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
-        """Drop any pending message this user wrote that has not been sent yet."""
+        """Drop any pending message this user wrote that has not been sent yet.
+
+        The transcription cache is keyed by attachment id and carries no author,
+        so it cannot be filtered down to one person -- `_forget_images` drops it
+        whole. That is wasteful (every other channel re-reads its images once)
+        and correct, which is the right way round for this request.
+        """
         for queue in self._pending.values():
             for item in list(queue):
                 if item.get("author_id") == user_id:
                     queue.remove(item)
+        self._forget_images()
 
     def _note(self, channel_id: int, reason: str) -> None:
         """Record why this channel produced nothing, for `[p]watch show`."""
@@ -901,6 +1072,136 @@ class MessageWatch(commands.Cog):
     async def get_api_key(self) -> str | None:
         """The TypeSafe key from Red's shared token store, or None if unusable."""
         tokens = await self.bot.get_shared_api_tokens(TOKEN_SERVICE)
+        key = tokens.get("api_key") if isinstance(tokens, Mapping) else None
+        return key if isinstance(key, str) and key else None
+
+    async def _attach_image_text(self, window: list[dict[str, Any]]) -> None:
+        """Read this window's images, bounded, and hang the text on each item.
+
+        Bounded per window rather than per message: one post of twenty
+        screenshots would otherwise cost twenty vision calls for a single
+        judgement.
+        """
+        budget = MAX_IMAGES_PER_WINDOW
+        for item in window:
+            for attachment in item.get("images") or ():
+                if budget <= 0:
+                    return
+                budget -= 1
+                text = await self.image_text(attachment)
+                if text:
+                    item["image_text"] = (item.get("image_text", "") + " " + text).strip()
+
+    async def image_text(self, attachment: Mapping[str, Any]) -> str | None:
+        """The characters in one attachment, or None when they could not be read.
+
+        Every failure returns None for the same reason `judge` does: a
+        moderation aid that breaks the message handler is worse than one that
+        misses an image. The result is cached by attachment id, so the same
+        meme posted ten times is paid for once.
+        """
+        key = int(attachment["id"])
+        cached = self._image_cache.get(key)
+        if cached is not None:
+            self._image_cache.move_to_end(key)
+            return cached
+
+        vision = await self.config.all()
+        model = str(vision["image_model"]).strip()
+        api_base = str(vision["image_api_base"]).strip()
+        token = await self.get_image_key()
+        if not model or not api_base or not token:
+            return None
+
+        timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT_SECONDS)
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
+            ) as session:
+                async with session.get(attachment["url"], allow_redirects=False) as response:
+                    if response.status != 200:
+                        log.warning("messagewatch: attachment fetch returned %d", response.status)
+                        return None
+                    raw = await response.content.read(MAX_IMAGE_BYTES + 1)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            log.warning("messagewatch: attachment fetch failed (%s)", type(error).__name__)
+            return None
+        if len(raw) > MAX_IMAGE_BYTES:
+            return None
+
+        # Decoding and resizing are CPU-bound and would stall every other
+        # channel's ingestion if they ran on the event loop.
+        transcoded = await asyncio.to_thread(transcode_image, raw)
+        if transcoded is None:
+            return None
+        content_type, encoded = transcoded
+        data_uri = f"data:{content_type};base64,{base64.b64encode(encoded).decode('ascii')}"
+
+        text = await self._extract_text(api_base, token, model, data_uri)
+        if text is None:
+            return None
+        text = " ".join(text.split())[:IMAGE_TEXT_CHARS]
+        self._image_cache[key] = text
+        while len(self._image_cache) > IMAGE_CACHE_SIZE:
+            self._image_cache.popitem(last=False)
+        return text
+
+    async def _extract_text(
+        self, api_base: str, token: str, model: str, data_uri: str
+    ) -> str | None:
+        """Ask the vision model for the characters, and nothing else.
+
+        Verbatim extraction rather than description: a scam image is a
+        screenshot with text in it, the text is the evidence, and asking for a
+        description is open-ended generation whose errors nobody can check
+        against the picture.
+        """
+        payload = json.dumps({
+            "model": model,
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": IMAGE_PROMPT},
+                {"type": "input_image", "image_url": data_uri},
+            ]}],
+        }).encode()
+        timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT_SECONDS)
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
+            ) as session:
+                async with session.post(
+                    api_base.rstrip("/") + "/api/v1/responses",
+                    data=payload,
+                    headers={"Authorization": f"Bearer {token}",
+                             "Content-Type": "application/json"},
+                    allow_redirects=False,
+                ) as response:
+                    if response.status != 200:
+                        log.warning("messagewatch: image model returned %d", response.status)
+                        return None
+                    body = await response.content.read(MAX_RESPONSE_BYTES + 1)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            log.warning("messagewatch: image model unreachable (%s)", type(error).__name__)
+            return None
+        if len(body) > MAX_RESPONSE_BYTES:
+            return None
+        try:
+            decoded = json.loads(body)
+        except (ValueError, RecursionError):
+            log.warning("messagewatch: image model response was not usable JSON")
+            return None
+        parts: list[str] = []
+        for item in (decoded.get("output") or []) if isinstance(decoded, Mapping) else []:
+            for chunk in (item.get("content") or []) if isinstance(item, Mapping) else []:
+                if isinstance(chunk, Mapping) and chunk.get("type") == "output_text":
+                    value = chunk.get("text")
+                    if isinstance(value, str):
+                        parts.append(value)
+        joined = "\n".join(parts).strip()
+        return joined or None
+
+    async def get_image_key(self) -> str | None:
+        """The vision provider's key, from Red's shared token storage."""
+        tokens = await self.bot.get_shared_api_tokens(IMAGE_TOKEN_SERVICE)
         key = tokens.get("api_key") if isinstance(tokens, Mapping) else None
         return key if isinstance(key, str) and key else None
 
@@ -1157,6 +1458,14 @@ class MessageWatch(commands.Cog):
                 value=f"<@{flagged['author_id']}> · [跳至訊息]({flagged['jump_url']})",
                 inline=False,
             )
+        # What the machine thought it saw. The extraction is generated text
+        # with nothing calibrated behind it, so a moderator has to be able to
+        # check it against the image rather than trust a verdict built on it.
+        seen = " / ".join(item["image_text"] for item in window if item.get("image_text"))
+        if seen:
+            embed.add_field(
+                name="圖片中讀到的文字", value=seen[:EMBED_FIELD_LIMIT], inline=False
+            )
         embed.set_footer(
             text=f"判斷依據 {len(window)} 則訊息。這是提示，不是裁決；下面的動作只有你按才會發生。"
         )
@@ -1290,6 +1599,8 @@ class MessageWatch(commands.Cog):
                 return
 
             anonymise(window)
+            if channel_settings["images"]:
+                await self._attach_image_text(window)
             answers = await self.judge(
                 window,
                 getattr(channel, "name", str(channel.id)),
@@ -1558,7 +1869,11 @@ class MessageWatch(commands.Cog):
         if channel.id not in set(settings["watched_channels"]):
             return
         text = clean_text(getattr(message, "content", "") or "")
-        if not text:
+        # A bare screenshot is the commonest shape a scam takes here and it
+        # carries no text at all, so dropping it on empty text alone made the
+        # image feature unreachable for the case it was built for.
+        attachments = eligible_attachments(message)
+        if not text and not attachments:
             return
         async with self._locks[channel.id]:
             # Re-read inside the lock. `[p]watch disable` leaves the watched set
@@ -1567,6 +1882,19 @@ class MessageWatch(commands.Cog):
             # the clear and leave a disabled channel holding message text.
             if channel.id not in set(await self.config.guild(guild).watched_channels()):
                 return
+            # One read, answering both questions: whether this channel's queue
+            # should hold image references at all, and whether an image-only
+            # message is worth queueing. An earlier version skipped this read
+            # for messages that had text, storing attachments unconditionally
+            # so the ordinary path stayed at one settings lookup. That saving
+            # produced three separate findings in a row, the last of which was
+            # that a channel could queue attachments while image reading was
+            # off and have them sent when someone turned it on. The queue now
+            # holds an image only where the channel reads images, and the
+            # window between the two no longer exists to be reasoned about.
+            images = attachments if await self.config.channel(channel).images() else []
+            if not text and not images:
+                return
             self._pending[channel.id].append(
                 {
                     "author_id": author.id,
@@ -1574,6 +1902,10 @@ class MessageWatch(commands.Cog):
                     "text": text,
                     "jump_url": getattr(message, "jump_url", ""),
                     "at": time.monotonic(),
+                    # Captured here because the queue holds dictionaries and
+                    # the Message with its attachments is gone by the time the
+                    # window is judged.
+                    "images": images,
                 }
             )
             # hasattr: several tests build a partial cog that skips __init__.
@@ -1684,6 +2016,108 @@ class MessageWatch(commands.Cog):
             f"{channel.mention} 的「加上身分組」會給 `{role.name}`。",
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    @watch_group.command(name="vision")
+    async def watch_vision(self, ctx: commands.Context, key: str = "", *, value: str = "") -> None:
+        """Set the vision provider's endpoint or model, or show both.
+
+        Separate from `[p]watch set` because that table is numeric: every entry
+        carries a range and is rejected outside it. These two are free strings,
+        and squeezing them into a numeric validator would have meant a range
+        check that means nothing.
+
+        Bot owner only, and stored globally. The API key these two spend is
+        bot-wide and the owner's; an administrator of any guild the bot has
+        joined who could set the endpoint would be able to send that bearer
+        token, and every image, to a host of their choosing. Reading is left
+        open to the administrators who have to configure a channel around it.
+        """
+        fields = {
+            "api_base": ("image_api_base", "視覺模型的 API 根位址，例如 `https://openrouter.ai`"),
+            "model": ("image_model", "視覺模型名稱。沒有預設值——哪一個讀中文截圖最準還沒量過。"),
+        }
+        scope = self.config
+        if key not in fields:
+            settings = await scope.all()
+            lines = [
+                f"`{name}` = `{settings[stored] or '（未設定）'}`\n{note}"
+                for name, (stored, note) in fields.items()
+            ]
+            await ctx.send(
+                embed=discord.Embed(
+                    title="MessageWatch 視覺模型設定",
+                    description="\n\n".join(lines)
+                    + "\n\n用 `[p]watch vision <api_base|model> <值>` 設定（僅 bot owner）。"
+                    + "\nAPI key 由 bot owner 用 `[p]set api messagewatch_vision api_key <key>` 存。",
+                    colour=discord.Colour.blurple(),
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        if not await self.bot.is_owner(ctx.author):
+            await ctx.send(
+                "只有 bot owner 能改視覺模型的端點與模型名稱——它們花的是 bot 全域的 API key。"
+            )
+            return
+        stored, _ = fields[key]
+        value = value.strip()
+        if key == "api_base" and value and not value.startswith("https://"):
+            # The image leaves Discord over this, so plain HTTP would put a
+            # member's screenshot on the wire in clear.
+            await ctx.send("`api_base` 必須是 `https://` 開頭。")
+            return
+        if len(value) > 200:
+            await ctx.send("太長了，請控制在 200 字元內。")
+            return
+        await scope.set_raw(stored, value=value)
+        await ctx.send(
+            f"`{key}` 設為 `{value}`。" if value else f"已清除 `{key}`。",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @watch_group.command(name="images")
+    async def watch_images(
+        self, ctx: commands.Context, channel: discord.TextChannel, switch: str = ""
+    ) -> None:
+        """Turn image reading on or off for one channel, or report its state."""
+        scope = self.config.channel(channel)
+        wanted = switch.strip().casefold()
+        if wanted not in ("on", "off", ""):
+            await ctx.send("請用 `on` 或 `off`。")
+            return
+        if not wanted:
+            state = "開啟" if await scope.images() else "關閉"
+            await ctx.send(f"{channel.mention} 的圖片判讀目前是 **{state}**。")
+            return
+        if wanted == "off":
+            # Under the channel lock, because `flush` reads `images` and then
+            # awaits the download and the vision call while holding it. Without
+            # this an in-flight window sends an attachment after the command has
+            # already reported that image reading is off -- the same disable
+            # contract `[p]watch disable` holds.
+            async with self._locks[channel.id]:
+                await scope.images.set(False)
+            await ctx.send(f"已關閉 {channel.mention} 的圖片判讀。")
+            return
+        settings = await self.config.all()
+        await scope.images.set(True)
+        await ctx.send(
+            f"已開啟 {channel.mention} 的圖片判讀。該頻道的圖片附件會被下載、縮放後送往視覺模型抽取文字。"
+        )
+        # Saying so now beats a channel that looks configured and silently
+        # reads nothing, which is this project's most common failure.
+        missing = [
+            name for name, value in (
+                ("`image_model`", settings["image_model"]),
+                ("`image_api_base`", settings["image_api_base"]),
+            ) if not str(value).strip()
+        ]
+        if not await self.get_image_key():
+            missing.append("視覺模型的 API key（`[p]set api messagewatch_vision api_key <key>`，僅 bot owner）")
+        if missing:
+            await ctx.send(
+                "⚠️ 還缺：" + "、".join(missing) + "。在補齊之前，這個頻道的圖片不會被讀取，也不會送出。"
+            )
 
     @watch_group.command(name="marks")
     async def watch_marks(self, ctx: commands.Context) -> None:

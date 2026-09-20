@@ -346,7 +346,7 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
 
 
 class TestGating(unittest.IsolatedAsyncioTestCase):
-    def cog(self, *, still_watched=None, **overrides):
+    def cog(self, *, still_watched=None, images=False, **overrides):
         cog = object.__new__(MessageWatch)
         cog._reset_state()
         cog.bot = MagicMock()
@@ -361,6 +361,9 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         )
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
+        channel_scope = MagicMock()
+        channel_scope.images = AsyncMock(return_value=images)
+        cog.config.channel.return_value = channel_scope
         cog._pending = pending()
         cog._last_report = {}
         cog._locks = module.defaultdict(module.asyncio.Lock)
@@ -368,8 +371,10 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         return cog
 
     @staticmethod
-    def message(*, channel_id: int = 5, bot: bool = False, content: str = "hello", webhook=None):
+    def message(*, channel_id: int = 5, bot: bool = False, content: str = "hello",
+                webhook=None, attachments=()):
         return SimpleNamespace(
+            attachments=list(attachments),
             guild=SimpleNamespace(id=1),
             channel=SimpleNamespace(id=channel_id, guild=SimpleNamespace(id=1), name="c"),
             author=SimpleNamespace(id=42, bot=bot),
@@ -384,6 +389,56 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         await cog.on_message(self.message())
         self.assertEqual(len(cog._pending[5]), 1)
         self.assertEqual(cog._pending[5][0]["author_id"], 42)
+
+    async def test_an_image_only_message_is_queued_where_images_are_read(self) -> None:
+        # A bare screenshot is the commonest shape a scam takes here and it
+        # carries no text at all, so the empty-text gate made the image feature
+        # unreachable for the case it was built for.
+        shot = SimpleNamespace(content_type="image/png", filename="s.png", size=4000,
+                               width=800, height=600, id=991,
+                               url="https://cdn.discordapp.com/x.png")
+        cog = self.cog(images=True)
+        await cog.on_message(self.message(content="   ", attachments=[shot]))
+        self.assertEqual(len(cog._pending[5]), 1)
+        self.assertEqual(cog._pending[5][0]["images"], [{"id": 991, "url": shot.url}])
+
+    async def test_an_image_only_message_is_dropped_where_images_are_not_read(self) -> None:
+        # Otherwise a channel with images off accumulates empty messages that
+        # push real ones out of the window.
+        shot = SimpleNamespace(content_type="image/png", filename="s.png", size=4000,
+                               width=800, height=600, id=991,
+                               url="https://cdn.discordapp.com/x.png")
+        cog = self.cog(images=False)
+        await cog.on_message(self.message(content="", attachments=[shot]))
+        self.assertEqual(len(cog._pending[5]), 0)
+
+    async def test_the_image_gate_is_read_inside_the_lock(self) -> None:
+        # `[p]watch images off` takes this same lock. Read outside it, a disable
+        # landing between the gate and the append would still leave an empty
+        # item queued for a channel that no longer reads images.
+        cog = self.cog(images=True)
+        held = []
+        cog.config.channel.return_value.images = AsyncMock(
+            side_effect=lambda: held.append(cog._locks[5].locked()) or True
+        )
+        shot = SimpleNamespace(content_type="image/png", filename="s.png", size=4000,
+                               width=800, height=600, id=991,
+                               url="https://cdn.discordapp.com/x.png")
+        await cog.on_message(self.message(content="", attachments=[shot]))
+        self.assertEqual(held, [True])
+
+    async def test_a_channel_that_does_not_read_images_queues_none_of_them(self) -> None:
+        # Not merely "they are not sent": they are never stored. An earlier
+        # version queued attachments unconditionally and left `flush` to decide,
+        # which meant turning image reading on sent pictures posted while it was
+        # off. Nothing stale can be released because nothing stale is kept.
+        shot = SimpleNamespace(content_type="image/png", filename="s.png", size=4000,
+                               width=800, height=600, id=991,
+                               url="https://cdn.discordapp.com/x.png")
+        cog = self.cog(images=False)
+        await cog.on_message(self.message(content="hello", attachments=[shot]))
+        self.assertEqual(len(cog._pending[5]), 1)
+        self.assertEqual(cog._pending[5][0]["images"], [])
 
     async def test_nothing_is_queued_without_an_accepted_disclosure(self) -> None:
         cog = self.cog(disclosure_version=0)
@@ -422,7 +477,12 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         before = module.time.monotonic()
         await cog.on_message(self.message())
         item = cog._pending[5][0]
-        self.assertEqual(set(item), {"author_id", "message_id", "text", "jump_url", "at"})
+        self.assertEqual(
+            set(item), {"author_id", "message_id", "text", "jump_url", "at", "images"}
+        )
+        # Captured at ingest because the Message with its attachments is gone
+        # by the time the window is judged.
+        self.assertEqual(item["images"], [])
         self.assertGreaterEqual(item["at"], before)
         self.assertEqual(item["message_id"], 4242)
         self.assertEqual(item["author_id"], 42)
@@ -1180,14 +1240,27 @@ class TestActionAddressing(unittest.TestCase):
         # Discord rejects the whole message when a custom_id is too long, so
         # the failure would be an alert that never arrives. discord.py does not
         # check it, which was measured.
-        widest = module.build_custom_id("mute", "s", 10**19 - 1, 10**19 - 1, 10**19 - 1)
+        # A real snowflake is an unsigned 64-bit integer, so 20 digits is the
+        # ceiling -- an earlier version of this test used 19 and reported a
+        # worst case three characters short of the true one.
+        snowflake = 2**64 - 1
+        # Longest action name, not longest built id: everything else in the
+        # format is fixed width, so the two are the same thing, and taking the
+        # action first keeps the round-trip assertion below from depending on
+        # which of two equal-length names `max` happens to return.
+        widest_action = max(module.ACTIONS, key=len)
+        widest = module.build_custom_id(
+            widest_action, "s", snowflake, snowflake, snowflake
+        )
         self.assertLessEqual(len(widest), module.CUSTOM_ID_LIMIT)
+        self.assertEqual(len(widest), 72)
         # Asserting the built length only restates what the function produced;
         # it cannot fail when the guard is deleted. This drives the guard.
         with self.assertRaises(ValueError):
             module.build_custom_id("x" * 120, "s", 1, 2, 3)
         self.assertEqual(
-            module.parse_custom_id(widest), ("mute", "s", 10**19 - 1, 10**19 - 1, 10**19 - 1)
+            module.parse_custom_id(widest),
+            (widest_action, "s", snowflake, snowflake, snowflake),
         )
 
     def test_a_custom_id_is_untrusted_input(self) -> None:
@@ -1474,6 +1547,10 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         cog = self.cog()
         cog.bot.wait_until_red_ready = AsyncMock()
         cog.bot.get_channel.return_value = None
+        # The loop gets one real tick in before the cancel lands, and this
+        # helper has no Config -- without the stub every run of the suite
+        # prints a traceback from work this test is not about.
+        cog._update_dashboards = AsyncMock()
         await cog.cog_load()
         self.assertTrue(cog._sweep.is_running())
         await cog.cog_unload()
@@ -1634,8 +1711,13 @@ class TestSlashAndSettings(unittest.IsolatedAsyncioTestCase):
         # Discord allows one level of group nesting; `/watch rule add` uses it
         # exactly, and a third would be rejected at registration.
         self.assertLessEqual(max(name.count(" ") for name in seen), 2)
-        self.assertIn("watch rule add", seen)
-        self.assertIn("watch action role", seen)
+        # Named explicitly, because every test that drives a command calls its
+        # callback by attribute -- so a command registered under the wrong name
+        # passes all of them while being absent from Discord.
+        for name in ("watch rule add", "watch action role", "watch images",
+                     "watch dashboard", "watch rule threshold", "watch marks"):
+            with self.subTest(command=name):
+                self.assertIn(name, seen)
 
     def test_the_tree_is_hidden_from_members_in_discord_ui(self) -> None:
         # A display filter, not the check -- the Red checks still run. Without
@@ -1864,6 +1946,7 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
         cog.config.guild.return_value = scope
         channel_scope = MagicMock()
         channel_scope.all = AsyncMock(return_value=dict(module.DEFAULT_CHANNEL))
+        channel_scope.images = AsyncMock(return_value=module.DEFAULT_CHANNEL["images"])
         cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
         cog._pending = pending()
@@ -1946,6 +2029,7 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         cog.config.guild.return_value = scope
         channel_scope = MagicMock()
         channel_scope.all = AsyncMock(return_value=dict(module.DEFAULT_CHANNEL))
+        channel_scope.images = AsyncMock(return_value=module.DEFAULT_CHANNEL["images"])
         cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
         cog._pending = pending()
@@ -2239,6 +2323,308 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(healthy_embed.colour, discord.Colour.blurple())
 
 
+class TestImageAux(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def attachment(**over):
+        return SimpleNamespace(**{
+            "content_type": "image/png", "filename": "shot.png", "size": 40_000,
+            "width": 800, "height": 600, "url": "https://cdn.discordapp.com/x.png",
+            "id": 991, **over})
+
+    def test_only_real_bounded_images_are_captured(self) -> None:
+        # The declared size and dimensions come from Discord and are
+        # attacker-adjacent, so they narrow the set here and the real bytes are
+        # checked again after download.
+        good = SimpleNamespace(attachments=[self.attachment()])
+        self.assertEqual(module.eligible_attachments(good),
+                         [{"id": 991, "url": "https://cdn.discordapp.com/x.png"}])
+        for over in (
+            {"content_type": "application/pdf"},
+            {"content_type": "image/png", "filename": "shot.pdf"},
+            {"size": module.MAX_IMAGE_BYTES + 1},
+            {"width": 20_000, "height": 20_000},
+            {"size": 0}, {"width": -1}, {"size": True},
+            {"url": "http://cdn.discordapp.com/x.png"},
+            {"url": None}, {"id": None},
+        ):
+            with self.subTest(over=str(over)[:34]):
+                bad = SimpleNamespace(attachments=[self.attachment(**over)])
+                self.assertEqual(module.eligible_attachments(bad), [])
+        self.assertEqual(module.eligible_attachments(SimpleNamespace(attachments=None)), [])
+        # Bounded per message as well as per window.
+        many = SimpleNamespace(attachments=[self.attachment(id=i) for i in range(20)])
+        self.assertEqual(len(module.eligible_attachments(many)), module.MAX_IMAGES_PER_WINDOW)
+
+    def test_transcoding_validates_and_strips(self) -> None:
+        from PIL import Image as PILImage
+        buf = module.BytesIO()
+        PILImage.new("RGB", (4000, 40)).save(buf, format="PNG")
+        kind, data = module.transcode_image(buf.getvalue())
+        self.assertEqual(kind, "image/jpeg")
+        with PILImage.open(module.BytesIO(data)) as out:
+            # Downscaled to the long edge, which is where the cost saving is.
+            self.assertEqual(max(out.size), module.IMAGE_MAX_EDGE)
+        # Transparency survives as PNG rather than being flattened onto an
+        # invented background, which would change what a screenshot says.
+        buf = module.BytesIO()
+        PILImage.new("RGBA", (10, 10)).save(buf, format="PNG")
+        self.assertEqual(module.transcode_image(buf.getvalue())[0], "image/png")
+        # The header dimensions are read before any pixel is decoded, because
+        # Pillow's own bomb guard does not fire until twice the limit and the
+        # ingest step only saw the dimensions Discord declared.
+        buf = module.BytesIO()
+        PILImage.new("RGB", (300, 300)).save(buf, format="PNG")
+        with patch.object(module, "MAX_IMAGE_PIXELS", 100):
+            self.assertIsNone(module.transcode_image(buf.getvalue()))
+
+        # Not an image at all.
+        self.assertIsNone(module.transcode_image(b"not an image"))
+        self.assertIsNone(module.transcode_image(b""))
+
+    async def test_turning_images_on_says_what_is_still_missing(self) -> None:
+        # A channel that looks configured and silently reads nothing is this
+        # project's most common failure, so the command names the gaps at the
+        # moment someone would otherwise assume it is working.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={})
+        scope = MagicMock()
+        scope.images = MagicMock()
+        scope.images.set = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.channel.return_value = scope
+        cog.config.all = AsyncMock(return_value={"image_model": "", "image_api_base": ""})
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+
+        await MessageWatch.watch_images.callback(cog, ctx, channel, "on")
+        scope.images.set.assert_awaited_once_with(True)
+        warning = ctx.send.await_args.args[0]
+        self.assertIn("image_model", warning)
+        self.assertIn("image_api_base", warning)
+        self.assertIn("api key", warning.casefold())
+        self.assertIn("不會送出", warning)
+
+    async def test_turning_images_off_needs_no_configuration(self) -> None:
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        scope = MagicMock()
+        scope.images = MagicMock()
+        scope.images.set = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.channel.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_images.callback(
+            cog, ctx, SimpleNamespace(id=5, mention="<#5>", name="c"), "off")
+        scope.images.set.assert_awaited_once_with(False)
+
+    async def test_nothing_is_sent_when_the_channel_has_images_off(self) -> None:
+        # The default, and the state every channel starts in.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.image_text = AsyncMock()
+        window = [{"images": [{"id": 1, "url": "https://x/y.png"}]}]
+        self.assertFalse(module.DEFAULT_CHANNEL["images"])
+        # _attach_image_text is only reached when the channel opted in; this
+        # asserts the call site's gate, not the method.
+        source = (pathlib.Path(__file__).parent / "messagewatch.py").read_text(encoding="utf-8")
+        self.assertIn('if channel_settings["images"]:\n                await self._attach_image_text(', source)
+
+    async def test_no_model_or_key_means_no_request(self) -> None:
+        # Refusing rather than guessing a default: no model has been measured
+        # for CJK screenshot transcription yet.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
+        cog._extract_text = AsyncMock()
+        cog.config = MagicMock()
+        for settings in ({"image_model": "", "image_api_base": "https://x"},
+                         {"image_model": "m", "image_api_base": ""}):
+            with self.subTest(settings=settings):
+                cog.config.all = AsyncMock(return_value=settings)
+                with patch("messagewatch.messagewatch.aiohttp.ClientSession") as session:
+                    got = await cog.image_text({"id": 1, "url": "https://x/y.png"})
+                self.assertIsNone(got)
+                # Not merely "no model call" -- the image is not even fetched,
+                # so an unconfigured channel costs nothing and sends nothing.
+                session.assert_not_called()
+                cog._extract_text.assert_not_awaited()
+
+    async def test_a_cached_attachment_is_not_fetched_twice(self) -> None:
+        # The same meme reposted ten times is paid for once.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog._image_cache[991] = "已經讀過的文字"
+        cog.bot = MagicMock()
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
+        cog._extract_text = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.all = AsyncMock(
+            return_value={"image_model": "m", "image_api_base": "https://x"})
+        got = await cog.image_text({"id": 991, "url": "https://x/y.png"})
+        self.assertEqual(got, "已經讀過的文字")
+        cog._extract_text.assert_not_awaited()
+
+    async def test_the_cache_is_bounded_and_drops_the_oldest(self) -> None:
+        # Driven through `image_text`, not by re-running the eviction in the
+        # test: an assertion that restates the loop passes whatever the loop
+        # does.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
+        cog.config = MagicMock()
+        cog.config.all = AsyncMock(
+            return_value={"image_model": "m", "image_api_base": "https://x"})
+        response = MagicMock()
+        response.status = 200
+        response.content.read = AsyncMock(return_value=b"bytes")
+        response_ctx = MagicMock()
+        response_ctx.__aenter__ = AsyncMock(return_value=response)
+        response_ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get.return_value = response_ctx
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=session)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+        with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx), \
+                patch("messagewatch.messagewatch.transcode_image",
+                      return_value=("image/png", b"x")):
+            for i in range(module.IMAGE_CACHE_SIZE + 5):
+                cog._extract_text = AsyncMock(return_value=str(i))
+                await cog.image_text({"id": i, "url": f"https://x/{i}.png"})
+        self.assertEqual(len(cog._image_cache), module.IMAGE_CACHE_SIZE)
+        self.assertNotIn(0, cog._image_cache)
+        self.assertIn(module.IMAGE_CACHE_SIZE + 4, cog._image_cache)
+
+    async def test_the_vision_endpoint_must_be_https(self) -> None:
+        # The image leaves Discord over this. Plain HTTP would put a member's
+        # screenshot on the wire in clear, so the command refuses rather than
+        # storing a setting that silently downgrades the transport.
+        cog = object.__new__(MessageWatch)
+        cog.config = MagicMock()
+        cog.config.set_raw = AsyncMock()
+        scope = cog.config
+        cog.bot = MagicMock()
+        cog.bot.is_owner = AsyncMock(return_value=True)
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        command = MessageWatch.watch_vision.callback
+
+        await command(cog, ctx, "api_base", value="http://openrouter.ai")
+        scope.set_raw.assert_not_awaited()
+        await command(cog, ctx, "api_base", value="x" * 201)
+        scope.set_raw.assert_not_awaited()
+
+        await command(cog, ctx, "api_base", value="https://openrouter.ai")
+        scope.set_raw.assert_awaited_with("image_api_base", value="https://openrouter.ai")
+        # The model is a free string; only the endpoint carries the scheme rule.
+        await command(cog, ctx, "model", value="google/gemini-3.8-flash")
+        scope.set_raw.assert_awaited_with("image_model", value="google/gemini-3.8-flash")
+        # And clearing is allowed, which is how a guild turns the aux off
+        # without touching every channel.
+        await command(cog, ctx, "api_base", value="")
+        scope.set_raw.assert_awaited_with("image_api_base", value="")
+
+    async def test_only_the_bot_owner_can_aim_the_vision_endpoint(self) -> None:
+        # The API key these two spend is bot-wide and the owner's. An
+        # administrator of any guild the bot has joined who could set the
+        # endpoint would be able to send that bearer token, and every image, to
+        # a host of their own -- so the setting lives at the same scope as the
+        # credential and only the owner writes it.
+        cog = object.__new__(MessageWatch)
+        cog.config = MagicMock()
+        cog.config.set_raw = AsyncMock()
+        cog.bot = MagicMock()
+        cog.bot.is_owner = AsyncMock(return_value=False)
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        for key, value in (("api_base", "https://evil.example"), ("model", "m")):
+            with self.subTest(key=key):
+                await MessageWatch.watch_vision.callback(cog, ctx, key, value=value)
+                cog.config.set_raw.assert_not_awaited()
+        # And the endpoint is not a guild setting at all any more, so there is
+        # no per-guild copy left for an administrator to reach.
+        self.assertNotIn("image_api_base", DEFAULT_GUILD)
+        self.assertNotIn("image_model", DEFAULT_GUILD)
+        self.assertIn("image_api_base", module.DEFAULT_GLOBAL)
+
+    async def test_turning_images_off_takes_the_channel_lock(self) -> None:
+        # `flush` reads `images` and then awaits a download and a vision call
+        # while holding this lock. Without taking it, an in-flight window sends
+        # an attachment after the command has reported image reading is off --
+        # the same disable contract `[p]watch disable` holds.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        scope = MagicMock()
+        scope.images = MagicMock()
+        held = []
+        async def record(_value):
+            held.append(cog._locks[5].locked())
+        scope.images.set = AsyncMock(side_effect=record)
+        cog.config = MagicMock()
+        cog.config.channel.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+        await MessageWatch.watch_images.callback(cog, ctx, channel, "off")
+        self.assertEqual(held, [True])
+
+    def test_the_transcription_is_part_of_what_reaches_typesafe(self) -> None:
+        # It travels twice -- shown in the report, and sent on with the message
+        # text -- so words that existed only inside an image reach both
+        # providers. The disclosure says so because this is what happens.
+        items = anonymise(window(11, 22))
+        items[1]["image_text"] = "您的帳號異常 請至 http://fake/verify 驗證"
+        sent = json.dumps(module.build_state("c", items), ensure_ascii=False)
+        self.assertIn("http://fake/verify", sent)
+
+    async def test_the_cache_is_dropped_on_unload_and_on_a_deletion_request(self) -> None:
+        # It is the only member content this cog holds. Keyed by attachment id
+        # with no author, it cannot be filtered to one person, so a deletion
+        # request drops all of it.
+        for drop in (
+            lambda cog: cog.cog_unload(),
+            lambda cog: cog.red_delete_data_for_user(requester="user", user_id=42),
+        ):
+            with self.subTest(drop=drop):
+                cog = object.__new__(MessageWatch)
+                cog._reset_state()
+                cog._image_cache[991] = "秘密"
+                cog._sweep = MagicMock()
+                cog._flush_usage = AsyncMock()
+                await drop(cog)
+                self.assertEqual(len(cog._image_cache), 0)
+
+    def test_the_report_shows_what_the_machine_read(self) -> None:
+        # The transcription is generated text with nothing calibrated behind
+        # it, so a moderator has to be able to check it against the image
+        # rather than trust a verdict built on it.
+        items = anonymise(window(11, 22))
+        items[1]["image_text"] = "您的帳號異常 請至 http://fake/verify 驗證"
+        rendered = json.dumps(
+            MessageWatch.report_embed(
+                SimpleNamespace(id=5, mention="<#5>"), items, 1, ["詐騙 0.97"]
+            ).to_dict(), ensure_ascii=False)
+        self.assertIn("圖片中讀到的文字", rendered)
+        self.assertIn("http://fake/verify", rendered)
+        # Nothing to show when no image was read.
+        clean = json.dumps(MessageWatch.report_embed(
+            SimpleNamespace(id=5, mention="<#5>"), anonymise(window(11, 22)), 1, ["詐騙 0.97"]
+        ).to_dict(), ensure_ascii=False)
+        self.assertNotIn("圖片中讀到的文字", clean)
+
+    def test_extracted_text_reaches_the_state_only_when_present(self) -> None:
+        items = anonymise(window(11, 22))
+        items[0]["image_text"] = "圖片裡的字"
+        state = build_state("c", items)
+        self.assertEqual(state["recent_messages"][0]["image_text"], "圖片裡的字")
+        # An empty key would claim the image had no text, which is a different
+        # statement from not having read one.
+        self.assertNotIn("image_text", state["recent_messages"][1])
+
+
 class TestDataStatement(unittest.TestCase):
     @staticmethod
     def statement() -> str:
@@ -2334,6 +2720,7 @@ class TestDataStatement(unittest.TestCase):
             "report_channel": "the report-route channel ID set by [p]watch route",
             "actions": "the list of report buttons",
             "action_role": "the role ID the role button adds",
+            "images": "whether image reading is enabled",
             "rule_threshold": "a per-channel rule-violation threshold set by [p]watch rule threshold",
         }
         self.assertEqual(set(module.DEFAULT_CHANNEL), set(phrases))
@@ -2356,6 +2743,12 @@ class TestDataStatement(unittest.TestCase):
                 self.assertIn(phrase, statement)
 
     def test_the_disclosure_says_it_is_continuous_and_untriggered(self) -> None:
+        # Images began leaving Discord in version 4, to a provider that is not
+        # TypeSafe. A disclosure silent about that is the defect this cog has
+        # produced more than any other.
+        self.assertGreaterEqual(DISCLOSURE_VERSION, 4)
+        self.assertIn("Images:", module.DISCLOSURE_TEXT)
+        self.assertIn("off unless a manager enables it", module.DISCLOSURE_TEXT)
         for phrase in (
             "with nobody triggering it",
             "The bot never acts on its own",
