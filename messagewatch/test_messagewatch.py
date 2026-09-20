@@ -1150,7 +1150,7 @@ class TestDataStatement(unittest.TestCase):
             "a per-run pseudonymous author label",
             CHANNEL_CLAUSE,
             "those rules and the channel's purpose note",
-            "The configured rules and purpose note are stored per channel",
+            "are stored per channel",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, statement)
@@ -1199,6 +1199,23 @@ class TestDataStatement(unittest.TestCase):
         readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
         section = readme.split("## MessageWatch", 1)[1].split("\n## ", 1)[0]
         self.assertIn(module.MODEL, section)
+
+    def test_the_statement_enumerates_every_stored_per_channel_field(self) -> None:
+        # The statement listed what is stored and a new stored field was added
+        # without it -- the same shape as the message-ID claim, where the
+        # statement and the code disagreed and only the prose was checked.
+        # Anchoring on the config keys is what makes the next added field fail
+        # here until the statement names it.
+        phrases = {
+            "rules": "The configured rules",
+            "purpose": "the purpose note",
+            "report_channel": "the report-route channel ID set by [p]watch route",
+        }
+        self.assertEqual(set(module.DEFAULT_CHANNEL), set(phrases))
+        statement = self.statement()
+        for key, phrase in phrases.items():
+            with self.subTest(key=key):
+                self.assertIn(phrase, statement)
 
     def test_the_statement_names_what_leaves_and_what_does_not(self) -> None:
         statement = self.statement()
