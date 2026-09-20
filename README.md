@@ -1,6 +1,17 @@
+**English** | [繁體中文](README.zh-TW.md)
+
 # NyanCogs
 
 Cogs for [Red Discord Bot](https://github.com/Cog-Creators/Red-DiscordBot).
+
+| Cog | What it does |
+|---|---|
+| [ChannelSummary](#channelsummary) | Attributed channel summaries through an OpenAI-compatible LLM Agent |
+| [MessageWatch](#messagewatch) | Reports likely scams and hostile exchanges to a moderator channel |
+| [EmbedFixer](#embedfixer) | Replaces supported social links with provider-fixed links |
+
+Design notes for MessageWatch live in [`docs/`](docs/), in English and
+Traditional Chinese.
 
 ## ChannelSummary
 
@@ -11,7 +22,7 @@ and can use native OpenAI or OpenRouter web search when the selected profile
 supports it. Generic Responses and Chat/CLIProxy profiles can instead use the
 application-controlled Firecrawl cloud tools.
 
-Install and load it with Red's Downloader:
+### Installation
 
 ```text
 [p]cog install NyanCogs channelsummary
@@ -33,24 +44,41 @@ keys remain in Red's shared API token storage.
 [p]summary provider webquota 20
 ```
 
-`web_enabled` is the guild master switch. `web_mode` is `auto`, `native`, or
-`firecrawl`: `auto` keeps native hosted search for OpenAI/OpenRouter and selects
-Firecrawl for other profiles when its separately stored key is present. There
-is no runtime fallback between backends. Each summary can attempt at most 5
-Firecrawl calls and expose at most five search results regardless of higher guild
-settings; fetched markdown is capped by `web_fetch_max_chars`.
+### Web search
 
-HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. API keys
-and selected Discord data traverse the LAN unencrypted; use HTTP only on a
-trusted LAN. Prefer HTTPS whenever it is available.
+`web_enabled` is the guild master switch. `web_mode` selects the backend, and
+there is no runtime fallback between them.
 
-Guild members with guild-level Manage Messages use `/summary settings` to pick
-a profile and model, adjust limits through the Select and Modal panel, review
-the data-export disclosure, and enable the Cog. Summaries are written in the dominant language of the
-messages by default; `summary_language` forces one instead, as a single
-identifier with no spaces such as `zh-TW`, `zh-Hant-TW`, or `Japanese`. The equivalent text
-setting surface is `[p]summaryset set <key> <value>`; use
-`[p]summary help` for every key, range, provider command, and privacy detail.
+| `web_mode` | Behaviour |
+|---|---|
+| `auto` | Native hosted search for OpenAI/OpenRouter; Firecrawl for other profiles when its separately stored key is present |
+| `native` | The provider's own hosted search |
+| `firecrawl` | The application-controlled Firecrawl cloud tools |
+
+Each summary can attempt at most 5 Firecrawl calls and expose at most five
+search results regardless of higher guild settings; fetched markdown is capped
+by `web_fetch_max_chars`.
+
+> ⚠️ **An HTTP provider puts keys on the wire in clear.**
+
+HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP
+provider, API keys, selected Discord data, and inlined image bytes traverse the
+LAN unencrypted. Use HTTP only on a trusted LAN. Prefer HTTPS whenever it is
+available.
+
+### Configuration
+
+Guild members with guild-level Manage Messages use `/summary settings` to pick a
+profile and model, adjust limits through the Select and Modal panel, review the
+data-export disclosure, and enable the cog. The equivalent text surface is
+`[p]summaryset set <key> <value>`; `[p]summary help` lists every key, range,
+provider command, and privacy detail.
+
+Summaries are written in the dominant language of the messages by default.
+`summary_language` forces one instead, as a single identifier with no spaces such
+as `zh-TW`, `zh-Hant-TW`, or `Japanese`.
+
+### Commands
 
 | Command | Purpose |
 |---|---|
@@ -68,55 +96,82 @@ While a summary runs, the bot updates one temporary channel status through
 message collection, Agent context completion, and Embed rendering, then removes
 it. The progress text never exposes hidden reasoning or raw tool payloads.
 
+### Access and rate limits
+
 All users who can view and read the current channel may run a summary after a
 guild enables it. The bot needs View Channel, Read Message History, Send
-Messages, and Embed Links. A per-user cooldown, atomic guild request quota,
-bounded guild/provider concurrency, and a persistent per-channel new-message
-checkpoint limit API cost and repeated output. Defaults require 20 new human
-messages after a successful summary before that channel can run another;
-members with guild-level Manage Messages are exempt from that checkpoint, but
-the cooldown, quota, and concurrency limits still apply to them.
+Messages, and Embed Links.
+
+| Control | Effect |
+|---|---|
+| Per-user cooldown | Limits how often one member can trigger a summary |
+| Atomic guild request quota | Caps requests per guild |
+| Bounded guild/provider concurrency | Caps simultaneous runs |
+| Per-channel new-message checkpoint | Requires 20 new human messages after a successful summary before that channel can run another |
+
+Members with guild-level Manage Messages are exempt from the checkpoint, but the
+cooldown, quota, and concurrency limits still apply to them.
 
 The Embed footer reports what the summary consumed: input and output tokens,
 reasoning tokens when the provider separates them, and the price when the
-provider reports one. OpenRouter does; OpenAI does not, and no figure is
-computed from a local price table.
+provider reports one. OpenRouter does; OpenAI does not, and no figure is computed
+from a local price table.
+
+### Link and mention safety
 
 Summary Embeds preserve validated `<@user_id>` speaker attribution but use
-`AllowedMentions.none()`, so they do not notify anyone. Discord jump links are
-constructed locally from supplied messages. Native-mode web links are rendered
-only from provider citation annotations. Firecrawl-mode links are rendered only
-from application-validated URLs in successful same-run Firecrawl search results;
-model annotations and manually authored fetch URLs grant no authority. Rendering
-performs no network I/O.
+`AllowedMentions.none()`, so they do not notify anyone. Rendering performs no
+network I/O.
+
+| Link kind | Source of authority |
+|---|---|
+| Discord jump links | Constructed locally from supplied messages |
+| Native-mode web links | Provider citation annotations only |
+| Firecrawl-mode web links | Application-validated URLs in successful same-run Firecrawl search results only |
+
+Model annotations and manually authored fetch URLs grant no authority.
+
+### Images
+
+When images are enabled, the bot downloads each attachment, downscales it so its
+long edge is at most `image_max_edge` pixels (3840 by default) and re-encodes it,
+then sends those bytes inline, so no Discord CDN URL leaves this bot and EXIF
+metadata such as camera GPS is discarded before sending.
+
+| Limit | Value |
+|---|---|
+| Per attachment | 20 MiB and 25 MP |
+| Per request, all attachments | 50 MiB and 100 MP |
+| Attachments considered | The first 20 eligible ones in chronological order |
+| Re-encoded bytes added to one request | At most 16 MB |
+
+A lower `image_max_edge` fits more images into one summary.
+
+### Privacy
 
 Selected message text, stable user and message IDs, timestamps, reply and embed
-metadata leave Discord for the selected LLM. In Firecrawl mode, private
-Discord-derived search queries and fetch URLs go to Firecrawl. Firecrawl-returned
-URLs, titles, snippets, and markdown go to the LLM and may be resent across up
-to 20 stateless turns. Firecrawl retention and training are unverified, and its
-credits may incur cost. After a guild manager consents, any channel reader may
-trigger these exports.
+metadata leave Discord for the selected LLM. Image content may be resent to the
+LLM across up to 20 stateless turns. In Firecrawl mode, private Discord-derived
+search queries and fetch URLs go to Firecrawl; Firecrawl-returned URLs, titles,
+snippets, and markdown go to the LLM and may likewise be resent across up to 20
+turns.
+
+Provider retention and training are unverified. Firecrawl retention and training
+are unverified, and its credits may incur cost. After a guild manager consents,
+any channel reader may trigger these exports.
+
+> ⚠️ **Firecrawl's hourly quota is shared across every guild.**
 
 The owner Firecrawl hourly quota is one process-wide shared pool; one enabled
-guild can exhaust Firecrawl availability and spend allowance for all guilds;
-the guild request quota is not an owner Firecrawl budget control. A process
-restart clears the in-memory pool, and multiple processes multiply the cap.
+guild can exhaust Firecrawl availability and spend allowance for all guilds; the
+guild request quota is not an owner Firecrawl budget control. A process restart
+clears the in-memory pool, and multiple processes multiply the cap.
+
 Firecrawl cloud is trusted to control target DNS, redirects, and SSRF; DNS
 rebinding and split-horizon behavior remain residual vendor risk.
 
-When images are enabled, the bot downloads each attachment, downscales it so its long edge is
-at most `image_max_edge` pixels (3840 by default) and re-encodes it, then sends those bytes inline, so image
-content may be resent to the LLM across up to 20 stateless turns while no Discord
-CDN URL leaves this bot and EXIF metadata such as camera GPS is discarded before
-sending. Provider retention and training are unverified. Attachments are limited
-to 20 MiB and 25 MP each, 50 MiB and 100 MP total, and the first 20 eligible ones
-in chronological order; the re-encoded images together may add at most 16 MB to a
-request, so a lower `image_max_edge` fits more of them into one summary. ChannelSummary
-does not persist messages, prompts, searches, provider responses, or summaries.
-With an HTTP provider, API keys, selected Discord data, and inlined image bytes
-traverse the LAN unencrypted. Use HTTP only on a trusted LAN. Its complete
-statement is in
+ChannelSummary does not persist messages, prompts, searches, provider responses,
+or summaries. The complete statement is in
 [`channelsummary/info.json`](channelsummary/info.json).
 
 ## MessageWatch
@@ -124,13 +179,14 @@ statement is in
 MessageWatch reports likely scam messages and hostile exchanges to a moderator
 channel. It judges short rolling windows of recent messages with
 [TypeSafe Jev](https://docs.typesafe.ai/), a model that returns calibrated
-probabilities rather than text. It never deletes, edits, reacts to, or punishes
-anything on its own. A report can carry buttons, and only a moderator holding
-the matching Discord permission can press one: marking a report right or wrong
-records a count, while deleting a message, timing a member out or adding a role
-happen only on a press and are recorded in the modlog under that moderator's
-name. Which buttons a channel's reports carry is set per channel and defaults to
-the two marks.
+probabilities rather than text, and it never acts on its own.
+
+| Document | Contents |
+|---|---|
+| [`docs/messagewatch-design.md`](docs/messagewatch-design.md) · [繁體中文](docs/messagewatch-design.zh-TW.md) | Design rationale — why the cog is shaped this way |
+| [`docs/jev-integration.md`](docs/jev-integration.md) · [繁體中文](docs/jev-integration.zh-TW.md) | Question design and the measurements behind every threshold |
+
+### Installation
 
 ```text
 [p]cog install NyanCogs messagewatch
@@ -143,20 +199,28 @@ the two marks.
 [p]watch enable #a-channel       # one channel at a time
 ```
 
-Every channel is opted in separately and sends nothing until it is. An enabled
-channel is a standing export: message text goes to TypeSafe continuously, with
-nobody triggering it, which is unlike the on-demand `/summary`. Each request
-also carries the name of the channel, and, where rules are configured for that
-channel, those rules and its purpose note. A venting or confession channel is
-where this export costs the most: what people write there is what they expect
-will not be repeated. Discord user IDs, display names and
-avatars are never sent; authors become labels such as `u1` generated per
-request and never stored. Embeds and links are never fetched or
-resolved, and image attachments are fetched only in a channel where a manager
-turned image reading on. `[p]watch disable` stops a channel immediately and
-drops anything pending for it.
+Every channel is opted in separately and sends nothing until it is.
 
-Which buttons a report carries is per channel, and defaults to the two marks:
+> ⚠️ **An enabled channel is a standing export.** Message text goes to TypeSafe
+> continuously, with nobody triggering it, which is unlike the on-demand
+> `/summary`. A venting or confession channel is where this costs the most: what
+> people write there is what they expect will not be repeated.
+
+Each request also carries the name of the channel and, where rules are configured for
+that channel, those rules and its purpose note. Discord user IDs, display names
+and avatars are never sent; authors become labels such as `u1`, generated per
+request and never stored. Embeds and links are never fetched or resolved, and
+image attachments are fetched only in a channel where a manager turned image
+reading on.
+
+`[p]watch disable` drops everything queued for a channel immediately and stops it
+being read again. It does not cancel a report already in flight: it takes the
+same channel lock `flush` holds, so it waits for a flush that has already
+started, and that flush still delivers its report.
+
+### Report buttons
+
+Which buttons a report carries is set per channel and defaults to the two marks.
 
 ```text
 [p]watch action set #一般討論 ok no del      # marks plus delete
@@ -165,16 +229,24 @@ Which buttons a report carries is per channel, and defaults to the two marks:
 [p]watch marks                               # what moderators have marked so far
 ```
 
-`ok` and `no` act on nothing: they record whether a report was right, which is
-the only precision data this cog can ever accumulate — every threshold in it was
-set from synthetic cases and a hand-written test set. `[p]watch marks` prints
-those counts and says plainly that they measure precision, not recall: a case
-the cog missed never produced a report to mark.
+| Button | Effect | Permission required of the presser |
+|---|---|---|
+| `ok` | Records that the report was right | None beyond reaching the moderator channel |
+| `no` | Records that the report was wrong | None beyond reaching the moderator channel |
+| `del` | Deletes the flagged message | `manage_messages` |
+| `mute` | Times the author out | `moderate_members` |
+| `role` | Adds the configured role to the author | `manage_roles` |
 
-`del`, `mute` and `role` act, and only when a moderator holding the matching
-Discord permission presses them. The check is on the presser, not on who can see
-the moderator channel. Each action is recorded in Red's modlog under that
-moderator's name, and the report itself gains a line saying who did what.
+Each acting button is recorded in Red's modlog under that moderator's name, and
+the report itself gains a line saying who did what.
+
+`ok` and `no` act on nothing. They record whether a report was right, which is
+the only precision data this cog can ever accumulate — every threshold in it was
+set from synthetic cases and a hand-written test set.
+
+> **Note:** `[p]watch marks` prints those counts and says plainly that they
+> measure precision, not recall. A case the cog missed never produced a report to
+> mark.
 
 Buttons are addressed entirely through their own `custom_id`, so a report stays
 usable after a restart and the cog keeps no record of a pending one.
@@ -183,6 +255,8 @@ A report quotes the channel it came from, so a channel can send its findings
 somewhere other than the default with `[p]watch route`. A venting channel's
 reports carry what someone wrote there, and fewer people should see those than
 see a scam alert. Without a route, reports go to the guild-wide channel.
+
+### Image reading
 
 A channel can have its image attachments read, off by default:
 
@@ -194,15 +268,27 @@ A channel can have its image attachments read, off by default:
 ```
 
 Only the **characters in the image** are asked for, verbatim — not a description
-of it. A scam here is a screenshot with text in it, the text is the evidence,
-and a description is open-ended generation whose errors nobody can check against
-the picture. The transcription goes into the same scam judgement that already
-exists, so it needs no rule of its own. That means the transcription travels
-twice: it is shown in the report, and it is sent on to TypeSafe with the message
-text, so words that existed only inside an image reach both providers. It is
-shown because the extraction is generated text with nothing calibrated behind
-it, and a moderator has to be able to check it rather than trust a verdict built
-on it.
+of it. A scam here is a screenshot with text in it, the text is the evidence, and
+a description is open-ended generation whose errors nobody can check against the
+picture. The transcription goes into the same scam judgement that already exists,
+so it needs no rule of its own, and it is shown in the report because the
+extraction is generated text with nothing calibrated behind it.
+
+> ⚠️ **The transcription travels twice.** It is shown in the report *and* sent on
+> to TypeSafe with the message text, so words that existed only inside an image
+> reach both providers.
+
+| Property | Value |
+|---|---|
+| What is asked of the vision model | Verbatim transcription of the characters, nothing else |
+| Before sending | Downscaled and re-encoded, which discards EXIF including GPS tags |
+| Cache | By attachment id, at most 256 entries in memory; never on disk; dropped on reload and on a data deletion request |
+| Default model | None — see below |
+| Endpoint scheme | `https://` only |
+
+There is no default model. Picking one without measuring which reads CJK
+screenshots best would be a guess dressed as a default, so the cog sends nothing
+until a model and an endpoint are set.
 
 `[p]watch vision` is separate from `[p]watch set` because the latter takes only
 numbers — every threshold the cog has — and these two are strings. Both are
@@ -212,17 +298,12 @@ could set the endpoint would be able to send that bearer token, and every image,
 to a host of their own. Reading them stays open to the managers who have to
 configure a channel around them.
 
-Attachments are downscaled and re-encoded before they are sent, which discards
-EXIF including GPS tags. Results are cached by attachment id, so the same image
-reposted is paid for once; that cache holds at most 256 entries in memory, never
-touches disk, and is dropped on reload and on a data deletion request. There is no default model: picking one without
-measuring which reads CJK screenshots best would be a guess dressed as a
-default, so the cog sends nothing until a model and an endpoint are set.
+> ⚠️ **This is the heaviest thing the cog sends, and the only thing it sends
+> anywhere other than TypeSafe.** An image can carry a face, a document, or a
+> screenshot of someone else's private conversation. It is decided one channel at
+> a time and the disclosure says so.
 
-This is the heaviest thing the cog sends and the only thing it sends anywhere
-other than TypeSafe — an image can carry a face, a document, or a screenshot of
-someone else's private conversation. It is decided one channel at a time and
-the disclosure says so.
+### Per-channel rules
 
 A channel can also be judged against its own posted rules:
 
@@ -244,55 +325,73 @@ merely *talks about* the rules — pointing out that someone else broke one — 
 vetoed by a separate question, because with the rules posted in the channel that
 is the most common thing that looks like a violation without being one.
 
-Measured 2026-09-20 against `jev-1.13.0` with a real channel ruleset. On twelve
-held-out cases written after the design was fixed: 12/12 correct on whether a
-rule was broken at all, 11/12 on which rule (the miss sat between two adjacent
-rules on a genuinely borderline phrase), and no false positives among the five
-clean replies. Nineteen earlier cases were used while iterating and are not
-independent evidence.
+| Measured 2026-09-20, `jev-1.13.0`, real channel ruleset | Result |
+|---|---|
+| Whether a rule was broken at all (12 held-out cases) | 12/12 |
+| Which rule was broken | 11/12 — the miss sat between two adjacent rules on a genuinely borderline phrase |
+| False positives among the 5 clean replies | 0 |
+
+Nineteen earlier cases were used while iterating and are not independent
+evidence.
+
+### Slash commands
 
 Every command is also a slash command: `/watch enable`, `/watch rule add`,
-`/watch set`. The tree is hidden from members who lack Manage Server in
-Discord's own UI, which is a display filter — the permission checks still run
-regardless. **Slash commands do not appear until the bot owner runs
-`[p]slash enable` and `[p]slash sync`**; without that they exist in the cog and
-are invisible in Discord, which looks exactly like the feature not working.
+`/watch set`. The tree is hidden from members who lack Manage Server in Discord's
+own UI, which is a display filter — the permission checks still run regardless.
 
-`[p]watch set` with no arguments prints every setting with what it means, what
-it accepts and what it is currently set to, rather than a list of key names. A
-key with no value explains that one setting. As a slash command the key is a
-dropdown built from the same table, so it cannot offer a setting the command
-would reject.
+> ⚠️ **Slash commands do not appear until the bot owner runs `[p]slash enable`
+> and `[p]slash sync`.** Without that they exist in the cog and are invisible in
+> Discord, which looks exactly like the feature not working.
 
-`[p]watch show` is the diagnostic surface: per watched channel it prints how
-many messages are pending, when that channel was last actually judged, and the
-last reason nothing happened. Without those, a channel whose report channel lost
-its permissions looks exactly like a quiet week, because every failure path in
-this cog returns silently. Failures are also logged to `red.nyancogs.messagewatch`
-with a reason and no message content.
+### Settings and diagnostics
 
-A channel that goes quiet before filling a window is judged anyway, after
-`idle_seconds` (600 by default) with no new message — short of a full window,
-down to two messages. One message alone is not judged and waits for a second:
-hostility is a property of an exchange. Without that a quiet channel is never judged at all: a
-venting channel is a post, two replies and then silence, which is exactly the
-shape the rules are for. `[p]watch set idle_seconds 0` turns the sweep off and
-restores the old behaviour, where only a full window is ever judged.
+| Command | Purpose |
+|---|---|
+| `[p]watch set` | Print every setting with what it means, what it accepts, and its current value |
+| `[p]watch set <key>` | Explain that one setting |
+| `[p]watch set <key> <value>` | Change one setting |
+| `[p]watch show` | Per watched channel: messages pending, when it was last judged, and the last reason nothing happened |
 
-Hostility and heat are judged over a window rather than a message, because an
-argument is a property of an exchange. Consecutive windows overlap by half, so
-an exchange straddling a boundary is still judged together and every message is
-judged in two windows. Window size, the report cooldown, and all three
-thresholds are per-guild settings; `[p]watch show` prints the effective values
-and `[p]watch set <key> <value>` changes one.
+`[p]watch set` prints meanings rather than a list of key names. As a slash
+command the key is a dropdown built from the same table, so it cannot offer a
+setting the command would reject.
 
-Defaults were measured on 2026-09-20 against `jev-1.13.0`. On synthetic cases
-scams separated at 0.93 and above against 0.08 for a message *warning about* a
-phishing mail, and hostility at 0.95 against 0.03 for a heated technical
-argument. On 97 real messages from the target guild the maxima were 0.05, 0.15
-and 1.53 out of 3, so the defaults sit far above observed background. False
-negatives are not measured: that sample contained no scam and no argument to
-catch, so the recall of this cog is unverified.
+`[p]watch show` is the diagnostic surface. Without it, a channel whose report
+channel lost its permissions looks exactly like a quiet week, because every
+failure path in this cog returns silently. Failures are also logged to
+`red.nyancogs.messagewatch` with a reason and no message content.
+
+### When a window is judged
+
+| Situation | Behaviour |
+|---|---|
+| A full window accumulates | Judged immediately; consecutive windows overlap by half, so every message is judged in two windows and an exchange straddling a boundary is still judged together |
+| A channel goes quiet short of a full window | Judged after `idle_seconds` (600 by default) with no new message, down to two messages |
+| One message and nothing else | Not judged — hostility is a property of an exchange, so it waits for a second message |
+| `[p]watch set idle_seconds 0` | Turns the sweep off; only a full window is ever judged |
+
+Without the idle sweep a quiet channel is never judged at all: a venting channel
+is a post, two replies and then silence, which is exactly the shape the rules are
+for.
+
+Window size, the report cooldown, and all three thresholds are per-guild
+settings.
+
+### Measured defaults
+
+Measured 2026-09-20 against `jev-1.13.0`.
+
+| Signal | Positive case | Negative case |
+|---|---|---|
+| Scam | 0.93 and above | 0.08 for a message *warning about* a phishing mail |
+| Hostility | 0.95 | 0.03 for a heated technical argument |
+
+On 97 real messages from the target guild the maxima were 0.05, 0.15 and 1.53
+out of 3, so the defaults sit far above observed background.
+
+> **Note:** False negatives are not measured. That sample contained no scam and
+> no argument to catch, so the recall of this cog is unverified.
 
 ## EmbedFixer
 
@@ -330,8 +429,6 @@ Install the cog with Red's Downloader:
 Replace `[p]` with the bot's command prefix.
 
 ### Permissions
-
-The bot needs the following permissions:
 
 | Location | Permissions |
 |---|---|
