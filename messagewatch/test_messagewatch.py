@@ -1063,6 +1063,25 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         await MessageWatch._sweep.coro(cog)
         cog.flush.assert_not_awaited()
 
+    async def test_a_stale_single_message_never_reaches_flush(self) -> None:
+        # It is waiting for a second message, not failing. Reaching `flush`
+        # every minute would record `no_api_key` or `no_report_channel` against
+        # it before `_take_window` turns it away, putting a false problem in the
+        # surface built to tell a real one from a quiet channel.
+        cog = self.cog()
+        cog._pending = pending()
+        cog._pending[5].extend(window(1, at=module.time.monotonic() - 900))
+        cog.bot.get_channel.return_value = self.channel()
+        cog.flush = AsyncMock()
+        await MessageWatch._sweep.coro(cog)
+        cog.flush.assert_not_awaited()
+        cog.bot.get_channel.assert_not_called()
+
+        # A second message makes it eligible.
+        cog._pending[5].extend(window(2, at=module.time.monotonic() - 900))
+        await MessageWatch._sweep.coro(cog)
+        cog.flush.assert_awaited_once()
+
     async def test_an_empty_or_unresolvable_channel_is_skipped(self) -> None:
         cog = self.cog()
         cog._pending = pending()

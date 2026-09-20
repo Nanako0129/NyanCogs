@@ -462,7 +462,12 @@ class MessageWatch(commands.Cog):
         channel is a post, two replies and then nothing.
         """
         for channel_id, queue in list(self._pending.items()):
-            if not queue:
+            # A queue that cannot reach MIN_PARTIAL_WINDOW is waiting for
+            # another message, not failing. Letting it into `flush` every
+            # minute would record `no_api_key` or `no_report_channel` against
+            # it before `_take_window` turns it away -- a false problem in the
+            # surface built to tell a real one from a quiet channel.
+            if len(queue) < MIN_PARTIAL_WINDOW:
                 continue
             channel = self.bot.get_channel(channel_id)
             guild = getattr(channel, "guild", None)
