@@ -160,7 +160,7 @@ Furthermore, rule criteria formulation directly alters classification performanc
 
 **Recall.** Three things get confused here, so they are named separately.
 
-Every figure documented above -- 4/4, 9/9, 12/12, 19/19 -- is **accuracy** on a labelled set: given a case whose correct answer is known, does the model return it. Those sets hold both violating and clean cases and carry no true-positive/false-positive denominator, so they are not precision.
+Every ratio documented above -- 4/4, 5/5, 9/9, 12/12, 17/19, 18/19, 19/19 -- is **accuracy** on a labelled set: given a case whose correct answer is known, does the model return it. Those sets hold both violating and clean cases and carry no true-positive/false-positive denominator, so they are not precision.
 
 **Precision** is what the moderator `ok`/`no` buttons accumulate, and only for cases that produced a report in the first place.
 
