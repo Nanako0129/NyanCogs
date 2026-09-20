@@ -673,7 +673,13 @@ def endpoint_is_allowed(value: str) -> bool:
     # Before either scheme branch. Credentials in the URL would be readable by
     # any manager through `[p]watch vision`'s display path, which is open on
     # purpose so the people configuring a channel can see the endpoint.
-    if parts.username or parts.password:
+    #
+    # Presence, not truthiness: `urlsplit("https://@host")` gives `username`
+    # as the empty string, which `or` reads as absent. That form carries no
+    # credential, so it is not a leak -- but "no userinfo" is a rule one can
+    # state and test, and "no non-empty userinfo" is not the rule the comment
+    # above claims. An "@" inside the netloc is always the userinfo separator.
+    if "@" in parts.netloc:
         return False
     if parts.scheme == "https":
         return bool(parts.hostname)

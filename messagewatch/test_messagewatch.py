@@ -2524,6 +2524,12 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             # readable by someone who is not the owner who set it.
             "https://user:pw@openrouter.ai",
             "https://:pw@openrouter.ai",
+            "https://user@openrouter.ai",
+            # Empty userinfo carries no credential, so this one is not a leak.
+            # It is here because the rule is "no userinfo", and a truthiness
+            # test reads `username == ""` as absent and lets it through.
+            "https://@openrouter.ai",
+            "http://@192.168.1.1",
             # `urlsplit` defers the port, so these parse until something reads
             # it. Refused here rather than stored and failing at request time.
             "http://192.168.1.2:not-a-port",
