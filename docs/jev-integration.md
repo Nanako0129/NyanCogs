@@ -27,11 +27,24 @@ The model identifier is pinned in source code as `MODEL = "jev-1.13.0"`, avoidin
 
 Every evaluation payload structures input into three explicit fields:
 
-```text
-state        = Anonymized message array (text, sequential index, u1/u2 pseudonyms, channel name)
-instructions = Classification objective for the specific question
-criteria     = Concrete semantic definitions distinguishing possible outcomes
+```json
+{
+  "state": { "channel": "...", "messages": [ ... ] },
+  "model": "jev-1.13.0",
+  "questions": {
+    "<question name>": {
+      "type": "noul | choice | score",
+      "instructions": "what this one question is judging",
+      "criteria": "how its possible answers differ"
+    }
+  }
+}
 ```
+
+`state` is the anonymised message array plus the channel name, and it is shared
+by every question in the request. `instructions` and `criteria` sit inside each
+question, not beside `state`, which is what lets independent judgements run over
+one payload.
 
 Discord user IDs, server nicknames, and avatar hashes are never transmitted. Author identities are mapped to ephemeral labels (`u1`, `u2`), generated per request and discarded immediately. The same user receives different pseudonyms across consecutive requests, preventing cross-window tracking outside the bot.
 

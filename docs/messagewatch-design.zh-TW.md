@@ -2,7 +2,7 @@
 
 # MessageWatch 架構決策
 
-本檔案記錄 MessageWatch 的架構設計決策與工程取捨。指令操作與安裝說明請參閱 [README](../README.md)。分類模型背後的實測數據與問題設計，請參閱 [Jev 導入紀錄](jev-integration.md)。
+本檔案記錄 MessageWatch 的架構設計決策與工程取捨。指令操作與安裝說明請參閱 [README](../README.zh-TW.md)。分類模型背後的實測數據與問題設計，請參閱 [Jev 導入紀錄](jev-integration.zh-TW.md)。
 
 ---
 
@@ -62,7 +62,7 @@ MessageWatch 負責監控已啟用頻道中的近期訊息，評估對話互動�
 
 當版本遞增後，所有伺服器將暫停對外發送。為避免無聲停擺，`[p]watch show` 會在面板首個欄位明確指出當前狀態為揭露版本過期而暫停。
 
-資料揭露宣告文字同時同步於四處：`messagewatch.py` 的 `DISCLOSURE_TEXT`、`info.json` 的 `end_user_data_statement`、[README](../README.md)，以及通報報告 embed 頁尾。單元測試 `test_messagewatch.py` 會比對 `DEFAULT_CHANNEL` 的欄位集合與宣告詞彙對照表，若新增儲存欄位而未於揭露文字中說明，測試將無法通過。
+資料揭露宣告文字同時同步於四處：`messagewatch.py` 的 `DISCLOSURE_TEXT`、`info.json` 的 `end_user_data_statement`、[README](../README.zh-TW.md)，以及通報報告 embed 頁尾。單元測試 `test_messagewatch.py` 會比對 `DEFAULT_CHANNEL` 的欄位集合與宣告詞彙對照表，若新增儲存欄位而未於揭露文字中說明，測試將無法通過。
 
 ## 6. 並行控制：單一鎖從頭鎖到尾
 
@@ -70,7 +70,7 @@ MessageWatch 負責監控已啟用頻道中的近期訊息，評估對話互動�
 
 在早期原型中，鎖僅在自佇列取出視窗時持有。這導致在取出訊息至發出報告之間存在並行空窗。若管理員在該空窗期執行 `[p]watch disable` 停用頻道，已被取出的訊息仍會被傳送至外部 API 並發出報告。
 
-將鎖的範疇擴展至包覆整個方法體，消除了這項競爭條件。推論期間該頻道的訊息接收僅短暫暫停，新收到的訊息會在釋鎖後排入 `self._pending[channel.id]`。此外，`flush()` 在發送前會在鎖內重新確認 `watched_channels` 狀態。因為 `[p]watch disable` 亦需取得同一個鎖，停用指令能即時阻斷未發送的推論報告。
+將鎖的範疇擴展至包覆整個方法體，消除了這項競爭條件。推論期間該頻道的訊息接收僅短暫暫停，新收到的訊息會在釋鎖後排入 `self._pending[channel.id]`。此外，`flush()` 在發送前會在鎖內重新確認 `watched_channels` 狀態。因為 `[p]watch disable` 亦需取得同一個鎖，它無法與那次重讀交錯：在重讀之前被停用的頻道不會送出任何東西。但它取消不了已經在途中的請求——`flush` 連同 provider 呼叫一起持鎖，所以停用指令會等那次呼叫結束，該次產生的報告仍會送出。
 
 ## 7. 外部模型輸出視為不可信
 

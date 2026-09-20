@@ -70,7 +70,7 @@ The evaluation routine `flush()` acquires `self._locks[channel.id]` across its e
 
 In an earlier prototype, the lock was held only while popping messages from the pending queue. This left a concurrency gap between message extraction and report dispatch. A moderator executing `[p]watch disable` within that window could disable the channel, yet extracted messages would still transmit to external APIs and generate reports.
 
-Holding the lock across the entire method closes this race condition. Message intake pauses briefly during active provider requests; incoming messages append to `self._pending[channel.id]` once the lock releases. In addition, `flush()` re-checks `watched_channels` inside the lock before transmission. Because `[p]watch disable` acquires the same lock, disabling a channel immediately blocks in-flight transmissions.
+Holding the lock across the entire method closes this race condition. Message intake pauses briefly during active provider requests; incoming messages append to `self._pending[channel.id]` once the lock releases. In addition, `flush()` re-checks `watched_channels` inside the lock before transmission. Because `[p]watch disable` acquires the same lock, it cannot interleave with that re-check: a channel disabled before the re-check sends nothing. It does not cancel a request already in flight. `flush` holds the lock across the provider call, so the disable command waits for that call to finish, and the report it produces is still delivered.
 
 ## 7. Provider output is never trusted
 
