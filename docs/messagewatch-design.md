@@ -2,217 +2,147 @@
 
 # MessageWatch: design decisions
 
-This records why MessageWatch is shaped the way it is. It is not usage
-documentation — that is in the [README](../README.md) — but the trade-offs made
-while building it, and what forced each one.
-
-The question design and measurements behind the model side are in
-[Jev integration](jev-integration.md).
+This document records why MessageWatch is shaped the way it is. Usage and command syntax live in the [README](../README.md). For empirical measurements, question schema, and provider benchmarks, see [Jev integration](jev-integration.md).
 
 ---
 
 ## 1. What it does, and what it deliberately does not
 
-MessageWatch reads recent messages in an enabled channel, judges whether the
-exchange needs a person to look at it, and posts a report in a moderator
-channel.
+MessageWatch monitors recent messages in explicitly enabled channels, evaluates whether an exchange warrants moderator attention, and dispatches structured reports to a configured moderation channel.
 
-It never acts on its own. No automatic deletion, timeout, or reminder. A report
-can carry buttons, and every button needs someone to press it. The two mark
-buttons record a count and ask for no permission beyond reaching the moderator
-channel; the three that change something — deleting a message, timing a member
-out, adding a role — each require the person pressing to hold the matching
-Discord permission themselves.
+The cog never initiates punitive or corrective actions autonomously—no automated message deletions, timeouts, or member warnings. Every action requires human confirmation via interactive report buttons:
 
-This is not caution for its own sake. The same repository used to contain a
-punishment path that looked complete and did nothing: the old `phishingchecker`
-called `modlog.case_create`, which does not exist in Red 3.5 (only `create_case`
-does), and neither its ban branch nor its kick branch ever actually called
-`ban()` or `kick()`. An automated punishment bot fails by quietly acting on
-someone. A reporting bot fails by quietly reporting nothing — a failure a
-person can notice.
+- **Audit marks (`ok`, `no`)**: Record moderator feedback for precision accounting. These require no elevated permissions beyond visibility of the moderation channel.
+- **State-altering actions (`del`, `mute`, `role`)**: Delete the target message, apply a temporary timeout, or assign a moderation role. Each button requires the moderator clicking it to hold the corresponding Discord permission directly (`manage_messages`, `moderate_members`, or `manage_roles`).
+
+This boundary addresses a concrete defect found in earlier moderation implementations. A legacy cog in this repository, `phishingchecker`, contained moderation branches that gave the false impression of handling enforcement. In practice, its ban and kick branches attempted to call `modlog.case_create`—an API absent in Red 3.5, where only `create_case` exists—and never invoked `ban()` or `kick()`. 
+
+An automated punishment system fails by silently penalizing innocent members. A reporting system fails by silently omitting a report—a failure mode human operators can identify and diagnose.
 
 ## 2. The unit of judgement is a window, not a message
 
-Hostility, heat, "someone is being lectured at when they wanted to be heard" —
-these are properties of an exchange. A single message cannot carry them. So
-the cog accumulates a window (`window_size`, 8 by default) before sending
-anything.
+Hostility, interpersonal friction, and condescension are properties of an exchange, not of a single message. Isolated messages cannot establish these dynamics. MessageWatch therefore evaluates rolling windows rather than individual messages, using a default `window_size` of 8.
 
-- A full window is taken with half of it left behind (take 8, keep 4).
-  Without the overlap, a conversation cut across the boundary is never seen
-  whole.
-- A short window, the kind the idle sweep takes, is consumed entirely. There
-  is no later message for an overlap to join it to, and leaving half behind only
-  makes the next sweep re-judge the same tail.
-- A lone message is never judged; `MIN_PARTIAL_WINDOW = 2` is the floor.
+- **Full windows slide by half (`take = 8`, `stride = 4`)**: When a channel queue reaches `window_size`, 8 messages are evaluated while 4 messages remain in the queue. Without this 50% overlap, conversations that cross a window boundary would be truncated and evaluated without context.
+- **Partial windows flush completely**: When an idle sweep consumes a partial window, all queued messages are cleared. Because no immediate subsequent messages exist, preserving an overlap would cause the next sweep to repeatedly re-evaluate the same conversational tail.
+- **Single messages are ignored**: Evaluation requires at least `MIN_PARTIAL_WINDOW = 2` messages. A lone message does not constitute an exchange.
 
 ## 3. Channels that never fill a window
 
-The first version only judged at 8 messages. That meant a quiet channel — one
-confession, two replies, then nothing — was never judged at all. That is
-the exact kind of channel this cog was written to watch.
+If evaluation required a full window of 8 messages, low-traffic channels—such as a venting channel where a member posts a single message followed by two replies—would never reach the threshold. These quiet spaces are often the primary channels requiring oversight.
 
-The answer is a `tasks.loop(seconds=60)` idle sweep: once a queue holds at least
-`MIN_PARTIAL_WINDOW` (2) messages and the newest one is older than the guild's
-`idle_seconds` (600 by default), it is sent with `partial=True`.
+To handle low-activity queues, an idle sweep runs every 60 seconds via `tasks.loop(seconds=60)` (`IDLE_SWEEP_SECONDS = 60`). The sweep checks whether a pending queue contains at least `MIN_PARTIAL_WINDOW` (2) messages and the timestamp of the newest message exceeds the guild's `idle_seconds` setting (default: 600 seconds). If both conditions hold, the queue is flushed with `partial=True`.
 
-So the real behaviour is:
-
-| Situation | When it is judged |
+| Message Queue State | Evaluation Timing |
 |---|---|
-| 8 messages or more | Immediately |
-| 2–7 messages, then silence | Once the silence reaches 10 minutes, at the next sweep (up to 60 seconds later) |
-| Exactly 1 message, ever | Never — see §2, one message is not an exchange |
+| 8 or more messages | Immediate evaluation |
+| 2–7 messages, followed by silence | Evaluated once silence reaches `idle_seconds` (10 minutes), on the next 60-second sweep |
+| Exactly 1 message | Never evaluated alone; waits for at least `MIN_PARTIAL_WINDOW = 2` |
 
-A queue below `MIN_PARTIAL_WINDOW` is skipped in the sweep rather than allowed
-into `flush` and turned away by `_take_window`. Otherwise it would record
-`no_api_key` or `no_report_channel` against that channel every minute — noise
-on a diagnostic surface meant to separate real problems from quiet channels.
+Queues with fewer than `MIN_PARTIAL_WINDOW` messages are bypassed via `continue` in `_sweep` rather than forwarded to `flush()`. Forwarding undersized queues would trigger `_take_window` rejections and log `no_api_key` or `no_report_channel` errors every minute on idle channels, creating false diagnostics on surfaces intended to flag genuine operational failures.
 
-The sweep is also where usage counters are written to disk and the dashboard
-message is refreshed. It already runs every 60 seconds; both ride along without
-extra timer overhead.
+The idle sweep also handles disk persistence for token spend counters (`_flush_usage`) and refreshes the monitoring dashboard (`_update_dashboards`). Bundling these tasks into the existing 60-second loop avoids auxiliary timer overhead.
 
 ## 4. Almost everything is per-channel
 
-Enablement, rules, the channel's purpose note, the violation threshold, where
-reports are routed, which buttons a report carries, which role the role button
-adds, whether images are read — all per-channel.
+Channel enablement, custom rules, channel purpose definitions, violation thresholds (`rule_threshold`), report routing destinations (`report_channel`), report button layouts (`actions`), and role assignment targets (`action_role`) are all configured per channel.
 
-This shape was forced by one channel. The venting channel's rules forbid
-inspirational platitudes, unsolicited advice, "I've been through this too",
-speculation about motives, and smoothing things over on someone's behalf. Every
-one of those scores near zero to a scam or hostility detector, and its
-disposition is not deletion or a timeout but adding a role that hides the channel
-from the person. The same ruleset in a general channel would be absurd, and so
-would the same buttons.
+This per-channel isolation was prompted by the requirements of confession and venting channels (e.g., `#樹洞`). Rules in such channels typically prohibit unsolicited advice, empty platitudes, personal anecdotes ("I went through this too"), motive speculation, and unprompted peacemaking. To generic scam or hostility detectors, these supportive or conversational statements register scores near 0.0. Furthermore, the appropriate remedy is neither deletion nor a timeout, but assigning an isolation role that hides the channel from the user. Applying these specialized rules or button actions to a general discussion channel would be counterproductive.
 
-Threshold inheritance is `channel_value or guild_value`: a per-channel `0.0`
-means *inherit*, not *threshold of zero*.
+Threshold inheritance follows the pattern `channel_value or guild_value`. A channel setting stored as `0.0` indicates inheritance from the guild-wide configuration, not a literal zero threshold.
 
 ## 5. The disclosure contract and its version
 
-`DISCLOSURE_VERSION` is currently 4. When the version a guild accepted does not
-match the current one, the cog stops sending anything at all for that guild
-until a manager accepts again.
+`DISCLOSURE_VERSION` is currently set to 3 in `messagewatch.py`. If the version accepted by a guild manager does not match this constant, the cog suspends all outbound processing for that guild until a manager re-accepts via `[p]watch disclosure I_ACCEPT`. Version 3 covers initial baseline exports, channel rules with purpose notes, and interactive report actions. Version 4 exists on an open pull request that adds image reading and is not merged; this document describes the merged code.
 
-It is bumped every time what leaves Discord changes: adding rules and the purpose
-note (members cannot write those, but they are still text leaving the platform),
-adding buttons and dispositions, adding image reading. The cost of that rule has
-to be handled with it — after a bump every guild silently stops, so
-`[p]watch show` must state plainly that it is stopped because the disclosure
-version is stale. A cog that quietly does nothing is the failure this project
-guards against hardest.
+Outbound changes trigger version bumps:
+- v1: Baseline human message text and channel names.
+- v2: Channel rules and moderator purpose notes.
+- v3: Interactive report action buttons with modlog audit records.
 
-The contract text is stated in four places — `DISCLOSURE_TEXT`, the
-`end_user_data_statement` in `info.json`, the README, and the report embed's
-footer. All four move together, and a test pins the field set of
-`DEFAULT_CHANNEL` against a phrase map, so adding any stored field without naming
-it in the disclosure turns the suite red.
+When the version increments, all guilds halt outbound requests until re-acknowledged. To prevent silent failures, `[p]watch show` prominently reports when processing is suspended due to an outdated disclosure version.
+
+The disclosure statement is synchronized across four locations: `DISCLOSURE_TEXT` in `messagewatch.py`, `end_user_data_statement` in `info.json`, the repository [README](../README.md), and report embed footers. Automated tests validate the configuration schema of `DEFAULT_CHANNEL` against a phrase map in `test_messagewatch.py`, failing the build if a newly persisted field is omitted from the disclosure text.
 
 ## 6. Concurrency: one lock, held end to end
 
-`flush()` holds `self._locks[channel.id]` for its entire body. An earlier version
-took the lock only while lifting the window, which left a gap between taking the
-messages and sending the report — and `[p]watch disable` could land in that gap
-while the messages it had just disabled went out anyway.
+The evaluation routine `flush()` acquires `self._locks[channel.id]` across its entire body, including external provider network calls. 
 
-Holding the lock across the whole body closes that race. There is
-still a re-read of `watched_channels` before sending, inside the lock; the
-disable command takes the same lock, so the two cannot interleave.
+In an earlier prototype, the lock was held only while popping messages from the pending queue. This left a concurrency gap between message extraction and report dispatch. A moderator executing `[p]watch disable` within that window could disable the channel, yet extracted messages would still transmit to external APIs and generate reports.
+
+Holding the lock across the entire method closes this race condition. Message intake pauses briefly during active provider requests; incoming messages append to `self._pending[channel.id]` once the lock releases. In addition, `flush()` re-checks `watched_channels` inside the lock before transmission. Because `[p]watch disable` acquires the same lock, disabling a channel immediately blocks in-flight transmissions.
 
 ## 7. Provider output is never trusted
 
-Everything that comes back from a provider goes through `_bounded_probability`,
-`_bounded_score`, `_bounded_index` or `_bounded_token_count`. This is not
-theoretical caution — the same class of defect appeared four times in this
-cog, in a different shape each time:
+All responses received from external inference providers are validated and constrained via helper utilities: `_bounded_probability`, `_bounded_score`, `_bounded_index`, and `_bounded_token_count`.
 
-- `float(10**400)` → `OverflowError`
-- `int("²")` → `ValueError` (yes, `"²".isdigit()` is `True`)
-- Deeply nested JSON → `RecursionError` from `json.loads`
-- `int(float("inf"))` → `OverflowError`
+These guards were introduced in response to four distinct data-parsing failures encountered during development:
 
-Range checks are always written `if not low <= parsed <= high`, never
-`if parsed < low or parsed > high`. The second form lets NaN through — both
-comparisons are false — and a NaN threshold makes `probability < threshold`
-false for everything, which is to say it passes everything.
+- `float(10**400)` raised `OverflowError` from unboundedly large integers parsed by `json.loads`.
+- `int("²")` raised `ValueError` because `"²".isdigit()` returns `True` despite failing integer conversion.
+- Excessively nested JSON structures raised `RecursionError` in `json.loads`.
+- `int(float("inf"))` raised `OverflowError` because `json.loads` converts literal `Infinity` tokens to float infinity.
+
+Range checks are strictly written using inclusive bounds: `if not low <= parsed <= high`, never `if parsed < low or parsed > high`. The latter pattern evaluates to `False` when comparing against `NaN`, permitting invalid values to bypass filtering and causing downstream checks like `probability < threshold` to fail silently.
 
 ## 8. Disposition stays in human hands
 
-Report buttons are a persistent view. The `custom_id` encodes
-`mw:<action>:<kind>:<channel>:<message>:<author>`, 69 characters at worst.
-discord.py does not enforce the 100-character limit (measured); only the
-Discord API rejects it, so the bound has to be kept by hand. `cog_load`
-re-registers the view with `bot.add_view`, so buttons on old reports still work
-after a restart.
+Interactive report buttons are implemented as a persistent view. Each button encodes its operational context in a structured `custom_id`:
 
-The three state-changing actions carry a required permission in the `ACTIONS`
-table; the two marks carry `None`. Where one is required, the check lives in the
-callback and reads the `guild_permissions` of the person who pressed the button
-(`manage_messages` / `moderate_members` / `manage_roles`), not "can see the
-moderator channel". Each action is written to the Red modlog under that
-moderator's name.
+```text
+mw:<action>:<kind>:<channel>:<message>:<author>
+```
+
+With three 20-digit snowflakes and the longest action (`role`), this measures 72 characters, below `CUSTOM_ID_LIMIT = 100`, which `build_custom_id` asserts at build time. Two smaller figures were in circulation before that was measured — 69 in an earlier draft of this document and 71 in the source comment — and both were written from inspection rather than from running the builder. While `discord.py` does not validate this 100-character ceiling client-side, the Discord API enforces it strictly. Handlers are re-registered on startup via `bot.add_view` inside `cog_load`, allowing buttons on pre-existing reports to remain functional across bot restarts.
+
+The `ACTIONS` registry pairs each action identifier with its required Discord permission:
+
+| Action Identifier | Button Label | Button Style | Required Discord Permission |
+|---|---|---|---|
+| `ok` | 屬實 | `secondary` | None (audit mark only) |
+| `no` | 誤判 | `secondary` | None (audit mark only) |
+| `del` | 刪除訊息 | `danger` | `manage_messages` |
+| `mute` | 禁言作者 | `danger` | `moderate_members` |
+| `role` | 加上身分組 | `danger` | `manage_roles` |
+
+Button callbacks check `guild_permissions` directly on the interacting member, verifying that the user possesses the requisite administrative authority rather than merely having access to the moderation channel. State changes are recorded in Red's `modlog` credited to the acting moderator.
 
 ## 9. What is stored
 
-Stored: guild settings, the report channel ID, the set of enabled channel IDs,
-per-channel rules and purpose note, the button list, the role ID, thresholds, and
-per-rule counts of how moderators marked reports. Counts only.
+### Persisted data
+- Guild configurations and moderation report channel IDs.
+- Sets of explicitly enabled channel IDs.
+- Per-channel rules, purpose notes, report route targets, button configurations, and action role IDs.
+- Classification thresholds (`scam_threshold`, `hostile_threshold`, `heat_threshold`, `rule_threshold`, `rule_confidence`).
+- Aggregate moderator mark counts (`ok` and `no` totals grouped by category).
 
-Not stored: message content, model responses, any judgement.
+### Excluded data
+- Raw message content.
+- Model response payloads.
+- Individual inference judgements.
 
-So false-positive data accumulates — and what accumulates is precision only.
-**Recall is still unmeasured.** A missed case needs a real missed case, and the
-buttons cannot see those. Every threshold in use came from measurements on
-synthetic cases. None of the recent work changed that, and it is written here so
-it does not get forgotten.
+Moderator audit buttons allow precision data to accumulate over time. However, **recall remains unmeasured**. Detecting false negatives requires identifying violations that never generated a report, which button feedback cannot capture. Operational defaults derive from synthetic test benchmarks rather than production recall metrics.
 
 ## 10. The image aux
 
-Jev does not read images. The commonest scam shape here is a message that is
-a screenshot and nothing else, so a multimodal model is bolted on to do one
-thing: transcribe the characters in the image, verbatim.
+Jev processes text representations only. Because Discord scams frequently arrive as standalone image screenshots without accompanying text, MessageWatch includes an auxiliary multimodal image pipeline with a strictly bounded contract: literal character transcription.
 
-Not "describe this image". A description is open-ended generation whose errors
-nobody can check against the picture; a verbatim transcription can be checked,
-and it is shown in the report so a moderator can do that. The transcription then
-feeds the scam judgement that already exists rather than getting a rule of its
-own — which means it travels twice, to the vision provider and on to TypeSafe,
-and the disclosure says so.
+The model is restricted to verbatim OCR transcription. It does not generate descriptive scene summaries. Free-form descriptions represent uncalibrated text that moderators cannot readily audit against original attachments; literal transcriptions can be verified directly on the report embed. Extracted text is fed into the existing scam classification question rather than a dedicated rule, meaning extracted text travels first to the vision endpoint and subsequently to TypeSafe.
 
-- Downscaled to a 1536 px long edge and re-encoded before sending, which
-  discards EXIF including GPS.
-- At most 4 images per window; 8 MB and 40 megapixels per image.
-- Cached by attachment id, at most 256 entries, in memory only. `cog_unload` and
-  a data deletion request both drop the whole cache (it has no author field, so
-  it cannot be filtered to one person, and dropping all of it is the honest
-  answer).
-- **There is no default model.** Which multimodal model reads CJK screenshots
-  best has not been measured, and picking one without data would just be guessing,
-  so this path sends nothing until it is configured.
+Operational parameters:
+- Images are downscaled to a maximum long edge of 1536 px and re-encoded before transmission, discarding EXIF metadata including GPS coordinates.
+- Limits are capped at 4 images per window, with individual image limits of 8 MB and 40 megapixels.
+- Attachments are cached in memory by attachment ID up to 256 entries. The cache contains no user identifiers; consequently, `cog_unload` and GDPR data deletion requests flush the entire cache.
+- **No default vision model is configured.** Because transcription accuracy across CJK screenshots remains unmeasured, the pipeline remains inactive until explicitly configured by an operator.
 
-The endpoint and model live in global config and only the bot owner can write
-them: the API key they spend is bot-wide and the owner's, so an administrator of
-any guild the bot has joined who could aim the endpoint would be able to send
-that bearer token, and every image, to a host of their own. `[p]watch vision` is
-separate from `[p]watch set` because that table is numeric — every entry carries
-a range — while these two are free strings, and forcing them in would have meant
-a range check that means nothing. `api_base` must be `https://`: the image
-leaves Discord over it.
+Vision endpoints and model names are stored in global configuration, editable only by the bot owner via `[p]watch vision`. Because vision calls consume the bot owner's global API credentials, restricting this setting prevents server administrators from redirecting API keys or image data to unauthorized hosts. `api_base` must use an `https://` scheme.
 
 ## 11. Cost visibility
 
-Usage — input tokens and windows judged — accumulates in memory, is written to
-disk by the idle sweep every 60 seconds, and once more in `cog_unload`, so a
-restart loses at most the tail since the last tick. `[p]watch dashboard` pins an
-embed in any channel that refreshes on the same tick.
+Resource utilization—including input token tallies and total evaluated windows—accumulates in process memory. Counters are written to disk every 60 seconds during the idle sweep and flushed once more during `cog_unload`. An ungraceful restart loses at most the final 60-second window. Operators can pin an auto-updating status embed in any channel via `[p]watch dashboard`.
 
 ## 12. What is not solved here
 
-- **Recall** (see §9).
-- No vision model has been measured.
-- Once `flush` is inside a discord.py dispatch task, `cog_unload` cannot cancel
-  it — those tasks do not belong to the cog — so an unloaded cog can still emit
-  one more report.
+- **Recall remains unmeasured**: The system tracks precision through moderator feedback, but cannot quantify missed violations.
+- **Vision model benchmarks are absent**: Multi-model accuracy on CJK screenshots has not been benchmarked.
+- **Dispatch task cancellation on unload**: In-flight `flush()` calls managed by `discord.py` dispatch tasks cannot be terminated during `cog_unload`, meaning an unloaded cog may emit one concluding report.
