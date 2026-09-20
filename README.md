@@ -119,6 +119,55 @@ traverse the LAN unencrypted. Use HTTP only on a trusted LAN. Its complete
 statement is in
 [`channelsummary/info.json`](channelsummary/info.json).
 
+## MessageWatch
+
+MessageWatch reports likely scam messages and hostile exchanges to a moderator
+channel. It judges short rolling windows of recent messages with
+[TypeSafe Jev](https://docs.typesafe.ai/), a model that returns calibrated
+probabilities rather than text. It never deletes, edits, reacts to, or punishes
+anything: the entire output is one report a moderator reads and acts on.
+
+```text
+[p]cog install NyanCogs messagewatch
+[p]load messagewatch
+[p]watch key                     # owner only, stores the TypeSafe api_key
+[p]watch report #mod-log
+[p]watch disclosure              # read it
+[p]watch disclosure I_ACCEPT
+[p]watch enable #a-channel       # one channel at a time
+```
+
+Every channel is opted in separately and sends nothing until it is. An enabled
+channel is a standing export: message text goes to TypeSafe continuously, with
+nobody triggering it, which is unlike the on-demand `/summary`. Each request
+also carries the name of the channel. Discord user IDs, display names and
+avatars are never sent; authors become labels such as `u1` generated per
+request and never stored. Attachments, embeds and links are
+not fetched or resolved. `[p]watch disable` stops a channel immediately and
+drops anything pending for it.
+
+`[p]watch show` is the diagnostic surface: per watched channel it prints how
+many messages are pending, when that channel was last actually judged, and the
+last reason nothing happened. Without those, a channel whose report channel lost
+its permissions looks exactly like a quiet week, because every failure path in
+this cog returns silently. Failures are also logged to `red.nyancogs.messagewatch`
+with a reason and no message content.
+
+Hostility and heat are judged over a window rather than a message, because an
+argument is a property of an exchange. Consecutive windows overlap by half, so
+an exchange straddling a boundary is still judged together and every message is
+judged in two windows. Window size, the report cooldown, and all three
+thresholds are per-guild settings; `[p]watch show` prints the effective values
+and `[p]watch set <key> <value>` changes one.
+
+Defaults were measured on 2026-09-20 against `jev-1.13.0`. On synthetic cases
+scams separated at 0.93 and above against 0.08 for a message *warning about* a
+phishing mail, and hostility at 0.95 against 0.03 for a heated technical
+argument. On 97 real messages from the target guild the maxima were 0.05, 0.15
+and 1.53 out of 3, so the defaults sit far above observed background. False
+negatives are not measured: that sample contained no scam and no argument to
+catch, so the recall of this cog is unverified.
+
 ## EmbedFixer
 
 EmbedFixer replaces supported social links with provider-fixed links sent by the
