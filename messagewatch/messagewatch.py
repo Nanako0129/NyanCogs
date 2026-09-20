@@ -663,11 +663,21 @@ def endpoint_is_allowed(value: str) -> bool:
     """
     try:
         parts = urlsplit(value)
+        # `urlsplit` defers the port: a bad one raises only when it is read.
+        # Reading it here means a malformed endpoint is refused at the command
+        # rather than stored, left looking configured, and failing at the first
+        # request where nothing surfaces the reason.
+        parts.port
     except ValueError:
+        return False
+    # Before either scheme branch. Credentials in the URL would be readable by
+    # any manager through `[p]watch vision`'s display path, which is open on
+    # purpose so the people configuring a channel can see the endpoint.
+    if parts.username or parts.password:
         return False
     if parts.scheme == "https":
         return bool(parts.hostname)
-    if parts.scheme != "http" or parts.username or parts.password:
+    if parts.scheme != "http":
         return False
     host = parts.hostname or ""
     # urlsplit strips the brackets from an IPv6 authority, so this parses both

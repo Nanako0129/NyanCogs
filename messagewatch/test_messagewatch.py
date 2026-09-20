@@ -2518,6 +2518,16 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             "http://172.32.0.1",             # one network past 172.16/12
             "http://192.168.1.1@evil.com",   # userinfo, host is evil.com
             "http://user:pw@192.168.1.1",    # credentials in the URL
+            # Credentials are refused on both schemes, not just the one the
+            # LAN rule made me think about. `[p]watch vision`'s display path is
+            # open to managers on purpose, so a stored password would be
+            # readable by someone who is not the owner who set it.
+            "https://user:pw@openrouter.ai",
+            "https://:pw@openrouter.ai",
+            # `urlsplit` defers the port, so these parse until something reads
+            # it. Refused here rather than stored and failing at request time.
+            "http://192.168.1.2:not-a-port",
+            "https://openrouter.ai:70000",
             "ftp://192.168.1.1", "http://", "https://", "",
         ):
             with self.subTest(refused=value):
