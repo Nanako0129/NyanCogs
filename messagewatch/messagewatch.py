@@ -343,8 +343,10 @@ DISCLOSURE_TEXT = (
     "someone else's private conversation, so this is a heavier export than text and is "
     "decided one channel at a time.\n"
     "**What does not:** Discord user IDs, display names and avatars are never sent. Authors are "
-    "replaced with labels such as u1 and u2, generated per request and never stored. Attachments, "
-    "embeds and links are not fetched or resolved.\n"
+    "replaced with labels such as u1 and u2, generated per request and never stored. Embeds and "
+    "links are not fetched or resolved. Image attachments are fetched only where a manager has "
+    "turned image reading on for that channel, and their transcribed text is held in memory until "
+    "the cog is unloaded.\n"
     "**Vendor:** TypeSafe states it does not train on customer input. Its retention terms and the "
     "accuracy of its judgements are unverified by this cog.\n"
     "**What the bot does with a result:** posts a report in the configured moderator channel. "
@@ -925,6 +927,15 @@ class MessageWatch(commands.Cog):
                 )
         self._sweep.start()
 
+    def _forget_images(self) -> None:
+        """Drop every cached transcription.
+
+        The cache holds text taken out of members' images, keyed by attachment
+        id with no author attached -- so a deletion request cannot target one
+        person's entries, and the honest response is to drop all of them.
+        """
+        self._image_cache.clear()
+
     async def cog_unload(self) -> None:
         """Stop the sweep, so an unloaded cog stops judging.
 
@@ -935,10 +946,12 @@ class MessageWatch(commands.Cog):
         the only work the cog itself starts.
 
         The usage flush runs one last time here so a restart loses at most the
-        seconds since the last sweep tick, not the whole in-memory tail.
+        seconds since the last sweep tick, not the whole in-memory tail. The
+        transcription cache is dropped instead: it is the only member content
+        this cog holds, and an unloaded cog has no reason to keep it.
         """
         self._sweep.cancel()
-        # hasattr: some tests build a partial cog that skips __init__.
+        self._forget_images()
         await self._flush_usage()
 
     @tasks.loop(seconds=IDLE_SWEEP_SECONDS)
@@ -953,10 +966,6 @@ class MessageWatch(commands.Cog):
         cheap here regardless, since this already runs every IDLE_SWEEP_SECONDS
         whether or not anything is due.
         """
-        # hasattr, not a default set here: several tests build a partial cog
-        # with object.__new__ and call `_sweep` directly without going through
-        # __init__, and this loop already tolerates that everywhere else. A
-        # cog built through __init__ always has both.
         await self._flush_usage()
         await self._update_dashboards()
         for channel_id, queue in list(self._pending.items()):
@@ -991,11 +1000,18 @@ class MessageWatch(commands.Cog):
         self._sweep.restart()
 
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
-        """Drop any pending message this user wrote that has not been sent yet."""
+        """Drop any pending message this user wrote that has not been sent yet.
+
+        The transcription cache is keyed by attachment id and carries no author,
+        so it cannot be filtered down to one person -- `_forget_images` drops it
+        whole. That is wasteful (every other channel re-reads its images once)
+        and correct, which is the right way round for this request.
+        """
         for queue in self._pending.values():
             for item in list(queue):
                 if item.get("author_id") == user_id:
                     queue.remove(item)
+        self._forget_images()
 
     def _note(self, channel_id: int, reason: str) -> None:
         """Record why this channel produced nothing, for `[p]watch show`."""
@@ -1839,8 +1855,18 @@ class MessageWatch(commands.Cog):
         if channel.id not in set(settings["watched_channels"]):
             return
         text = clean_text(getattr(message, "content", "") or "")
+        # Captured unconditionally: it is local computation over metadata
+        # Discord already sent, and nothing leaves here. `flush` decides
+        # whether the channel actually reads them.
+        images = eligible_attachments(message)
         if not text:
-            return
+            # A bare screenshot is the commonest shape a scam takes here and it
+            # carries no text at all, so dropping it at this gate made the
+            # image feature unreachable for the case it was built for. The
+            # channel read is on this branch only, so the ordinary path still
+            # costs one settings lookup.
+            if not images or not await self.config.channel(channel).images():
+                return
         async with self._locks[channel.id]:
             # Re-read inside the lock. `[p]watch disable` leaves the watched set
             # and then clears the queue under this same lock, so a handler that
@@ -1967,6 +1993,53 @@ class MessageWatch(commands.Cog):
         await self.config.channel(channel).action_role.set(role.id)
         await ctx.send(
             f"{channel.mention} 的「加上身分組」會給 `{role.name}`。",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @watch_group.command(name="vision")
+    async def watch_vision(self, ctx: commands.Context, key: str = "", *, value: str = "") -> None:
+        """Set the vision provider's endpoint or model, or show both.
+
+        Separate from `[p]watch set` because that table is numeric: every entry
+        carries a range and is rejected outside it. These two are free strings,
+        and squeezing them into a numeric validator would have meant a range
+        check that means nothing.
+        """
+        fields = {
+            "api_base": ("image_api_base", "視覺模型的 API 根位址，例如 `https://openrouter.ai`"),
+            "model": ("image_model", "視覺模型名稱。沒有預設值——哪一個讀中文截圖最準還沒量過。"),
+        }
+        scope = self.config.guild(ctx.guild)
+        if key not in fields:
+            settings = await scope.all()
+            lines = [
+                f"`{name}` = `{settings[stored] or '（未設定）'}`\n{note}"
+                for name, (stored, note) in fields.items()
+            ]
+            await ctx.send(
+                embed=discord.Embed(
+                    title="MessageWatch 視覺模型設定",
+                    description="\n\n".join(lines)
+                    + "\n\n用 `[p]watch vision <api_base|model> <值>` 設定。"
+                    + "\nAPI key 由 bot owner 用 `[p]set api messagewatch_vision api_key <key>` 存。",
+                    colour=discord.Colour.blurple(),
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        stored, _ = fields[key]
+        value = value.strip()
+        if key == "api_base" and value and not value.startswith("https://"):
+            # The image leaves Discord over this, so plain HTTP would put a
+            # member's screenshot on the wire in clear.
+            await ctx.send("`api_base` 必須是 `https://` 開頭。")
+            return
+        if len(value) > 200:
+            await ctx.send("太長了，請控制在 200 字元內。")
+            return
+        await scope.set_raw(stored, value=value)
+        await ctx.send(
+            f"`{key}` 設為 `{value}`。" if value else f"已清除 `{key}`。",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

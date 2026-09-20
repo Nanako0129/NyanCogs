@@ -151,8 +151,9 @@ channel, those rules and its purpose note. A venting or confession channel is
 where this export costs the most: what people write there is what they expect
 will not be repeated. Discord user IDs, display names and
 avatars are never sent; authors become labels such as `u1` generated per
-request and never stored. Attachments, embeds and links are
-not fetched or resolved. `[p]watch disable` stops a channel immediately and
+request and never stored. Embeds and links are never fetched or
+resolved, and image attachments are fetched only in a channel where a manager
+turned image reading on. `[p]watch disable` stops a channel immediately and
 drops anything pending for it.
 
 Which buttons a report carries is per channel, and defaults to the two marks:
@@ -187,8 +188,8 @@ A channel can have its image attachments read, off by default:
 
 ```text
 [p]set api messagewatch_vision api_key <key>     # bot owner
-[p]watch set image_api_base https://openrouter.ai
-[p]watch set image_model <a model with image input>
+[p]watch vision api_base https://openrouter.ai
+[p]watch vision model <a model with image input>
 [p]watch images #一般討論 on
 ```
 
@@ -200,9 +201,13 @@ exists, so it needs no rule of its own, and it is shown in the report: the
 extraction is generated text with nothing calibrated behind it, so a moderator
 has to be able to check it rather than trust a verdict built on it.
 
+`[p]watch vision` is separate from `[p]watch set` because the latter takes only
+numbers — every threshold the cog has — and these two are strings.
+
 Attachments are downscaled and re-encoded before they are sent, which discards
 EXIF including GPS tags. Results are cached by attachment id, so the same image
-reposted is paid for once. There is no default model: picking one without
+reposted is paid for once; that cache holds at most 256 entries in memory, never
+touches disk, and is dropped on reload and on a data deletion request. There is no default model: picking one without
 measuring which reads CJK screenshots best would be a guess dressed as a
 default, so the cog sends nothing until a model and an endpoint are set.
 
