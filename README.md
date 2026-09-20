@@ -1,3 +1,5 @@
+**English** | [繁體中文](README.zh-TW.md)
+
 # NyanCogs
 
 Cogs for [Red Discord Bot](https://github.com/Cog-Creators/Red-DiscordBot).
