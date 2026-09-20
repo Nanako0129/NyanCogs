@@ -2,6 +2,12 @@
 
 Cogs for [Red Discord Bot](https://github.com/Cog-Creators/Red-DiscordBot).
 
+Design notes live in [`docs/`](docs/): why MessageWatch is shaped the way it is
+([架構決策](docs/messagewatch-design.md)) and how its judgements are built on
+TypeSafe Jev, with the numbers each threshold came from
+([Jev 導入紀錄](docs/jev-integration.md)). Both are written in Traditional
+Chinese.
+
 ## ChannelSummary
 
 ChannelSummary creates attributed Discord channel summaries through an OpenAI-
@@ -124,7 +130,12 @@ statement is in
 MessageWatch reports likely scam messages and hostile exchanges to a moderator
 channel. It judges short rolling windows of recent messages with
 [TypeSafe Jev](https://docs.typesafe.ai/), a model that returns calibrated
-probabilities rather than text. It never deletes, edits, reacts to, or punishes
+probabilities rather than text. Its design rationale is in
+[`docs/messagewatch-design.md`](docs/messagewatch-design.md), and the question
+design and measurements behind every threshold are in
+[`docs/jev-integration.md`](docs/jev-integration.md).
+
+It never deletes, edits, reacts to, or punishes
 anything on its own. A report can carry buttons, and only a moderator holding
 the matching Discord permission can press one: marking a report right or wrong
 records a count, while deleting a message, timing a member out or adding a role
