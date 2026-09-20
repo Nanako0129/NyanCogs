@@ -244,10 +244,11 @@ class TestReport(unittest.TestCase):
 class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
     def cog(self) -> MessageWatch:
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog.bot = MagicMock()
         return cog
 
-    async def request_with(self, status: int, body: bytes, text: str = ""):
+    async def request_with(self, status: int, body: bytes, text: str = "", cog: MessageWatch | None = None):
         response = MagicMock()
         response.status = status
         response.content.read = AsyncMock(return_value=body)
@@ -263,7 +264,7 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
         if items:
             items[0]["text"] = text
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            return await self.cog().judge(items, "c", "k")
+            return await (cog or self.cog()).judge(items, "c", "k")
 
     async def test_a_good_answer_is_returned(self) -> None:
         body = json.dumps({"answers": {"any_scam": {"noul": 0.9}}}).encode()
@@ -310,10 +311,44 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
                 await self.cog().judge([], "c", "k")
             )
 
+    async def test_judge_surfaces_input_tokens_without_widening_the_none_contract(self) -> None:
+        # judge() used to throw usage.input_tokens away entirely. A caller
+        # needs it to accumulate spend, but every failure path must still
+        # return None -- the token count travels on `self`, not in the
+        # return value, so it cannot change that contract.
+        cog = self.cog()
+        body = json.dumps(
+            {"answers": {"any_scam": {"noul": 0.9}}, "usage": {"input_tokens": 512}}
+        ).encode()
+        answers = await self.request_with(200, body, cog=cog)
+        self.assertEqual(answers, {"any_scam": {"noul": 0.9}})
+        self.assertEqual(cog._last_input_tokens, 512)
+
+        # A later failure on the same cog must not leave the previous call's
+        # count readable -- a caller reading it after a None would silently
+        # attribute someone else's tokens to a judgement that never happened.
+        self.assertIsNone(await self.request_with(500, b"{}", cog=cog))
+        self.assertIsNone(cog._last_input_tokens)
+
+    async def test_an_untrusted_token_count_is_bounded_like_every_other_provider_field(self) -> None:
+        for value in (True, False, -5, "512", None, float("nan"), 10**400):
+            with self.subTest(value=value):
+                self.assertIsNone(module._bounded_token_count(value))
+        self.assertEqual(module._bounded_token_count(512), 512)
+        self.assertEqual(module._bounded_token_count(0), 0)
+
+        cog = self.cog()
+        body = json.dumps(
+            {"answers": {"any_scam": {"noul": 0.9}}, "usage": {"input_tokens": "not a number"}}
+        ).encode()
+        await self.request_with(200, body, cog=cog)
+        self.assertIsNone(cog._last_input_tokens)
+
 
 class TestGating(unittest.IsolatedAsyncioTestCase):
     def cog(self, *, still_watched=None, **overrides):
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog.bot = MagicMock()
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "watched_channels": [5], **overrides}
@@ -418,6 +453,7 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
 class TestFlush(unittest.IsolatedAsyncioTestCase):
     def cog(self, *, answers, rules=None, route=0, **overrides):
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "report_channel": 77, "watched_channels": [5], "window_size": 3,
                     **overrides}
@@ -906,6 +942,7 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def cog(rules):
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         scope = MagicMock()
         scope.rules = MagicMock(return_value=ValueContext(rules))
         cog.config = MagicMock()
@@ -939,6 +976,7 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
             with self.subTest(group=group.name):
                 self.assertTrue(group.invoke_without_command)
                 cog = object.__new__(MessageWatch)
+                cog._reset_state()
                 ctx = SimpleNamespace(
                     guild=MagicMock(), send=AsyncMock(),
                     send_help=AsyncMock(), invoked_subcommand=None,
@@ -960,6 +998,7 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
         channel_scope.report_channel = AsyncMock(return_value=99)
 
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog.config = MagicMock()
         cog.config.guild.return_value = guild_scope
         cog.config.channel.return_value = channel_scope
@@ -997,6 +1036,7 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
             for raw in ("nan", "inf", "-inf", "NaN"):
                 with self.subTest(key=key, raw=raw):
                     cog = object.__new__(MessageWatch)
+                    cog._reset_state()
                     scope = MagicMock()
                     scope.set_raw = AsyncMock()
                     cog.config = MagicMock()
@@ -1008,6 +1048,7 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
 
         # And a value inside the range still stores.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         scope = MagicMock()
         scope.set_raw = AsyncMock()
         cog.config = MagicMock()
@@ -1103,6 +1144,7 @@ class TestActionPermissions(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def cog():
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog.bot = MagicMock()
         cog.config = MagicMock()
         return cog
@@ -1164,6 +1206,7 @@ class TestModlogAndRole(unittest.IsolatedAsyncioTestCase):
         # each one is recorded. Measured: Red raises
         # "<name> is not a valid action type."
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         # cog_load also starts the sweep now, so the instance has to be
         # loadable and the loop has to be stopped. Cancelling alone was not
         # enough: without a `bot`, `_before_sweep` raises before the cleanup
@@ -1186,6 +1229,7 @@ class TestModlogAndRole(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_already_registered_case_type_is_not_fatal(self) -> None:
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog.bot = MagicMock()
         cog.bot.wait_until_red_ready = AsyncMock()
         cog._pending = pending()
@@ -1199,6 +1243,7 @@ class TestModlogAndRole(unittest.IsolatedAsyncioTestCase):
         # can be routed elsewhere entirely. Reading the interaction's channel
         # found no role in any configuration.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog.bot = MagicMock()
         scopes = {}
 
@@ -1243,11 +1288,16 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
 
     def cog(self, *, idle=600):
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog.bot = MagicMock()
         scope = MagicMock()
         scope.idle_seconds = AsyncMock(return_value=idle)
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
+        # The sweep also flushes usage and refreshes dashboards now, so a
+        # fixture that drives it needs those to resolve. They were invisible
+        # here while the code paths guarded themselves with hasattr.
+        cog.config.all_guilds = AsyncMock(return_value={})
         cog._pending = pending()
         cog._locks = module.defaultdict(module.asyncio.Lock)
         cog.flush = AsyncMock()
@@ -1335,6 +1385,7 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         # under it. A message arriving in that gap would otherwise have the
         # partial path eat a live conversation whole, without overlap.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._locks = module.defaultdict(module.asyncio.Lock)
         cog._last_report = {}
@@ -1378,6 +1429,7 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         # arrival time the sweep measures and the message id the buttons use,
         # and nothing in either feature's own tests would notice one missing.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._locks = module.defaultdict(module.asyncio.Lock)
         cog._last_report = {}
@@ -1426,6 +1478,7 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         # conversation to, and leaving half behind would have the next sweep
         # judge the same tail again.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._pending[5].extend(window(1, 2, 3))
         taken = cog._take_window(5, 8, module.MIN_PARTIAL_WINDOW)
@@ -1434,6 +1487,7 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
 
     def test_a_full_window_still_overlaps(self) -> None:
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._pending[5].extend(window(1, 2, 3, 4))
         taken = cog._take_window(5, 4, module.MIN_PARTIAL_WINDOW)
@@ -1444,6 +1498,7 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         # Hostility is a property of an exchange, so a lone message cannot
         # carry it; it waits for the next one instead.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._pending[5].extend(window(1))
         self.assertIsNone(cog._take_window(5, 8, module.MIN_PARTIAL_WINDOW))
@@ -1519,6 +1574,7 @@ class TestSlashAndSettings(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_bare_or_mistyped_set_shows_the_table(self) -> None:
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         settings = dict(DEFAULT_GUILD)
         scope = MagicMock()
         scope.all = AsyncMock(return_value=settings)
@@ -1547,6 +1603,7 @@ class TestSlashAndSettings(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_key_with_no_value_explains_that_one_setting(self) -> None:
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         scope = MagicMock()
         scope.get_raw = AsyncMock(return_value=0.9)
         cog.config = MagicMock()
@@ -1565,6 +1622,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         # The guild that needs this surface most is the one watching enough
         # channels to overflow the field, which Discord rejects outright.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._last_judged = {}
         cog._last_error = {item: (1_700_000_000.0, "report_forbidden") for item in range(80)}
@@ -1587,6 +1645,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         # "監看中" while nothing is judged is the silent no-op this cog exists
         # to avoid producing.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._last_judged = {}
         cog._last_error = {}
@@ -1608,6 +1667,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         # Every key `[p]watch set` accepts has to be readable back, or a
         # moderator cannot tell what the cog is actually using.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._last_judged = {}
         cog._last_error = {}
@@ -1633,6 +1693,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         # to the constant rather than to a sentence, so the claim cannot
         # outlive the behaviour it describes.
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._last_judged = {}
         cog._last_error = {}
@@ -1662,6 +1723,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
 
     async def test_watch_show_reports_the_last_problem_per_channel(self) -> None:
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog._pending = pending()
         cog._pending[5].extend(window(1, 2))
         cog._last_judged = {5: 1_700_000_000.0}
@@ -1689,6 +1751,7 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
 
     def cog(self, **overrides):
         cog = object.__new__(MessageWatch)
+        cog._reset_state()
         cog.bot = MagicMock()
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "watched_channels": [5], "report_channel": 77,
@@ -1757,6 +1820,245 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
         await module.asyncio.gather(*(cog.on_message(message) for message in messages))
         self.assertEqual(peak, 1)
         self.assertGreaterEqual(cog.judge.await_count, 1)
+
+
+class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
+    """The provider bills per input token and `judge()` used to throw the
+    count away entirely. These pin that flush() only ever accumulates in
+    process memory, and `_flush_usage` -- run from the sweep, not from every
+    judged window -- is the one place that turns it into a Config write."""
+
+    QUIET = {"any_scam": {"noul": 0.02}, "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}
+    SCAM = {"any_scam": {"noul": 0.97}, "scam_index": {"choice": "1"},
+            "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}
+
+    def cog(self):
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
+                    "report_channel": 77, "watched_channels": [5], "window_size": 3,
+                    "cooldown_seconds": 0}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        scope.watched_channels = AsyncMock(return_value=[5])
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        channel_scope = MagicMock()
+        channel_scope.all = AsyncMock(return_value=dict(module.DEFAULT_CHANNEL))
+        cog.config.channel.return_value = channel_scope
+        cog.get_api_key = AsyncMock(return_value="k")
+        cog._pending = pending()
+        cog._last_report = {}
+        cog._locks = module.defaultdict(module.asyncio.Lock)
+        cog._last_judged = {}
+        cog._last_error = {}
+        cog._usage_delta = module.defaultdict(
+            lambda: {"messages_queued": 0, "windows_judged": 0, "reports_sent": 0, "input_tokens": 0}
+        )
+        return cog, scope
+
+    @staticmethod
+    def channel():
+        report = MagicMock(spec=discord.TextChannel)
+        report.send = AsyncMock()
+        guild = MagicMock()
+        guild.id = 1
+        guild.get_channel.return_value = report
+        return SimpleNamespace(id=5, guild=guild, name="c", mention="<#5>"), report
+
+    async def test_token_counts_accumulate_across_judgements_and_survive_a_flush(self) -> None:
+        cog, scope = self.cog()
+        channel, report = self.channel()
+
+        # `judge` is mocked in every flush test, including this one, so the
+        # attribute it normally sets on success has to be set here too.
+        async def first(*args, **kwargs):
+            cog._last_input_tokens = 500
+            return self.QUIET
+        cog.judge = AsyncMock(side_effect=first)
+        cog._pending[5].extend(window(1, 2, 3))
+        await cog.flush(channel)
+
+        async def second(*args, **kwargs):
+            cog._last_input_tokens = 300
+            return self.SCAM
+        cog.judge = AsyncMock(side_effect=second)
+        cog._pending[5].extend(window(4, 5, 6))
+        await cog.flush(channel)
+
+        self.assertEqual(cog._usage_delta[1]["windows_judged"], 2)
+        self.assertEqual(cog._usage_delta[1]["input_tokens"], 800)
+        # The report from the second window is the only one of the two.
+        self.assertEqual(cog._usage_delta[1]["reports_sent"], 1)
+        report.send.assert_awaited_once()
+
+        # Flushing to Config adds the delta once and zeroes it, so the next
+        # sweep tick does not double-count what this one already wrote.
+        stored = dict(DEFAULT_GUILD["usage"])
+        usage_ctx = ValueContext(stored)
+        scope.usage = MagicMock(return_value=usage_ctx)
+        cog.bot = MagicMock()
+        cog.bot.get_guild.return_value = channel.guild
+        await cog._flush_usage()
+        self.assertEqual(stored["windows_judged"], 2)
+        self.assertEqual(stored["input_tokens"], 800)
+        self.assertEqual(stored["reports_sent"], 1)
+        self.assertGreater(stored["started_at"], 0)
+        self.assertEqual(
+            cog._usage_delta[1],
+            {"messages_queued": 0, "windows_judged": 0, "reports_sent": 0, "input_tokens": 0},
+        )
+
+        # A third judgement after the flush starts counting fresh from zero,
+        # not from the total the flush already moved into Config.
+        async def third(*args, **kwargs):
+            cog._last_input_tokens = 250
+            return self.QUIET
+        cog.judge = AsyncMock(side_effect=third)
+        cog._pending[5].extend(window(7, 8, 9))
+        await cog.flush(channel)
+        self.assertEqual(cog._usage_delta[1]["input_tokens"], 250)
+
+    async def test_nothing_is_written_to_config_per_judgement(self) -> None:
+        # The write belongs to the sweep (`_flush_usage`), not to flush() --
+        # a Config write per judged window is a disk write every few
+        # messages. scope.usage is never touched here at all.
+        cog, scope = self.cog()
+        channel, _ = self.channel()
+
+        async def fake_judge(*args, **kwargs):
+            cog._last_input_tokens = 42
+            return self.QUIET
+        cog.judge = AsyncMock(side_effect=fake_judge)
+
+        cog._pending[5].extend(window(1, 2, 3))
+        await cog.flush(channel)
+        scope.usage.assert_not_called()
+        self.assertEqual(cog._usage_delta[1]["windows_judged"], 1)
+        self.assertEqual(cog._usage_delta[1]["input_tokens"], 42)
+
+
+class TestDashboard(unittest.IsolatedAsyncioTestCase):
+    """`[p]watch dashboard` posts a live embed the sweep keeps current. These
+    pin the two failure modes a message the sweep edits forever invites:
+    editing nothing when it was deleted (an exception, from `on_message`'s
+    own precedent of never breaking on a Discord failure), and retrying a
+    channel that is never coming back once a minute forever."""
+
+    def cog(self, *, dashboard_channel=9, dashboard_message=0, last_error=None):
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog._pending = pending()
+        cog._last_judged = {}
+        cog._last_error = last_error or {}
+        cog._dashboard_error = {}
+        cog._dashboard_last_render = {}
+        settings = {
+            **DEFAULT_GUILD, "watched_channels": [5],
+            "dashboard_channel": dashboard_channel, "dashboard_message": dashboard_message,
+        }
+        cog.config = MagicMock()
+        cog.config.all_guilds = AsyncMock(return_value={1: settings})
+        guild_scope = MagicMock()
+        guild_scope.all = AsyncMock(return_value=settings)
+        guild_scope.dashboard_message.set = AsyncMock()
+        cog.config.guild.return_value = guild_scope
+        cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
+        cog.bot = MagicMock()
+        guild = MagicMock()
+        guild.id = 1
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        guild.get_channel.return_value = channel
+        cog.bot.get_guild.return_value = guild
+        return cog, guild, channel, guild_scope
+
+    async def test_a_fresh_dashboard_message_is_created_when_none_exists(self) -> None:
+        cog, guild, channel, guild_scope = self.cog(dashboard_message=0)
+        await cog._update_dashboards()
+        channel.send.assert_awaited_once()
+        guild_scope.dashboard_message.set.assert_awaited_once()
+
+    async def test_the_dashboard_message_is_edited_rather_than_reposted_when_it_already_exists(
+        self,
+    ) -> None:
+        cog, guild, channel, guild_scope = self.cog(dashboard_message=555)
+        message = MagicMock()
+        message.edit = AsyncMock()
+        channel.fetch_message = AsyncMock(return_value=message)
+        await cog._update_dashboards()
+        message.edit.assert_awaited_once()
+        channel.send.assert_not_awaited()
+
+        # The other half, and the half that was missing: an unchanged
+        # dashboard is not edited again. Asserting only that an edit happened
+        # passes just as well when the render signature is ignored entirely
+        # and every tick rewrites the message.
+        await cog._update_dashboards()
+        message.edit.assert_awaited_once()
+
+    async def test_a_deleted_dashboard_message_results_in_a_new_one_rather_than_an_exception(
+        self,
+    ) -> None:
+        cog, guild, channel, guild_scope = self.cog(dashboard_message=555)
+        channel.fetch_message = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
+        await cog._update_dashboards()
+        channel.send.assert_awaited_once()
+        guild_scope.dashboard_message.set.assert_awaited_once()
+
+    async def test_a_missing_channel_is_recorded_and_stops_being_retried(self) -> None:
+        cog, guild, channel, guild_scope = self.cog(dashboard_channel=9)
+        guild.get_channel.return_value = None
+        await cog._update_dashboards()
+        self.assertIn(1, cog._dashboard_error)
+        self.assertEqual(cog._dashboard_error[1][1], "dashboard_channel_missing")
+
+        # A permission problem or a missing channel does not fix itself in a
+        # minute -- the next tick must not even try to resolve it again.
+        guild.get_channel.reset_mock()
+        await cog._update_dashboards()
+        guild.get_channel.assert_not_called()
+
+    async def test_a_forbidden_dashboard_channel_is_recorded_and_stops_being_retried(self) -> None:
+        cog, guild, channel, guild_scope = self.cog(dashboard_message=0)
+        channel.send = AsyncMock(side_effect=discord.Forbidden(MagicMock(), "no"))
+        await cog._update_dashboards()
+        self.assertEqual(cog._dashboard_error[1][1], "dashboard_forbidden")
+        channel.send.reset_mock()
+        await cog._update_dashboards()
+        channel.send.assert_not_called()
+
+    async def test_the_estimate_is_labelled_an_estimate_and_the_marks_line_says_precision_not_recall(
+        self,
+    ) -> None:
+        cog, guild, _, _ = self.cog()
+        embed = await cog.dashboard_embed(guild)
+        rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
+        # The word appears in several places, so finding it proves nothing
+        # about the caveat. What must survive is the sentence saying the price
+        # goes stale silently when the vendor changes it.
+        footer = embed.footer.text or ""
+        self.assertIn("估計值", footer)
+        self.assertIn("不會自動更新", footer)
+        self.assertIn("精確率", rendered)
+        self.assertIn("不是召回率", rendered)
+        # The key is bot-global, so the figure shown is this guild's share of
+        # a shared bill, not an independent one -- otherwise a moderator would
+        # read it as this guild's whole cost.
+        self.assertIn("整個機器人共用", rendered)
+
+    async def test_the_dashboard_colour_turns_orange_when_a_watched_channel_has_a_problem(
+        self,
+    ) -> None:
+        # A dashboard's whole point is being readable at a glance, so the
+        # colour alone has to say whether something needs attention.
+        sick, guild, _, _ = self.cog(last_error={5: (1_700_000_000.0, "no_api_key")})
+        sick_embed = await sick.dashboard_embed(guild)
+        self.assertEqual(sick_embed.colour, discord.Colour.orange())
+
+        healthy, healthy_guild, _, _ = self.cog(last_error={})
+        healthy_embed = await healthy.dashboard_embed(healthy_guild)
+        self.assertEqual(healthy_embed.colour, discord.Colour.blurple())
 
 
 class TestDataStatement(unittest.TestCase):

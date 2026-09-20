@@ -170,6 +170,14 @@ DEFAULT_RULE_THRESHOLD = 0.85
 # belongs in the report instead. Whether a violation happened at all is what
 # DEFAULT_RULE_THRESHOLD decides, on a separate calibrated probability.
 DEFAULT_RULE_CONFIDENCE = 0.70
+
+# Measured 2026-09-20 against jev-1.13.0 through the production key: USD
+# 0.042 per million input tokens, output free. A vendor price change makes
+# this silently wrong -- there is no callback that tells this cog the price
+# moved -- which is why every render of the estimate it produces says
+# "estimate" rather than stating a cost as fact.
+DEFAULT_TOKEN_PRICE_PER_MILLION = 0.042
+
 DEFAULT_GUILD = {
     "report_channel": 0,
     "watched_channels": [],
@@ -187,6 +195,23 @@ DEFAULT_GUILD = {
     # precision data this cog can ever accumulate.
     "marks": {},
     "idle_seconds": DEFAULT_IDLE_SECONDS,
+    # Aggregate counters only -- integers, never message text or an author --
+    # so the data statement's "does not store message content" stays true for
+    # this too. Accumulated in memory and flushed here periodically, not on
+    # every judgement; see `_flush_usage`. started_at is 0 until the first
+    # flush ever writes one, and is never reset after that.
+    "usage": {
+        "messages_queued": 0,
+        "windows_judged": 0,
+        "reports_sent": 0,
+        "input_tokens": 0,
+        "started_at": 0,
+    },
+    "price_per_million_input_tokens": DEFAULT_TOKEN_PRICE_PER_MILLION,
+    # 0 means no dashboard configured. dashboard_message is the id the sweep
+    # edits; 0 means none has been posted yet, or the last one was deleted.
+    "dashboard_channel": 0,
+    "dashboard_message": 0,
 }
 
 class Setting(NamedTuple):
@@ -237,6 +262,11 @@ SETTING_RULES: dict[str, Setting] = {
         int, 0, 86_400, "閒置判斷秒數",
         "安靜這麼久之後，就算湊不滿一個視窗也判斷（至少要 2 則）。設 0 會關掉它，"
         "湊不滿視窗的安靜頻道將永遠不會被判斷。",
+    ),
+    "price_per_million_input_tokens": Setting(
+        float, 0.0, 1000.0, "input token 單價（每百萬美元）",
+        "用來估計花費，不是即時報價。實測 jev-1.13.0 是 0.042，但供應商調整價格後"
+        "這裡不會自動跟著變，儀表板顯示的花費只是估計值。",
     ),
 }
 
@@ -359,6 +389,25 @@ def _bounded_index(value: Any, size: int) -> int | None:
         # controlled, and neither may escape into the message handler.
         return None
     return index if 0 <= index < size else None
+
+
+def _bounded_token_count(value: Any) -> int | None:
+    """A model-reported token count, or None when it is not a sane one.
+
+    Same guard shape as `_bounded_probability`, for the same reason: this
+    number came from the provider and feeds straight into a spend estimate a
+    moderator reads, so anything that is not a non-negative real number is
+    discarded rather than coerced.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    if number != number or number < 0:  # number != number is the NaN check
+        return None
+    return int(number)
 
 
 def _message_options(items: list[Mapping[str, Any]], none_label: str) -> dict[str, str]:
@@ -636,6 +685,21 @@ class MessageWatch(commands.Cog):
         # be absurd in a help channel, and it is the channel's own posted rules
         # that members agreed to.
         self.config.register_channel(**DEFAULT_CHANNEL)
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        """Every piece of in-memory state, defined once.
+
+        `__init__` calls it and the tests call it on a bare instance, so a
+        new piece of state cannot be added to one and forgotten in the
+        other. It used to be inline here, and the code paths that read it
+        guarded themselves with hasattr to survive test fixtures built by
+        `object.__new__` -- which meant renaming an attribute turned the
+        whole of usage accounting into a silent no-op with every test
+        still passing. Production code should not be defensive about a
+        shape only a test can produce.
+        """
+
         # Per channel: the pending window, and when that channel last reported.
         # Both are process memory on purpose. A restart losing a half-filled
         # window costs one late report; persisting message text would
@@ -649,6 +713,25 @@ class MessageWatch(commands.Cog):
         # judged, and why nothing happened the last time something did not.
         self._last_judged: dict[int, float] = {}
         self._last_error: dict[int, tuple[float, str]] = {}
+        # The input token count from the most recent `judge()` call, read by
+        # `flush` right after awaiting it. Reset to None at the top of every
+        # call, so a failure never leaves a stale count behind for the caller
+        # to silently attribute to a judgement that did not happen.
+        self._last_input_tokens: int | None = None
+        # Usage deltas since the last Config flush, per guild id. In-memory
+        # only, on purpose: a Config write per judged window would be a disk
+        # write every few messages, so these ride on the 60-second sweep
+        # instead. See `_flush_usage`.
+        self._usage_delta: defaultdict[int, dict[str, int]] = defaultdict(
+            lambda: {"messages_queued": 0, "windows_judged": 0, "reports_sent": 0, "input_tokens": 0}
+        )
+        # Per-guild dashboard state. `_dashboard_error` stops the sweep from
+        # retrying a channel that is gone or forbidden every minute forever;
+        # it is cleared only by `[p]watch dashboard` posting a new one.
+        # `_dashboard_last_render` is the last rendered embed, so the sweep
+        # only edits Discord when the numbers actually changed.
+        self._dashboard_error: dict[int, tuple[float, str]] = {}
+        self._dashboard_last_render: dict[int, dict[str, Any]] = {}
 
     async def cog_load(self) -> None:
         """Register the case types this cog records under, and start the sweep.
@@ -681,8 +764,13 @@ class MessageWatch(commands.Cog):
         own those -- so an unload can still be followed by one report from a
         request that was already out. What it can stop is this loop, which is
         the only work the cog itself starts.
+
+        The usage flush runs one last time here so a restart loses at most the
+        seconds since the last sweep tick, not the whole in-memory tail.
         """
         self._sweep.cancel()
+        # hasattr: some tests build a partial cog that skips __init__.
+        await self._flush_usage()
 
     @tasks.loop(seconds=IDLE_SWEEP_SECONDS)
     async def _sweep(self) -> None:
@@ -691,7 +779,17 @@ class MessageWatch(commands.Cog):
         Without this a channel that never reaches `window_size` is never judged
         at all, which is the silent no-op this cog is most exposed to: a venting
         channel is a post, two replies and then nothing.
+
+        Also where the usage counters and the dashboard message ride: both are
+        cheap here regardless, since this already runs every IDLE_SWEEP_SECONDS
+        whether or not anything is due.
         """
+        # hasattr, not a default set here: several tests build a partial cog
+        # with object.__new__ and call `_sweep` directly without going through
+        # __init__, and this loop already tolerates that everywhere else. A
+        # cog built through __init__ always has both.
+        await self._flush_usage()
+        await self._update_dashboards()
         for channel_id, queue in list(self._pending.items()):
             # A queue that cannot reach MIN_PARTIAL_WINDOW is waiting for
             # another message, not failing. Letting it into `flush` every
@@ -734,6 +832,29 @@ class MessageWatch(commands.Cog):
         """Record why this channel produced nothing, for `[p]watch show`."""
         self._last_error[channel_id] = (time.time(), reason)
 
+    async def _flush_usage(self) -> None:
+        """Add each guild's accumulated deltas into Config, then zero them.
+
+        Called from the sweep, not from `flush`: a Config write per judged
+        window is a disk write every few messages, so this rides on the
+        60-second sweep instead and `cog_unload` calls it once more so a
+        restart loses at most the tail since the last tick.
+        """
+        for guild_id, delta in list(self._usage_delta.items()):
+            if not any(delta.values()):
+                continue
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                # Not cached right now -- leave the delta in place and try
+                # again next tick rather than losing it.
+                continue
+            async with self.config.guild(guild).usage() as usage:
+                for key, amount in delta.items():
+                    usage[key] = int(usage.get(key, 0)) + amount
+                if not usage.get("started_at"):
+                    usage["started_at"] = time.time()
+            self._usage_delta.pop(guild_id, None)
+
     async def get_api_key(self) -> str | None:
         """The TypeSafe key from Red's shared token store, or None if unusable."""
         tokens = await self.bot.get_shared_api_tokens(TOKEN_SERVICE)
@@ -753,7 +874,14 @@ class MessageWatch(commands.Cog):
         Every failure path returns None rather than raising. A moderation aid
         that breaks the message handler is worse than one that misses a window,
         so the caller carries on and the channel keeps working.
+
+        The input token count for this request is left on `self` rather than
+        widening the return type, which would ripple through every existing
+        caller and test that unpacks a plain answers mapping or None. Reset
+        first, so a caller reading it after this returns None sees None rather
+        than a stale count from a previous, unrelated success.
         """
+        self._last_input_tokens = None
         payload = json.dumps(
             {
                 "state": build_state(channel_name, window, purpose, rules),
@@ -807,6 +935,9 @@ class MessageWatch(commands.Cog):
         if not isinstance(answers, Mapping):
             log.warning("messagewatch: provider response carried no answers mapping")
             return None
+        usage = decoded.get("usage") if isinstance(decoded, Mapping) else None
+        if isinstance(usage, Mapping):
+            self._last_input_tokens = _bounded_token_count(usage.get("input_tokens"))
         return answers
 
     @staticmethod
@@ -1128,6 +1259,12 @@ class MessageWatch(commands.Cog):
                 return
             self._last_judged[channel.id] = time.time()
             self._last_error.pop(channel.id, None)
+            # In memory only -- see `_flush_usage` for why this is not a
+            # Config write. hasattr: several tests build a partial cog that
+            # skips __init__.
+            delta = self._usage_delta[guild.id]
+            delta["windows_judged"] += 1
+            delta["input_tokens"] += getattr(self, "_last_input_tokens", None) or 0
 
             index, reasons, rule_index = self.findings(answers, settings, len(window), rules)
             if not reasons:
@@ -1166,6 +1303,7 @@ class MessageWatch(commands.Cog):
             # must not silence the channel for the whole cooldown with nothing
             # sent.
             self._last_report[channel.id] = time.monotonic()
+            self._usage_delta[guild.id]["reports_sent"] += 1
 
     async def _audit(self, interaction: discord.Interaction, line: str) -> None:
         """Append what was done to the report itself, where a moderator reads it."""
@@ -1388,6 +1526,8 @@ class MessageWatch(commands.Cog):
                     "at": time.monotonic(),
                 }
             )
+            # hasattr: several tests build a partial cog that skips __init__.
+            self._usage_delta[guild.id]["messages_queued"] += 1
             full = len(self._pending[channel.id]) >= int(settings["window_size"])
         # Outside the lock: flush takes it again for the queue alone, so the
         # provider request never blocks this channel's ingestion.
@@ -1727,15 +1867,16 @@ class MessageWatch(commands.Cog):
         embed.set_footer(text="門檻的預設值來自 2026-09-20 對 jev-1.13.0 的實測，不是猜的。")
         return embed
 
-    @watch_group.command(name="show")
-    async def watch_show(self, ctx: commands.Context) -> None:
-        """Show the effective settings for this guild."""
-        settings = await self.config.guild(ctx.guild).all()
-        # Not just the id list: without the last judgement time and the last
-        # reason, a channel that has been silently failing for a week looks
-        # exactly like one with nothing to report.
+    async def _channel_status_rows(self, watched_channels: Iterable[int]) -> str:
+        """Per-channel status lines, trimmed to fit one embed field.
+
+        Shared between `[p]watch show` and the dashboard, which is a live
+        sibling of it rather than a second tool: same row shape, same
+        EMBED_FIELD_LIMIT trim, so the two surfaces cannot silently drift
+        apart on what a "channel status" line means.
+        """
         rows = []
-        for item in settings["watched_channels"]:
+        for item in watched_channels:
             parts = [f"<#{item}>", f"待判 `{len(self._pending.get(item, ()))}`"]
             routed = int(await self.config.channel_from_id(item).report_channel())
             if routed:
@@ -1755,7 +1896,16 @@ class MessageWatch(commands.Cog):
             hidden += 1
         if hidden:
             rows.append(f"…另 {hidden} 個頻道未顯示")
-        watched = "\n".join(rows) or "（無）"
+        return "\n".join(rows) or "（無）"
+
+    @watch_group.command(name="show")
+    async def watch_show(self, ctx: commands.Context) -> None:
+        """Show the effective settings for this guild."""
+        settings = await self.config.guild(ctx.guild).all()
+        # Not just the id list: without the last judgement time and the last
+        # reason, a channel that has been silently failing for a week looks
+        # exactly like one with nothing to report.
+        watched = await self._channel_status_rows(settings["watched_channels"])
         report = f"<#{settings['report_channel']}>" if settings["report_channel"] else "（未設定）"
         embed = discord.Embed(title="MessageWatch 設定", colour=discord.Colour.blurple())
         accepted = int(settings["disclosure_version"])
@@ -1781,6 +1931,11 @@ class MessageWatch(commands.Cog):
             inline=False,
         )
         embed.add_field(
+            name="花費估計",
+            value=f"每百萬 input token `{settings['price_per_million_input_tokens']}` 美元（估計值，見 `[p]watch dashboard`）",
+            inline=False,
+        )
+        embed.add_field(
             name="視窗",
             value=(
                 f"每 `{settings['window_size']}` 則判一次 · 冷卻 `{settings['cooldown_seconds']}` 秒\n"
@@ -1794,3 +1949,159 @@ class MessageWatch(commands.Cog):
             inline=False,
         )
         await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    async def dashboard_embed(self, guild: discord.Guild) -> discord.Embed:
+        """The live usage dashboard: throughput, spend estimate, per-channel status.
+
+        Deliberately a sibling of `[p]watch show`, not a second tool: the same
+        per-channel row shape and the same `EMBED_FIELD_LIMIT` trim, both from
+        `_channel_status_rows`, so a moderator reading either recognises the
+        other. The colour is set from state -- orange the instant any watched
+        channel carries a recorded problem -- so the dashboard's whole point,
+        being readable at a glance, does not require reading it.
+        """
+        settings = await self.config.guild(guild).all()
+        usage = settings["usage"]
+        watched = list(settings["watched_channels"])
+        messages = int(usage.get("messages_queued", 0))
+        windows = int(usage.get("windows_judged", 0))
+        reports = int(usage.get("reports_sent", 0))
+        tokens = int(usage.get("input_tokens", 0))
+        started = usage.get("started_at") or 0
+        price = float(settings["price_per_million_input_tokens"])
+        spend = tokens / 1_000_000 * price
+        rate = f"{reports / windows:.0%}" if windows else "N/A"
+
+        healthy = not any(item in self._last_error for item in watched)
+        colour = discord.Colour.blurple() if healthy else discord.Colour.orange()
+
+        embed = discord.Embed(title="MessageWatch 儀表板", colour=colour)
+        embed.add_field(
+            name="統計期間",
+            value=f"<t:{int(started)}:R> 至今" if started else "尚未開始累計",
+            inline=False,
+        )
+        embed.add_field(
+            name="用量",
+            value=(
+                f"排入佇列 `{messages}` 則 · 判斷 `{windows}` 次視窗 · 送出報告 `{reports}` 則"
+                f"（報告率 `{rate}`）\n"
+                f"input tokens `{tokens:,}` · 估計花費 `${spend:.4f}` 美元（估計值，見下方註記）"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="監看中的頻道",
+            value=await self._channel_status_rows(watched),
+            inline=False,
+        )
+
+        marks = settings["marks"]
+        names = {"s": "詐騙", "h": "敵意", "t": "火藥味", "r": "違規"}
+        mark_lines = [
+            f"{label} 屬實 `{int((marks.get(key) or {}).get('ok', 0))}` "
+            f"／ 誤判 `{int((marks.get(key) or {}).get('no', 0))}`"
+            for key, label in names.items()
+            if (marks.get(key) or {}).get("ok") or (marks.get(key) or {}).get("no")
+        ]
+        embed.add_field(
+            name="標記統計", value="\n".join(mark_lines) or "（還沒有任何標記）", inline=False
+        )
+
+        embed.set_footer(
+            text=(
+                f"花費是估計值：每百萬 input token ${price} 美元是量到的價格，供應商調價後這裡不會自動更新。"
+                "標記統計量到的是精確率，不是召回率——漏掉而沒有報告的案例不會出現在這裡。"
+                "API key 是整個機器人共用的，這裡的花費是這個伺服器佔全部帳單的一部分，不是獨立帳單。"
+            )
+        )
+        return embed
+
+    async def _update_dashboards(self) -> None:
+        """Edit each guild's dashboard message when its rendered numbers changed.
+
+        Runs from the sweep, so a dashboard is never more than one sweep
+        interval stale. Compared against the last rendered embed rather than
+        against individual counters, so this edits Discord only when something
+        a viewer would actually see has changed.
+        """
+        all_guilds = await self.config.all_guilds()
+        for guild_id, settings in all_guilds.items():
+            channel_id = int(settings.get("dashboard_channel") or 0)
+            if not channel_id:
+                continue
+            if guild_id in self._dashboard_error:
+                # A permission problem or a missing channel does not fix
+                # itself in a minute; wait for `[p]watch dashboard` instead of
+                # retrying every tick.
+                continue
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                continue
+            channel = guild.get_channel(channel_id)
+            if channel is None:
+                self._dashboard_error[guild_id] = (time.time(), "dashboard_channel_missing")
+                continue
+
+            embed = await self.dashboard_embed(guild)
+            signature = embed.to_dict()
+            if self._dashboard_last_render.get(guild_id) == signature:
+                continue
+
+            message_id = int(settings.get("dashboard_message") or 0)
+            message = None
+            if message_id:
+                try:
+                    message = await channel.fetch_message(message_id)
+                except discord.NotFound:
+                    # Deleted -- fall through and post a new one rather than
+                    # raising, exactly like a fresh `[p]watch dashboard`.
+                    message = None
+                except discord.HTTPException as error:
+                    log.warning("messagewatch: dashboard fetch failed (%s)", type(error).__name__)
+                    self._dashboard_error[guild_id] = (time.time(), "dashboard_fetch_failed")
+                    continue
+            try:
+                if message is not None:
+                    await message.edit(embed=embed)
+                else:
+                    message = await channel.send(
+                        embed=embed, allowed_mentions=discord.AllowedMentions.none()
+                    )
+                    await self.config.guild(guild).dashboard_message.set(message.id)
+            except discord.Forbidden:
+                self._dashboard_error[guild_id] = (time.time(), "dashboard_forbidden")
+                continue
+            except discord.HTTPException as error:
+                log.warning("messagewatch: dashboard update failed (%s)", type(error).__name__)
+                self._dashboard_error[guild_id] = (time.time(), "dashboard_update_failed")
+                continue
+            self._dashboard_last_render[guild_id] = signature
+
+    @watch_group.command(name="dashboard")
+    async def watch_dashboard(
+        self, ctx: commands.Context, channel: discord.TextChannel | None = None
+    ) -> None:
+        """Post a live usage dashboard in one channel, or stop with no channel."""
+        if channel is None:
+            await self.config.guild(ctx.guild).dashboard_channel.set(0)
+            await self.config.guild(ctx.guild).dashboard_message.set(0)
+            self._dashboard_error.pop(ctx.guild.id, None)
+            self._dashboard_last_render.pop(ctx.guild.id, None)
+            await ctx.send("已取消儀表板。")
+            return
+        embed = await self.dashboard_embed(ctx.guild)
+        try:
+            message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.Forbidden:
+            await ctx.send(f"機器人沒有在 {channel.mention} 發言的權限。")
+            return
+        except discord.HTTPException as error:
+            log.warning("messagewatch: dashboard post failed (%s)", type(error).__name__)
+            await ctx.send("儀表板訊息發送失敗。")
+            return
+        await self.config.guild(ctx.guild).dashboard_channel.set(channel.id)
+        await self.config.guild(ctx.guild).dashboard_message.set(message.id)
+        self._dashboard_error.pop(ctx.guild.id, None)
+        self._dashboard_last_render[ctx.guild.id] = embed.to_dict()
+        await ctx.send(f"已在 {channel.mention} 建立儀表板，之後每分鐘更新一次。")
