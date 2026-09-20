@@ -864,6 +864,22 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
         await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 1)
         self.assertEqual(ctx.send.await_args.kwargs["allowed_mentions"].everyone, False)
 
+    async def test_a_bare_group_answers_instead_of_doing_nothing(self) -> None:
+        # Without invoke_without_command the callback never runs, so the help
+        # these groups try to send is unreachable and `[p]watch` answers
+        # nothing at all. The flag is the load-bearing part; the send_help call
+        # alone is not enough.
+        for group in (MessageWatch.watch_group, MessageWatch.watch_rule):
+            with self.subTest(group=group.name):
+                self.assertTrue(group.invoke_without_command)
+                cog = object.__new__(MessageWatch)
+                ctx = SimpleNamespace(
+                    guild=MagicMock(), send=AsyncMock(),
+                    send_help=AsyncMock(), invoked_subcommand=None,
+                )
+                await group.callback(cog, ctx)
+                ctx.send_help.assert_awaited_once()
+
     async def test_a_route_alone_is_enough_to_enable_a_channel(self) -> None:
         # The guild default and a per-channel route are two ways to have a
         # report channel, and requiring the default anyway would force a

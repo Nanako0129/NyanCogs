@@ -838,11 +838,17 @@ class MessageWatch(commands.Cog):
         if full:
             await self.flush(channel)
 
-    @commands.group(name="watch")
+    # invoke_without_command, or the callback never runs for a bare `[p]watch`
+    # and the help it sends is unreachable. A command group that answers
+    # nothing is the same silent no-op this cog exists to avoid, just at the
+    # command surface instead of the judging one.
+    @commands.group(name="watch", invoke_without_command=True)
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def watch_group(self, ctx: commands.Context) -> None:
         """Configure scam and hostility reporting."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
 
     @watch_group.command(name="key")
     @checks.is_owner()
@@ -938,7 +944,7 @@ class MessageWatch(commands.Cog):
                         message = f"停止監看 {channel.mention}，未送出的暫存也已清除。"
         await ctx.send(message)
 
-    @watch_group.group(name="rule")
+    @watch_group.group(name="rule", invoke_without_command=True)
     async def watch_rule(self, ctx: commands.Context) -> None:
         """Manage the rules a watched channel is judged against."""
         if ctx.invoked_subcommand is None:
