@@ -55,16 +55,16 @@ there is no runtime fallback between them.
 | `native` | The provider's own hosted search |
 | `firecrawl` | The application-controlled Firecrawl cloud tools |
 
-| Limit | Value |
-|---|---|
-| Firecrawl calls per summary | 5 |
-| Search results exposed per summary | 5, regardless of higher guild settings |
-| Fetched markdown | Capped by `web_fetch_max_chars` |
+Each summary can attempt at most 5 Firecrawl calls and expose at most five
+search results regardless of higher guild settings; fetched markdown is capped
+by `web_fetch_max_chars`.
 
-> ⚠️ **HTTP providers put keys on the wire in clear.** HTTP is restricted to
-> RFC1918, IPv6 ULA, or loopback destinations. API keys and selected Discord data
-> traverse the LAN unencrypted; use HTTP only on a trusted LAN, and prefer HTTPS
-> whenever it is available.
+> ⚠️ **An HTTP provider puts keys on the wire in clear.**
+
+HTTP is restricted to RFC1918, IPv6 ULA, or loopback destinations. With an HTTP
+provider, API keys, selected Discord data, and inlined image bytes traverse the
+LAN unencrypted. Use HTTP only on a trusted LAN. Prefer HTTPS whenever it is
+available.
 
 ### Configuration
 
@@ -135,7 +135,7 @@ Model annotations and manually authored fetch URLs grant no authority.
 
 When images are enabled, the bot downloads each attachment, downscales it so its
 long edge is at most `image_max_edge` pixels (3840 by default) and re-encodes it,
-then sends those bytes inline. No Discord CDN URL leaves this bot, and EXIF
+then sends those bytes inline, so no Discord CDN URL leaves this bot and EXIF
 metadata such as camera GPS is discarded before sending.
 
 | Limit | Value |
@@ -160,11 +160,12 @@ Provider retention and training are unverified. Firecrawl retention and training
 are unverified, and its credits may incur cost. After a guild manager consents,
 any channel reader may trigger these exports.
 
-> ⚠️ **The owner Firecrawl hourly quota is one process-wide shared pool.** One
-> enabled guild can exhaust Firecrawl availability and spend allowance for all
-> guilds; the guild request quota is not an owner Firecrawl budget control. A
-> process restart clears the in-memory pool, and multiple processes multiply the
-> cap.
+> ⚠️ **Firecrawl's hourly quota is shared across every guild.**
+
+The owner Firecrawl hourly quota is one process-wide shared pool; one enabled
+guild can exhaust Firecrawl availability and spend allowance for all guilds; the
+guild request quota is not an owner Firecrawl budget control. A process restart
+clears the in-memory pool, and multiple processes multiply the cap.
 
 Firecrawl cloud is trusted to control target DNS, redirects, and SSRF; DNS
 rebinding and split-horizon behavior remain residual vendor risk.
@@ -205,11 +206,12 @@ Every channel is opted in separately and sends nothing until it is.
 > `/summary`. A venting or confession channel is where this costs the most: what
 > people write there is what they expect will not be repeated.
 
-Each request also carries the channel's name and, where rules are configured for
+Each request also carries the name of the channel and, where rules are configured for
 that channel, those rules and its purpose note. Discord user IDs, display names
 and avatars are never sent; authors become labels such as `u1`, generated per
-request and never stored. Attachments, embeds and links are not fetched or
-resolved.
+request and never stored. Embeds and links are never fetched or resolved, and
+image attachments are fetched only in a channel where a manager turned image
+reading on.
 
 `[p]watch disable` drops everything queued for a channel immediately and stops it
 being read again. It does not cancel a report already in flight: it takes the
@@ -253,6 +255,53 @@ A report quotes the channel it came from, so a channel can send its findings
 somewhere other than the default with `[p]watch route`. A venting channel's
 reports carry what someone wrote there, and fewer people should see those than
 see a scam alert. Without a route, reports go to the guild-wide channel.
+
+### Image reading
+
+A channel can have its image attachments read, off by default:
+
+```text
+[p]set api messagewatch_vision api_key <key>     # bot owner
+[p]watch vision api_base https://openrouter.ai   # bot owner
+[p]watch vision model <a model with image input> # bot owner
+[p]watch images #一般討論 on                      # guild manager
+```
+
+Only the **characters in the image** are asked for, verbatim — not a description
+of it. A scam here is a screenshot with text in it, the text is the evidence, and
+a description is open-ended generation whose errors nobody can check against the
+picture. The transcription goes into the same scam judgement that already exists,
+so it needs no rule of its own, and it is shown in the report because the
+extraction is generated text with nothing calibrated behind it.
+
+> ⚠️ **The transcription travels twice.** It is shown in the report *and* sent on
+> to TypeSafe with the message text, so words that existed only inside an image
+> reach both providers.
+
+| Property | Value |
+|---|---|
+| What is asked of the vision model | Verbatim transcription of the characters, nothing else |
+| Before sending | Downscaled and re-encoded, which discards EXIF including GPS tags |
+| Cache | By attachment id, at most 256 entries in memory; never on disk; dropped on reload and on a data deletion request |
+| Default model | None — see below |
+| Endpoint scheme | `https://` only |
+
+There is no default model. Picking one without measuring which reads CJK
+screenshots best would be a guess dressed as a default, so the cog sends nothing
+until a model and an endpoint are set.
+
+`[p]watch vision` is separate from `[p]watch set` because the latter takes only
+numbers — every threshold the cog has — and these two are strings. Both are
+stored globally and only the bot owner can write them: the API key they spend is
+bot-wide and the owner's, so an administrator of any guild the bot has joined who
+could set the endpoint would be able to send that bearer token, and every image,
+to a host of their own. Reading them stays open to the managers who have to
+configure a channel around them.
+
+> ⚠️ **This is the heaviest thing the cog sends, and the only thing it sends
+> anywhere other than TypeSafe.** An image can carry a face, a document, or a
+> screenshot of someone else's private conversation. It is decided one channel at
+> a time and the disclosure says so.
 
 ### Per-channel rules
 
