@@ -91,6 +91,11 @@ RULE_REASON_CHARS = 60
 DEFAULT_CHANNEL = {
     "rules": [],
     "purpose": "",
+    # 0 means "use the guild's report channel". A watched channel can send its
+    # reports somewhere else, because a report quotes the channel it came from:
+    # a venting channel's findings carry what someone wrote there, and fewer
+    # people should see those than see a scam alert.
+    "report_channel": 0,
 }
 
 # Measured 2026-09-20 against jev-1.13.0 with a real channel ruleset (the one
@@ -719,7 +724,9 @@ class MessageWatch(commands.Cog):
             if channel.id not in set(settings["watched_channels"]):
                 self._pending.pop(channel.id, None)
                 return
-            report_id = int(settings["report_channel"])
+            channel_settings = await self.config.channel(channel).all()
+            rules = list(channel_settings["rules"])
+            report_id = int(channel_settings["report_channel"]) or int(settings["report_channel"])
             if not report_id:
                 self._note(channel.id, "no_report_channel")
                 return
@@ -736,8 +743,6 @@ class MessageWatch(commands.Cog):
             window = self._take_window(channel.id, int(settings["window_size"]))
             if window is None:
                 return
-            channel_settings = await self.config.channel(channel).all()
-            rules = list(channel_settings["rules"])
 
             cooldown = int(settings["cooldown_seconds"])
             last = self._last_report.get(channel.id)
@@ -846,6 +851,25 @@ class MessageWatch(commands.Cog):
         await self.config.guild(ctx.guild).report_channel.set(channel.id)
         await ctx.send(f"報告會送到 {channel.mention}。")
 
+    @watch_group.command(name="route")
+    async def watch_route(
+        self,
+        ctx: commands.Context,
+        channel: discord.TextChannel,
+        destination: discord.TextChannel | None = None,
+    ) -> None:
+        """Send one watched channel's reports somewhere other than the default.
+
+        `[p]watch route #樹洞 #樹洞管理` routes them; `[p]watch route #樹洞`
+        with no destination clears the route and falls back to `[p]watch report`.
+        """
+        if destination is None:
+            await self.config.channel(channel).report_channel.set(0)
+            await ctx.send(f"{channel.mention} 的報告改回送到伺服器預設的報告頻道。")
+            return
+        await self.config.channel(channel).report_channel.set(destination.id)
+        await ctx.send(f"{channel.mention} 的報告會送到 {destination.mention}。")
+
     @watch_group.command(name="disclosure")
     async def watch_disclosure(self, ctx: commands.Context, confirmation: str = "") -> None:
         """Show the data-export disclosure, or accept it with I_ACCEPT."""
@@ -868,8 +892,12 @@ class MessageWatch(commands.Cog):
         if await scope.disclosure_version() != DISCLOSURE_VERSION:
             await ctx.send("請先閱讀並接受 `[p]watch disclosure`。")
             return
-        if not await scope.report_channel():
-            await ctx.send("請先用 `[p]watch report` 指定報告頻道。")
+        routed = await self.config.channel(channel).report_channel()
+        if not routed and not await scope.report_channel():
+            await ctx.send(
+                "請先用 `[p]watch report` 指定伺服器預設的報告頻道，"
+                "或用 `[p]watch route` 單獨指定這個頻道的報告去處。"
+            )
             return
         async with scope.watched_channels() as watched:
             if channel.id in watched:
@@ -1017,6 +1045,9 @@ class MessageWatch(commands.Cog):
         rows = []
         for item in settings["watched_channels"]:
             parts = [f"<#{item}>", f"待判 `{len(self._pending.get(item, ()))}`"]
+            routed = int(await self.config.channel_from_id(item).report_channel())
+            if routed:
+                parts.append(f"→ <#{routed}>")
             judged = self._last_judged.get(item)
             parts.append(f"上次判斷 <t:{int(judged)}:R>" if judged else "尚未判斷過")
             noted = self._last_error.get(item)

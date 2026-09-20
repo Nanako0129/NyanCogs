@@ -395,7 +395,7 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFlush(unittest.IsolatedAsyncioTestCase):
-    def cog(self, *, answers, rules=None, **overrides):
+    def cog(self, *, answers, rules=None, route=0, **overrides):
         cog = object.__new__(MessageWatch)
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "report_channel": 77, "watched_channels": [5], "window_size": 3,
@@ -406,7 +406,8 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         cog.config.guild.return_value = scope
         channel_scope = MagicMock()
         channel_scope.all = AsyncMock(
-            return_value={**module.DEFAULT_CHANNEL, "rules": list(rules or ())}
+            return_value={**module.DEFAULT_CHANNEL, "rules": list(rules or ()),
+                          "report_channel": route or 0}
         )
         cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
@@ -630,6 +631,30 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(5, cog._last_error)
         self.assertIn(5, cog._last_judged)
 
+    async def test_a_routed_channel_reports_somewhere_else(self) -> None:
+        # A report quotes the channel it came from. A venting channel's
+        # findings carry what someone wrote there, and fewer people should see
+        # those than see a scam alert.
+        cog = self.cog(answers=self.SCAM, route=99)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        channel.guild.get_channel.assert_called_with(99)
+        report.send.assert_awaited_once()
+
+    async def test_no_route_falls_back_to_the_guild_channel(self) -> None:
+        cog = self.cog(answers=self.SCAM)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        channel.guild.get_channel.assert_called_with(77)
+        report.send.assert_awaited_once()
+
+    async def test_a_route_is_enough_to_report_without_a_guild_default(self) -> None:
+        cog = self.cog(answers=self.SCAM, route=99, report_channel=0)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        report.send.assert_awaited_once()
+        self.assertNotIn(5, cog._last_error)
+
     async def test_a_partial_window_is_not_judged(self) -> None:
         cog = self.cog(answers=self.SCAM, window_size=8)
         channel, report = self.channel()
@@ -835,6 +860,40 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
         await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 1)
         self.assertEqual(ctx.send.await_args.kwargs["allowed_mentions"].everyone, False)
 
+    async def test_a_route_alone_is_enough_to_enable_a_channel(self) -> None:
+        # The guild default and a per-channel route are two ways to have a
+        # report channel, and requiring the default anyway would force a
+        # moderator to name a destination they do not intend to use.
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+        watched = []
+        guild_scope = MagicMock()
+        guild_scope.disclosure_version = AsyncMock(return_value=DISCLOSURE_VERSION)
+        guild_scope.report_channel = AsyncMock(return_value=0)
+        guild_scope.watched_channels = MagicMock(return_value=ValueContext(watched))
+        channel_scope = MagicMock()
+        channel_scope.report_channel = AsyncMock(return_value=99)
+
+        cog = object.__new__(MessageWatch)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = guild_scope
+        cog.config.channel.return_value = channel_scope
+        cog.get_api_key = AsyncMock(return_value="k")
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+
+        await MessageWatch.watch_enable.callback(cog, ctx, channel)
+        self.assertEqual(watched, [5])
+        self.assertIn("開始監看", ctx.send.await_args_list[0].args[0])
+
+        # And with neither, it says both ways out.
+        channel_scope.report_channel = AsyncMock(return_value=0)
+        watched.clear()
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_enable.callback(cog, ctx, channel)
+        self.assertEqual(watched, [])
+        message = ctx.send.await_args.args[0]
+        self.assertIn("watch report", message)
+        self.assertIn("watch route", message)
+
     async def test_a_rule_is_bounded_and_counted(self) -> None:
         channel = SimpleNamespace(id=5, mention="<#5>", name="c")
         cog = self.cog([])
@@ -865,6 +924,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         scope.all = AsyncMock(return_value=settings)
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
+        cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)
@@ -887,6 +947,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         scope.all = AsyncMock(return_value=settings)
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
+        cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)
@@ -906,6 +967,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         scope.all = AsyncMock(return_value=settings)
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
+        cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)
@@ -927,6 +989,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         scope.all = AsyncMock(return_value=settings)
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
+        cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)

@@ -131,7 +131,8 @@ anything: the entire output is one report a moderator reads and acts on.
 [p]cog install NyanCogs messagewatch
 [p]load messagewatch
 [p]watch key                     # owner only, stores the TypeSafe api_key
-[p]watch report #mod-log
+[p]watch report #mod-log         # the guild-wide default
+[p]watch route #樹洞 #樹洞管理    # one channel's reports, sent elsewhere
 [p]watch disclosure              # read it
 [p]watch disclosure I_ACCEPT
 [p]watch enable #a-channel       # one channel at a time
@@ -148,6 +149,11 @@ avatars are never sent; authors become labels such as `u1` generated per
 request and never stored. Attachments, embeds and links are
 not fetched or resolved. `[p]watch disable` stops a channel immediately and
 drops anything pending for it.
+
+A report quotes the channel it came from, so a channel can send its findings
+somewhere other than the default with `[p]watch route`. A venting channel's
+reports carry what someone wrote there, and fewer people should see those than
+see a scam alert. Without a route, reports go to the guild-wide channel.
 
 A channel can also be judged against its own posted rules:
 
