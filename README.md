@@ -139,9 +139,10 @@ anything: the entire output is one report a moderator reads and acts on.
 
 Every channel is opted in separately and sends nothing until it is. An enabled
 channel is a standing export: message text goes to TypeSafe continuously, with
-nobody triggering it, which is unlike the on-demand `/summary`. Discord user
-IDs, display names and avatars are never sent; authors become labels such as
-`u1` generated per request and never stored. Attachments, embeds and links are
+nobody triggering it, which is unlike the on-demand `/summary`. Each request
+also carries the name of the channel. Discord user IDs, display names and
+avatars are never sent; authors become labels such as `u1` generated per
+request and never stored. Attachments, embeds and links are
 not fetched or resolved. `[p]watch disable` stops a channel immediately and
 drops anything pending for it.
 

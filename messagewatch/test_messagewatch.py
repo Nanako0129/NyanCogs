@@ -22,6 +22,11 @@ from .messagewatch import (
 )
 
 
+# The one wording every statement of the outbound contract has to use, so the
+# three of them can be reconciled by a single assertion.
+CHANNEL_CLAUSE = "name of the channel"
+
+
 def window(*authors: int) -> list[dict[str, object]]:
     return [
         {"author_id": author, "text": f"m{index}", "jump_url": f"https://d/{index}"}
@@ -485,13 +490,31 @@ class TestDataStatement(unittest.TestCase):
         statement = self.statement()
         self.assertNotIn("message ID", statement)
         for phrase in (
-            "the channel name is sent",
-            "its text",
+            "the text of each recent human message",
             "its position in the window",
             "a per-run pseudonymous author label",
+            CHANNEL_CLAUSE,
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, statement)
+
+    def test_every_statement_of_the_contract_names_the_channel(self) -> None:
+        # The payload carries the channel name. info.json was corrected for it
+        # and the other two statements of the same contract were not, because
+        # only one of the three had been opened. Reconciling one place is not
+        # reconciling the contract, so all three are asserted here together.
+        from pathlib import Path
+
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        section = readme.split("## MessageWatch", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("channel", build_state("交誼廳", anonymise(window(111))))
+        for source, text in (
+            ("info.json", self.statement()),
+            ("DISCLOSURE_TEXT", module.DISCLOSURE_TEXT),
+            ("README", section),
+        ):
+            with self.subTest(source=source):
+                self.assertIn(CHANNEL_CLAUSE, text)
 
     def test_the_statement_names_what_leaves_and_what_does_not(self) -> None:
         statement = self.statement()

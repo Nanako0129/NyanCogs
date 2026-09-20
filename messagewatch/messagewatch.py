@@ -88,8 +88,9 @@ SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
 DISCLOSURE_VERSION = 1
 DISCLOSURE_TEXT = (
     "**What leaves Discord:** in an enabled channel, the text of recent human messages is sent "
-    "to TypeSafe continuously, with nobody triggering it. This is unlike an on-demand command: "
-    "enabling a channel is a standing export of what people say in it.\n"
+    "to TypeSafe continuously, together with the name of the channel, with nobody triggering "
+    "it. This is unlike an on-demand command: enabling a channel is a standing export of what "
+    "people say in it.\n"
     "**What does not:** Discord user IDs, display names and avatars are never sent. Authors are "
     "replaced with labels such as u1 and u2, generated per request and never stored. Attachments, "
     "embeds and links are not fetched or resolved.\n"
