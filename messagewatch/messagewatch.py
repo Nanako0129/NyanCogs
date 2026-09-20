@@ -20,6 +20,7 @@ import json
 import re
 import time
 from collections import defaultdict, deque
+from itertools import islice
 from typing import Any, Iterable, Mapping
 
 import aiohttp
@@ -45,6 +46,14 @@ SCAM_OPTION_LABEL_CHARS = 48
 MAX_REQUEST_BYTES = 262_144
 MAX_RESPONSE_BYTES = 65_536
 REQUEST_TIMEOUT_SECONDS = 30.0
+
+# The pending queue is bounded. A channel can be enabled while no API key is
+# stored, and `flush` then returns before consuming anything, so without a cap
+# a busy channel would retain every message in process memory indefinitely.
+# Past the cap the oldest pending message is dropped rather than the newest,
+# because the current exchange is the one worth judging. Must stay above the
+# largest `window_size` (25) or a window could never fill.
+MAX_PENDING_MESSAGES = 64
 
 # Measured 2026-09-20 against jev-1.13.0 through the production key. Synthetic
 # cases separated at 0.93+ for scams and 0.95 for hostility, against 0.08 and
@@ -170,7 +179,15 @@ def _bounded_index(value: Any, size: int) -> int | None:
     """The index the model picked, or None for `none` and anything unexpected."""
     if not isinstance(value, str) or not value.isdigit():
         return None
-    index = int(value)
+    try:
+        index = int(value)
+    except ValueError:
+        # `str.isdigit` is not `int`-convertible. Measured on this Python:
+        # "²".isdigit() is True and int("²") raises, and int() refuses a digit
+        # string longer than sys.get_int_max_str_digits() (4300 by default),
+        # which fits well inside MAX_RESPONSE_BYTES. Both are provider-
+        # controlled, and neither may escape into the message handler.
+        return None
     return index if 0 <= index < size else None
 
 
@@ -236,7 +253,9 @@ class MessageWatch(commands.Cog):
         # Both are process memory on purpose. A restart losing a half-filled
         # window costs one late report; persisting message text would
         # contradict the data statement.
-        self._pending: defaultdict[int, deque[dict[str, Any]]] = defaultdict(deque)
+        self._pending: defaultdict[int, deque[dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=MAX_PENDING_MESSAGES)
+        )
         self._last_report: dict[int, float] = {}
         self._locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -364,10 +383,36 @@ class MessageWatch(commands.Cog):
         )
         return embed
 
+    def _take_window(self, channel_id: int, window_size: int) -> list[dict[str, Any]] | None:
+        """Copy one full window and advance the queue by half of it.
+
+        The windows overlap. Consuming the whole batch would mean an exchange
+        that straddles a boundary is never judged together, and hostility is a
+        property of an exchange, which is the entire reason this cog judges
+        windows rather than messages. The stride is half a window, so every
+        message is judged in two of them: that doubles the amortised input cost
+        per message, and gives a borderline case near a boundary a second
+        chance, which is the direction the unmeasured recall gap points.
+
+        Callers hold `self._locks[channel_id]`; nothing here awaits.
+        """
+        queue = self._pending[channel_id]
+        if len(queue) < window_size:
+            return None
+        window = [dict(item) for item in islice(queue, window_size)]
+        for _ in range(window_size - window_size // 2):
+            queue.popleft()
+        return window
+
     async def flush(self, channel: discord.TextChannel | discord.Thread) -> None:
         """Judge one full window for this channel and report if it crosses."""
         guild = channel.guild
         settings = await self.config.guild(guild).all()
+        # `[p]watch disable` leaves the watched set before it clears the queue,
+        # so a window that filled just before it must not still be exported.
+        if channel.id not in set(settings["watched_channels"]):
+            self._pending.pop(channel.id, None)
+            return
         report_id = int(settings["report_channel"])
         if not report_id:
             return
@@ -378,16 +423,19 @@ class MessageWatch(commands.Cog):
         if key is None:
             return
 
-        queue = self._pending[channel.id]
-        window_size = int(settings["window_size"])
-        if len(queue) < window_size:
+        # The lock covers the queue and nothing else. Holding it across the
+        # request would stall every later message in this channel for the whole
+        # provider timeout, so judging and reporting happen outside it.
+        async with self._locks[channel.id]:
+            window = self._take_window(channel.id, int(settings["window_size"]))
+        if window is None:
             return
-        window = anonymise([queue.popleft() for _ in range(window_size)])
+        anonymise(window)
 
         answers = await self.judge(window, getattr(channel, "name", str(channel.id)), key)
         if answers is None:
             return
-        index, reasons = self.findings(answers, settings, window_size)
+        index, reasons = self.findings(answers, settings, len(window))
         if not reasons:
             return
 
@@ -398,7 +446,6 @@ class MessageWatch(commands.Cog):
         # gets a report every few messages for the same exchange.
         if last is not None and now - last < cooldown:
             return
-        self._last_report[channel.id] = now
         try:
             await report_channel.send(
                 embed=self.report_embed(channel, window, index, reasons),
@@ -406,6 +453,9 @@ class MessageWatch(commands.Cog):
             )
         except discord.HTTPException:
             return
+        # Recorded only once a report was delivered: a transport failure must
+        # not silence the channel for the whole cooldown with nothing sent.
+        self._last_report[channel.id] = now
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -425,6 +475,12 @@ class MessageWatch(commands.Cog):
         if not text:
             return
         async with self._locks[channel.id]:
+            # Re-read inside the lock. `[p]watch disable` leaves the watched set
+            # and then clears the queue under this same lock, so a handler that
+            # passed the check above before the disable must not append after
+            # the clear and leave a disabled channel holding message text.
+            if channel.id not in set(await self.config.guild(guild).watched_channels()):
+                return
             self._pending[channel.id].append(
                 {
                     "author_id": author.id,
@@ -432,8 +488,11 @@ class MessageWatch(commands.Cog):
                     "jump_url": getattr(message, "jump_url", ""),
                 }
             )
-            if len(self._pending[channel.id]) >= int(settings["window_size"]):
-                await self.flush(channel)
+            full = len(self._pending[channel.id]) >= int(settings["window_size"])
+        # Outside the lock: flush takes it again for the queue alone, so the
+        # provider request never blocks this channel's ingestion.
+        if full:
+            await self.flush(channel)
 
     @commands.group(name="watch")
     @commands.guild_only()
@@ -485,6 +544,10 @@ class MessageWatch(commands.Cog):
                 return
             watched.append(channel.id)
         await ctx.send(f"開始監看 {channel.mention}。該頻道的訊息會送往 TypeSafe 判斷。")
+        if await self.get_api_key() is None:
+            # The key is owner-scoped and this command is not, so a manager can
+            # enable a channel that then silently judges nothing.
+            await ctx.send("⚠️ 尚未設定 API key，在 bot owner 執行 `[p]watch key` 之前不會產生任何判斷。")
 
     @watch_group.command(name="disable")
     async def watch_disable(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
@@ -494,7 +557,12 @@ class MessageWatch(commands.Cog):
                 await ctx.send(f"{channel.mention} 本來就沒有在監看。")
                 return
             watched.remove(channel.id)
-        self._pending.pop(channel.id, None)
+        # Under the lock, and after leaving the watched set: an `on_message`
+        # handler already holding the lock appends and this clears it, and one
+        # that takes the lock afterwards re-reads the set and appends nothing.
+        # Without both halves this command's own claim would be false.
+        async with self._locks[channel.id]:
+            self._pending.pop(channel.id, None)
         self._last_report.pop(channel.id, None)
         await ctx.send(f"停止監看 {channel.mention}，未送出的暫存也已清除。")
 

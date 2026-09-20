@@ -29,6 +29,24 @@ def window(*authors: int) -> list[dict[str, object]]:
     ]
 
 
+def pending() -> "module.defaultdict":
+    """The same bounded queue the cog builds, so tests cannot outgrow it."""
+    return module.defaultdict(lambda: module.deque(maxlen=module.MAX_PENDING_MESSAGES))
+
+
+class ValueContext:
+    """Stand-in for a Config value used as `async with scope.field() as value`."""
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    async def __aenter__(self) -> object:
+        return self.value
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
 class TestOutboundPayload(unittest.TestCase):
     def test_authors_become_per_request_labels_and_ids_never_leave(self) -> None:
         items = anonymise(window(111111111111111111, 222222222222222222, 111111111111111111))
@@ -94,8 +112,10 @@ class TestUntrustedAnswers(unittest.TestCase):
                 self.assertIsNone(module._bounded_score(value, 4))
 
         self.assertEqual(module._bounded_index("2", 8), 2)
-        for value in ("none", "8", "-1", "", 2, None, "1.5"):
-            with self.subTest(value=value):
+        # "²" and a 5000-digit string both pass str.isdigit() and both make
+        # int() raise; they are provider-controlled and must not escape.
+        for value in ("none", "8", "-1", "", 2, None, "1.5", "²", "9" * 5000):
+            with self.subTest(value=str(value)[:12]):
                 self.assertIsNone(module._bounded_index(value, 8))
 
     def test_findings_fire_only_above_their_threshold(self) -> None:
@@ -214,16 +234,21 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
 
 
 class TestGating(unittest.IsolatedAsyncioTestCase):
-    def cog(self, **overrides):
+    def cog(self, *, still_watched=None, **overrides):
         cog = object.__new__(MessageWatch)
         cog.bot = MagicMock()
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "watched_channels": [5], **overrides}
         scope = MagicMock()
         scope.all = AsyncMock(return_value=settings)
+        # What the in-lock recheck sees, which `[p]watch disable` can have
+        # changed since the gate above it read the same field.
+        scope.watched_channels = AsyncMock(
+            return_value=settings["watched_channels"] if still_watched is None else still_watched
+        )
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
-        cog._pending = module.defaultdict(module.deque)
+        cog._pending = pending()
         cog._last_report = {}
         cog._locks = module.defaultdict(module.asyncio.Lock)
         cog.flush = AsyncMock()
@@ -274,19 +299,42 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         await cog.on_message(self.message())
         cog.flush.assert_awaited_once()
 
+    async def test_a_channel_disabled_mid_flight_queues_nothing(self) -> None:
+        # The handler passed the gate before `[p]watch disable` ran; the recheck
+        # inside the lock is what stops it appending after the queue was
+        # cleared, which would leave a disabled channel holding message text.
+        cog = self.cog(still_watched=[])
+        await cog.on_message(self.message())
+        self.assertEqual(len(cog._pending[5]), 0)
+
+    async def test_the_pending_queue_is_bounded(self) -> None:
+        # A channel enabled with no API key never consumes its queue, so
+        # without a cap it retains every message in process memory.
+        with patch("messagewatch.messagewatch.Config"):
+            cog = MessageWatch(MagicMock())
+        self.assertGreater(module.MAX_PENDING_MESSAGES, module.SETTING_RULES["window_size"][2])
+        queue = cog._pending[5]
+        for index in range(module.MAX_PENDING_MESSAGES + 5):
+            queue.append({"text": str(index)})
+        self.assertEqual(len(queue), module.MAX_PENDING_MESSAGES)
+        # The oldest go, not the newest: the current exchange is the one worth
+        # judging.
+        self.assertEqual(queue[0]["text"], "5")
+
 
 class TestFlush(unittest.IsolatedAsyncioTestCase):
     def cog(self, *, answers, **overrides):
         cog = object.__new__(MessageWatch)
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
-                    "report_channel": 77, "window_size": 3, **overrides}
+                    "report_channel": 77, "watched_channels": [5], "window_size": 3,
+                    **overrides}
         scope = MagicMock()
         scope.all = AsyncMock(return_value=settings)
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
         cog.get_api_key = AsyncMock(return_value="k")
         cog.judge = AsyncMock(return_value=answers)
-        cog._pending = module.defaultdict(module.deque)
+        cog._pending = pending()
         cog._last_report = {}
         cog._locks = module.defaultdict(module.asyncio.Lock)
         cog._pending[5].extend(window(111, 222, 333))
@@ -305,14 +353,47 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
             "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}
     QUIET = {"any_scam": {"noul": 0.03}, "is_hostile": {"noul": 0.05}, "heat": {"score": 0.4}}
 
-    async def test_a_crossing_window_reports_once_and_consumes_it(self) -> None:
+    async def test_a_crossing_window_reports_once(self) -> None:
         cog = self.cog(answers=self.SCAM)
         channel, report = self.channel()
         await cog.flush(channel)
         report.send.assert_awaited_once()
-        self.assertEqual(len(cog._pending[5]), 0)
         kwargs = report.send.await_args.kwargs
         self.assertEqual(kwargs["allowed_mentions"].users, False)
+
+    async def test_windows_overlap_so_an_exchange_is_never_split(self) -> None:
+        # Consuming the whole batch would mean an exchange straddling a
+        # boundary is never judged together, and hostility is a property of an
+        # exchange. Window 4, stride 2: every message is judged twice.
+        cog = self.cog(answers=self.QUIET, window_size=4)
+        cog._pending[5].clear()
+        cog._pending[5].extend(window(1, 2, 3, 4))
+        channel, _ = self.channel()
+        await cog.flush(channel)
+        first = [item["text"] for item in cog.judge.await_args.args[0]]
+        self.assertEqual(first, ["m0", "m1", "m2", "m3"])
+
+        cog._pending[5].extend(
+            {"author_id": 9, "text": f"m{index}", "jump_url": f"https://d/{index}"}
+            for index in (4, 5)
+        )
+        await cog.flush(channel)
+        second = [item["text"] for item in cog.judge.await_args.args[0]]
+        # m3 and m4 sit either side of the first boundary and are judged
+        # together here; with no overlap they never would be.
+        self.assertEqual(second, ["m2", "m3", "m4", "m5"])
+
+    async def test_the_request_does_not_hold_the_ingestion_lock(self) -> None:
+        # Holding it would stall every later message in this channel for the
+        # whole provider timeout.
+        cog = self.cog(answers=self.QUIET)
+        channel, _ = self.channel()
+        observed = []
+        cog.judge = AsyncMock(
+            side_effect=lambda *a, **k: observed.append(cog._locks[5].locked()) or self.QUIET
+        )
+        await cog.flush(channel)
+        self.assertEqual(observed, [False])
 
     async def test_a_quiet_window_reports_nothing(self) -> None:
         cog = self.cog(answers=self.QUIET)
@@ -346,6 +427,35 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         await cog.flush(channel)
         report.send.assert_not_awaited()
 
+    async def test_a_failed_send_does_not_start_the_cooldown(self) -> None:
+        # Recording it before the send would silence the channel for up to a
+        # day while nothing was ever delivered.
+        cog = self.cog(answers=self.SCAM)
+        channel, report = self.channel()
+        report.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
+        await cog.flush(channel)
+        self.assertNotIn(5, cog._last_report)
+
+    async def test_an_unwatched_channel_exports_nothing(self) -> None:
+        # `[p]watch disable` leaves the watched set before it clears the queue;
+        # a window that filled just before it must not still be sent.
+        cog = self.cog(answers=self.SCAM, watched_channels=[])
+        channel, report = self.channel()
+        await cog.flush(channel)
+        cog.judge.assert_not_awaited()
+        report.send.assert_not_awaited()
+        self.assertEqual(len(cog._pending[5]), 0)
+
+    async def test_disable_clears_the_queue_under_the_lock(self) -> None:
+        cog = self.cog(answers=self.SCAM)
+        scope = cog.config.guild.return_value
+        scope.watched_channels = MagicMock(return_value=ValueContext([5]))
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        channel = SimpleNamespace(id=5, mention="<#5>")
+        await MessageWatch.watch_disable.callback(cog, ctx, channel)
+        self.assertEqual(len(cog._pending[5]), 0)
+        self.assertIn("已清除", ctx.send.await_args.args[0])
+
     async def test_a_partial_window_is_not_judged(self) -> None:
         cog = self.cog(answers=self.SCAM, window_size=8)
         channel, report = self.channel()
@@ -355,12 +465,36 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
 
 
 class TestDataStatement(unittest.TestCase):
-    def test_the_statement_names_what_leaves_and_what_does_not(self) -> None:
+    @staticmethod
+    def statement() -> str:
         from pathlib import Path
 
-        statement = json.loads(
+        return json.loads(
             (Path(__file__).parent / "info.json").read_text(encoding="utf-8")
         )["end_user_data_statement"]
+
+    def test_the_statement_enumerates_exactly_what_build_state_sends(self) -> None:
+        # The statement claimed the message ID was sent; build_state never
+        # captured one. A list of phrases cannot catch a claim about a field
+        # that does not exist, so this pins the payload's own shape: adding a
+        # field here fails until the statement is rewritten to name it.
+        state = build_state("交誼廳", anonymise(window(111, 222)))
+        self.assertEqual(set(state), {"channel", "recent_messages"})
+        self.assertEqual(set(state["recent_messages"][0]), {"i", "author", "text"})
+
+        statement = self.statement()
+        self.assertNotIn("message ID", statement)
+        for phrase in (
+            "the channel name is sent",
+            "its text",
+            "its position in the window",
+            "a per-run pseudonymous author label",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, statement)
+
+    def test_the_statement_names_what_leaves_and_what_does_not(self) -> None:
+        statement = self.statement()
         for phrase in (
             "Discord user IDs, display names, and avatars are never sent",
             "never deletes, edits, reacts to, or punishes anything",

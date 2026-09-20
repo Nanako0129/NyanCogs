@@ -146,9 +146,11 @@ not fetched or resolved. `[p]watch disable` stops a channel immediately and
 drops anything pending for it.
 
 Hostility and heat are judged over a window rather than a message, because an
-argument is a property of an exchange. Window size, the report cooldown, and all
-three thresholds are per-guild settings; `[p]watch show` prints the effective
-values and `[p]watch set <key> <value>` changes one.
+argument is a property of an exchange. Consecutive windows overlap by half, so
+an exchange straddling a boundary is still judged together and every message is
+judged in two windows. Window size, the report cooldown, and all three
+thresholds are per-guild settings; `[p]watch show` prints the effective values
+and `[p]watch set <key> <value>` changes one.
 
 Defaults were measured on 2026-09-20 against `jev-1.13.0`. On synthetic cases
 scams separated at 0.93 and above against 0.08 for a message *warning about* a
