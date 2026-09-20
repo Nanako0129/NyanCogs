@@ -53,12 +53,13 @@ Threshold inheritance follows the pattern `channel_value or guild_value`. A chan
 
 ## 5. The disclosure contract and its version
 
-`DISCLOSURE_VERSION` is currently set to 4 in `messagewatch.py`. If the version accepted by a guild manager does not match this constant, the cog suspends all outbound processing for that guild until a manager re-accepts via `[p]watch disclosure I_ACCEPT`. The versions are cumulative: 1 covered the baseline export of message text, 2 added channel rules and purpose notes, 3 added the report action buttons and their modlog entries, and 4 added image reading. Every guild that accepted 3 is therefore stopped until someone accepts 4.
+`DISCLOSURE_VERSION` is currently set to 4 in `messagewatch.py`. If the version accepted by a guild manager does not match this constant, the cog suspends all outbound processing for that guild until a manager re-accepts via `[p]watch disclosure I_ACCEPT`. Every guild that accepted 3 is therefore stopped until someone accepts 4.
 
-Outbound changes trigger version bumps:
+Each version adds something that leaves Discord, and they are cumulative:
 - v1: Baseline human message text and channel names.
 - v2: Channel rules and moderator purpose notes.
 - v3: Interactive report action buttons with modlog audit records.
+- v4: Image attachments to a vision provider, and the transcription on to TypeSafe.
 
 When the version increments, all guilds halt outbound requests until re-acknowledged. To prevent silent failures, `[p]watch show` prominently reports when processing is suspended due to an outdated disclosure version.
 

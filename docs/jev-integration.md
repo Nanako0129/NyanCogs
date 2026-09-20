@@ -158,6 +158,12 @@ Furthermore, rule criteria formulation directly alters classification performanc
 
 ## 11. What is not measured
 
-**Recall.** Every figure documented above evaluates precision: given a known input case, does the model categorize it accurately. Quantifying recall requires capturing production violations that the system failed to flag, which synthetic test suites and moderator report buttons cannot observe. Moderator audit buttons accumulate precision feedback only.
+**Recall.** Three things get confused here, so they are named separately.
+
+Every figure documented above -- 4/4, 9/9, 12/12, 19/19 -- is **accuracy** on a labelled set: given a case whose correct answer is known, does the model return it. Those sets hold both violating and clean cases and carry no true-positive/false-positive denominator, so they are not precision.
+
+**Precision** is what the moderator `ok`/`no` buttons accumulate, and only for cases that produced a report in the first place.
+
+**Recall** is unmeasured. Quantifying it requires production violations the system failed to flag, which neither a synthetic test set nor a report button can observe: a case that produced no report has no button to press.
 
 This omission is a methodological boundary of the synthetic benchmark framework rather than a transient task item.
