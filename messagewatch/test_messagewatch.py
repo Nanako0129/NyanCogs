@@ -144,7 +144,7 @@ class TestUntrustedAnswers(unittest.TestCase):
             "is_hostile": {"noul": 0.15},
             "heat": {"score": 1.53},
         }
-        self.assertEqual(MessageWatch.findings(quiet, settings, 8), (None, []))
+        self.assertEqual(MessageWatch.findings(quiet, settings, 8), (None, [], None))
 
         scam = {
             "any_scam": {"noul": 0.97},
@@ -152,7 +152,7 @@ class TestUntrustedAnswers(unittest.TestCase):
             "is_hostile": {"noul": 0.02},
             "heat": {"score": 0.3},
         }
-        index, reasons = MessageWatch.findings(scam, settings, 8)
+        index, reasons, _ = MessageWatch.findings(scam, settings, 8)
         self.assertEqual(index, 2)
         self.assertEqual(reasons, ["詐騙 0.97"])
 
@@ -161,7 +161,7 @@ class TestUntrustedAnswers(unittest.TestCase):
             "is_hostile": {"noul": 0.95},
             "heat": {"score": 2.6},
         }
-        index, reasons = MessageWatch.findings(fight, settings, 8)
+        index, reasons, _ = MessageWatch.findings(fight, settings, 8)
         self.assertIsNone(index)
         self.assertEqual(reasons, ["敵意 0.95", "火藥味 2.60/3"])
 
@@ -176,17 +176,42 @@ class TestUntrustedAnswers(unittest.TestCase):
             {"heat": {"score": 99}},
         ):
             with self.subTest(answers=answers):
-                self.assertEqual(MessageWatch.findings(answers, settings, 8), (None, []))
+                self.assertEqual(MessageWatch.findings(answers, settings, 8), (None, [], None))
 
     def test_an_out_of_range_index_degrades_to_a_range_report(self) -> None:
         settings = dict(DEFAULT_GUILD)
         answers = {"any_scam": {"noul": 0.99}, "scam_index": {"choice": "99"}}
-        index, reasons = MessageWatch.findings(answers, settings, 8)
+        index, reasons, _ = MessageWatch.findings(answers, settings, 8)
         self.assertIsNone(index)
         self.assertEqual(reasons, ["詐騙 0.99"])
 
 
 class TestReport(unittest.TestCase):
+    def test_two_findings_about_two_people_get_two_links(self) -> None:
+        # A scam and a rule violation in one window are findings about two
+        # different members. One link beside both reasons would put a rule's
+        # name next to somebody else's message.
+        channel = SimpleNamespace(id=5, mention="<#5>")
+        items = anonymise(window(111, 222, 333))
+        rendered = json.dumps(
+            MessageWatch.report_embed(
+                channel, items, 0, ["詐騙 0.97", "違反第 2 條：下指導棋"], 2
+            ).to_dict(),
+            ensure_ascii=False,
+        )
+        self.assertIn("https://d/0", rendered)
+        self.assertIn("https://d/2", rendered)
+        self.assertIn("<@111>", rendered)
+        self.assertIn("<@333>", rendered)
+        self.assertIn("違規的訊息", rendered)
+
+        # The same message for both needs only one link.
+        one = json.dumps(
+            MessageWatch.report_embed(channel, items, 1, ["違反第 2 條"], 1).to_dict(),
+            ensure_ascii=False,
+        )
+        self.assertNotIn("違規的訊息", one)
+
     def test_report_points_at_the_message_and_claims_no_authority(self) -> None:
         channel = SimpleNamespace(id=5, mention="<#5>")
         items = anonymise(window(111, 222, 333))
@@ -644,7 +669,7 @@ class TestRules(unittest.TestCase):
         self.assertNotIn("channel_purpose", build_state("c", items))
         # And a rule answer present without configured rules is ignored.
         self.assertEqual(
-            MessageWatch.findings(self.answers(), self.settings(), 2), (None, [])
+            MessageWatch.findings(self.answers(), self.settings(), 2), (None, [], None)
         )
 
     def test_the_rule_text_is_the_option_label_and_never_the_state(self) -> None:
@@ -666,7 +691,7 @@ class TestRules(unittest.TestCase):
         self.assertIn("倒垃圾用", body)
 
     def test_a_violation_names_the_rule_and_the_message(self) -> None:
-        index, reasons = MessageWatch.findings(
+        index, reasons, _ = MessageWatch.findings(
             self.answers(), self.settings(), 4, self.RULES
         )
         self.assertEqual(index, 1)
@@ -681,14 +706,14 @@ class TestRules(unittest.TestCase):
         # merely say commentary is present.
         self.assertEqual(
             MessageWatch.findings(self.answers(meta="1"), self.settings(), 4, self.RULES),
-            (None, []),
+            (None, [], None),
         )
 
     def test_commentary_elsewhere_does_not_veto_a_real_violation(self) -> None:
         # One member breaking a rule while another points at a different
         # message must still be reported; a veto that fired on any commentary
         # anywhere would silence the violation.
-        index, reasons = MessageWatch.findings(
+        index, reasons, _ = MessageWatch.findings(
             self.answers(meta="3", index="1"), self.settings(), 4, self.RULES
         )
         self.assertEqual(index, 1)
@@ -703,12 +728,12 @@ class TestRules(unittest.TestCase):
                     MessageWatch.findings(
                         self.answers(meta=meta), self.settings(), 4, self.RULES
                     ),
-                    (None, []),
+                    (None, [], None),
                 )
         answers = self.answers()
         del answers["meta_index"]
         self.assertEqual(
-            MessageWatch.findings(answers, self.settings(), 4, self.RULES), (None, [])
+            MessageWatch.findings(answers, self.settings(), 4, self.RULES), (None, [], None)
         )
 
     def test_a_rule_report_must_name_a_message(self) -> None:
@@ -720,7 +745,7 @@ class TestRules(unittest.TestCase):
                     MessageWatch.findings(
                         self.answers(index=index), self.settings(), 4, self.RULES
                     ),
-                    (None, []),
+                    (None, [], None),
                 )
 
     def test_an_uncertain_choice_reports_nothing(self) -> None:
@@ -731,7 +756,7 @@ class TestRules(unittest.TestCase):
             MessageWatch.findings(
                 self.answers(violation=0.61, confidence=0.43), self.settings(), 4, self.RULES
             ),
-            (None, []),
+            (None, [], None),
         )
 
     def test_a_rule_number_outside_the_configured_set_is_discarded(self) -> None:
@@ -741,7 +766,7 @@ class TestRules(unittest.TestCase):
                     MessageWatch.findings(
                         self.answers(rule=rule), self.settings(), 4, self.RULES
                     ),
-                    (None, []),
+                    (None, [], None),
                 )
 
     def test_a_quiet_window_under_rules_reports_nothing(self) -> None:
@@ -749,7 +774,7 @@ class TestRules(unittest.TestCase):
             MessageWatch.findings(
                 self.answers(violation=0.07, rule="none"), self.settings(), 4, self.RULES
             ),
-            (None, []),
+            (None, [], None),
         )
 
     def test_an_uncertain_rule_is_reported_as_uncertain_not_suppressed(self) -> None:
@@ -759,7 +784,7 @@ class TestRules(unittest.TestCase):
         # that threw away a true positive to hide an uncertainty the moderator
         # is better off seeing. Whether a violation happened at all is decided
         # by a separate calibrated probability.
-        index, reasons = MessageWatch.findings(
+        index, reasons, _ = MessageWatch.findings(
             self.answers(violation=0.94, confidence=0.67), self.settings(), 4, self.RULES
         )
         self.assertEqual(index, 1)
@@ -768,7 +793,7 @@ class TestRules(unittest.TestCase):
         # An unreadable confidence is uncertainty too, not a reason to drop it.
         for bad in (None, "0.9", float("nan"), True, 10**400):
             with self.subTest(confidence=str(bad)[:10]):
-                _, reasons = MessageWatch.findings(
+                _, reasons, _rule = MessageWatch.findings(
                     self.answers(confidence=bad), self.settings(), 4, self.RULES
                 )
                 self.assertTrue(reasons and reasons[0].startswith("疑似違規"))
@@ -776,10 +801,55 @@ class TestRules(unittest.TestCase):
     def test_a_rule_finding_joins_the_other_reasons(self) -> None:
         answers = self.answers()
         answers["is_hostile"] = {"noul": 0.95}
-        index, reasons = MessageWatch.findings(answers, self.settings(), 4, self.RULES)
+        index, reasons, _ = MessageWatch.findings(answers, self.settings(), 4, self.RULES)
         self.assertEqual(len(reasons), 2)
         self.assertTrue(reasons[0].startswith("敵意"))
         self.assertTrue(reasons[1].startswith("違反第 2 條"))
+
+
+class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def cog(rules):
+        cog = object.__new__(MessageWatch)
+        scope = MagicMock()
+        scope.rules = MagicMock(return_value=ValueContext(rules))
+        cog.config = MagicMock()
+        cog.config.channel.return_value = scope
+        return cog
+
+    async def test_echoed_rule_text_cannot_ping_the_guild(self) -> None:
+        # A rule is moderator-written text echoed back verbatim, so a rule
+        # containing @everyone would otherwise notify the whole guild from the
+        # confirmation message.
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+        rule = "禁止 @everyone 與 <@&123> 這類標記"
+
+        cog = self.cog([])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_add.callback(cog, ctx, channel, text=rule)
+        self.assertEqual(ctx.send.await_args.kwargs["allowed_mentions"].everyone, False)
+        self.assertIn(rule, ctx.send.await_args.args[0])
+
+        cog = self.cog([rule])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 1)
+        self.assertEqual(ctx.send.await_args.kwargs["allowed_mentions"].everyone, False)
+
+    async def test_a_rule_is_bounded_and_counted(self) -> None:
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+        cog = self.cog([])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_add.callback(
+            cog, ctx, channel, text="字" * (module.MAX_RULE_CHARS + 1)
+        )
+        self.assertIn(str(module.MAX_RULE_CHARS), ctx.send.await_args.args[0])
+
+        full = ["規則"] * module.MAX_RULES
+        cog = self.cog(full)
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_add.callback(cog, ctx, channel, text="再一條")
+        self.assertEqual(len(full), module.MAX_RULES)
+        self.assertIn(str(module.MAX_RULES), ctx.send.await_args.args[0])
 
 
 class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
@@ -802,6 +872,49 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         field = next(f for f in embed.fields if f.name == "監看中的頻道")
         self.assertLessEqual(len(field.value), module.EMBED_FIELD_LIMIT)
         self.assertIn("未顯示", field.value)
+
+    async def test_watch_show_says_so_when_the_disclosure_is_stale(self) -> None:
+        # A bumped disclosure halts every channel. A list that still reads
+        # "監看中" while nothing is judged is the silent no-op this cog exists
+        # to avoid producing.
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._last_judged = {}
+        cog._last_error = {}
+        settings = {**DEFAULT_GUILD, "report_channel": 77, "watched_channels": [5],
+                    "disclosure_version": DISCLOSURE_VERSION - 1}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+
+        await MessageWatch.watch_show.callback(cog, ctx)
+        fields = {f.name: f.value for f in ctx.send.await_args.kwargs["embed"].fields}
+        self.assertIn("已暫停", fields["狀態"])
+        self.assertIn("watch disclosure", fields["狀態"])
+
+    async def test_watch_show_prints_every_tunable_threshold(self) -> None:
+        # Every key `[p]watch set` accepts has to be readable back, or a
+        # moderator cannot tell what the cog is actually using.
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._last_judged = {}
+        cog._last_error = {}
+        settings = {**DEFAULT_GUILD, "report_channel": 77, "watched_channels": [5]}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+
+        await MessageWatch.watch_show.callback(cog, ctx)
+        rendered = json.dumps(
+            ctx.send.await_args.kwargs["embed"].to_dict(), ensure_ascii=False
+        )
+        for key in module.SETTING_RULES:
+            with self.subTest(key=key):
+                self.assertIn(str(settings[key]), rendered)
 
     async def test_watch_show_reports_the_last_problem_per_channel(self) -> None:
         cog = object.__new__(MessageWatch)
@@ -956,6 +1069,21 @@ class TestDataStatement(unittest.TestCase):
         ):
             with self.subTest(source=source):
                 self.assertIn(CHANNEL_CLAUSE, text)
+
+    def test_a_guild_on_the_pre_rules_disclosure_is_not_treated_as_consenting(self) -> None:
+        # Version 1's text said nothing about rules, and rules now leave
+        # Discord with every request, so a guild still on 1 consented to a
+        # different export than the one happening.
+        #
+        # What this holds: the version cannot be reverted below the one whose
+        # text first covered rules, and the text of the current version must
+        # actually mention them. What it cannot hold: that a *future* outbound
+        # field is accompanied by another bump. Nothing automated can check
+        # that a human noticed what they changed; it is written here so the
+        # next reader knows the gap is known rather than missed.
+        self.assertGreaterEqual(DISCLOSURE_VERSION, 2)
+        self.assertIn("rules are configured", module.DISCLOSURE_TEXT)
+        self.assertIn("purpose note", module.DISCLOSURE_TEXT)
 
     def test_the_model_is_pinned_to_the_version_the_thresholds_were_measured_on(self) -> None:
         # An alias moves on the vendor's schedule and the probabilities behind

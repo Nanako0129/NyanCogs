@@ -131,7 +131,12 @@ SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
     "rule_confidence": (float, 0.0, 1.0),
 }
 
-DISCLOSURE_VERSION = 1
+# 2: a channel's rules and its purpose note began leaving Discord with every
+# request. The disclosure is about what leaves, so new outbound fields are
+# exactly what it exists to re-ask about, and a guild that accepted version 1
+# never saw them. Bumping halts every guild until a manager accepts again,
+# which is why `[p]watch show` says so in its first field.
+DISCLOSURE_VERSION = 2
 DISCLOSURE_TEXT = (
     "**What leaves Discord:** in an enabled channel, the text of recent human messages is sent "
     "to TypeSafe continuously, together with the name of the channel, with nobody triggering "
@@ -565,8 +570,14 @@ class MessageWatch(commands.Cog):
         settings: Mapping[str, Any],
         window_size: int,
         rules: list[str] | None = None,
-    ) -> tuple[int | None, list[str]]:
-        """Which thresholds this window crossed, and which message to point at."""
+    ) -> tuple[int | None, list[str], int | None]:
+        """Which thresholds this window crossed, and which messages to point at.
+
+        The rule pointer is returned separately because the two judgements can
+        name different messages: a scam and a rule violation in one window are
+        two findings about two people, and showing one link beside both reasons
+        would put a rule's name next to somebody else's message.
+        """
         reasons: list[str] = []
         index: int | None = None
 
@@ -594,16 +605,18 @@ class MessageWatch(commands.Cog):
             reasons.append(f"火藥味 {heat:.2f}/{levels - 1}")
 
         rules = list(rules or ())
+        rule_index: int | None = None
         if rules:
-            rule_index, rule_reason = MessageWatch._rule_finding(
+            found, rule_reason = MessageWatch._rule_finding(
                 answers, settings, rules, window_size
             )
             if rule_reason is not None:
                 reasons.append(rule_reason)
+                rule_index = found
                 if index is None:
-                    index = rule_index
+                    index = found
 
-        return index, reasons
+        return index, reasons, rule_index
 
     @staticmethod
     def report_embed(
@@ -611,6 +624,7 @@ class MessageWatch(commands.Cog):
         window: list[dict[str, Any]],
         index: int | None,
         reasons: list[str],
+        rule_index: int | None = None,
     ) -> discord.Embed:
         """The moderator-facing report. Judgement stays with the moderator."""
         embed = discord.Embed(
@@ -638,6 +652,16 @@ class MessageWatch(commands.Cog):
                     f"[開頭]({window[0]['jump_url']}) → [結尾]({window[-1]['jump_url']})"
                     f"（{len(window)} 則）"
                 ),
+                inline=False,
+            )
+        # A scam and a rule violation in one window are findings about two
+        # different people. One link beside both reasons would put a rule's
+        # name next to somebody else's message.
+        if rule_index is not None and rule_index != index and 0 <= rule_index < len(window):
+            flagged = window[rule_index]
+            embed.add_field(
+                name="違規的訊息",
+                value=f"<@{flagged['author_id']}> · [跳至訊息]({flagged['jump_url']})",
                 inline=False,
             )
         embed.set_footer(
@@ -738,12 +762,12 @@ class MessageWatch(commands.Cog):
             self._last_judged[channel.id] = time.time()
             self._last_error.pop(channel.id, None)
 
-            index, reasons = self.findings(answers, settings, len(window), rules)
+            index, reasons, rule_index = self.findings(answers, settings, len(window), rules)
             if not reasons:
                 return
             try:
                 await report_channel.send(
-                    embed=self.report_embed(channel, window, index, reasons),
+                    embed=self.report_embed(channel, window, index, reasons, rule_index),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except discord.Forbidden:
@@ -904,7 +928,12 @@ class MessageWatch(commands.Cog):
                 return
             rules.append(text)
             number = len(rules)
-        await ctx.send(f"{channel.mention} 第 {number} 條：{text}")
+        # A rule is moderator-written text echoed back verbatim, so a rule
+        # containing @everyone would otherwise ping the guild from here.
+        await ctx.send(
+            f"{channel.mention} 第 {number} 條：{text}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @watch_rule.command(name="list")
     async def watch_rule_list(
@@ -935,7 +964,10 @@ class MessageWatch(commands.Cog):
             removed = rules.pop(number - 1)
         # The numbers are positions, so removing one renumbers the rest. Saying
         # so beats a moderator deleting the wrong rule next time.
-        await ctx.send(f"已刪除第 {number} 條：{removed}\n後面的規則會往前遞補編號。")
+        await ctx.send(
+            f"已刪除第 {number} 條：{removed}\n後面的規則會往前遞補編號。",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @watch_rule.command(name="clear")
     async def watch_rule_clear(
@@ -1003,17 +1035,25 @@ class MessageWatch(commands.Cog):
         watched = "\n".join(rows) or "（無）"
         report = f"<#{settings['report_channel']}>" if settings["report_channel"] else "（未設定）"
         embed = discord.Embed(title="MessageWatch 設定", colour=discord.Colour.blurple())
-        embed.add_field(
-            name="狀態",
-            value=f"揭露=`v{settings['disclosure_version']}` · 報告頻道={report}",
-            inline=False,
-        )
+        accepted = int(settings["disclosure_version"])
+        # A bumped disclosure halts every channel, and a list that still says
+        # "監看中" while nothing is judged is the silent no-op this cog exists
+        # to avoid producing.
+        if accepted != DISCLOSURE_VERSION:
+            state = (
+                f"⚠️ **已暫停**：目前接受的是 `v{accepted}`，最新為 `v{DISCLOSURE_VERSION}`。"
+                f"在管理員重新執行 `[p]watch disclosure` 並接受之前，所有頻道都不會送出或判斷任何訊息。"
+            )
+        else:
+            state = f"揭露=`v{accepted}` · 報告頻道={report}"
+        embed.add_field(name="狀態", value=state, inline=False)
         embed.add_field(name="監看中的頻道", value=watched, inline=False)
         embed.add_field(
             name="門檻",
             value=(
                 f"詐騙=`{settings['scam_threshold']}` · 敵意=`{settings['hostile_threshold']}` · "
-                f"火藥味=`{settings['heat_threshold']}`"
+                f"火藥味=`{settings['heat_threshold']}`\n"
+                f"違規=`{settings['rule_threshold']}` · 條文信心下限=`{settings['rule_confidence']}`"
             ),
             inline=False,
         )
