@@ -405,7 +405,17 @@ def _bounded_token_count(value: Any) -> int | None:
         number = float(value)
     except OverflowError:
         return None
-    if number != number or number < 0:  # number != number is the NaN check
+    # `number != number` is the NaN check; the infinity check is separate and
+    # is the point. json.loads turns a bare `Infinity` into float("inf"), which
+    # is neither NaN nor negative, and `int(inf)` raises OverflowError -- from
+    # outside judge's JSON error handler, so it would escape a function that
+    # documents every failure as returning None and take the message event
+    # with it. This is the fourth conversion in this repo to meet the same
+    # shape: float(10**400), int("²"), json.loads recursion, and now int(inf).
+    # The pattern was copied from `_bounded_probability`, which returns a float
+    # and never converts, so copying it without the conversion carried the bug
+    # to a new place.
+    if number != number or number in (float("inf"), float("-inf")) or number < 0:
         return None
     return int(number)
 
@@ -848,12 +858,26 @@ class MessageWatch(commands.Cog):
                 # Not cached right now -- leave the delta in place and try
                 # again next tick rather than losing it.
                 continue
+            # Copied before the write, subtracted after it. Red's context
+            # manager awaits on entry and on exit, and `flush` or `on_message`
+            # can increment this same dict during either await -- popping the
+            # entry afterwards would discard whatever arrived in between and
+            # undercount silently, which is the worst way for a usage figure
+            # to be wrong.
+            flushed = dict(delta)
             async with self.config.guild(guild).usage() as usage:
-                for key, amount in delta.items():
+                for key, amount in flushed.items():
                     usage[key] = int(usage.get(key, 0)) + amount
                 if not usage.get("started_at"):
                     usage["started_at"] = time.time()
-            self._usage_delta.pop(guild_id, None)
+            # Subtract what was written rather than dropping the entry, so an
+            # increment that landed during the two awaits above survives to the
+            # next tick.
+            current = self._usage_delta[guild_id]
+            for key, amount in flushed.items():
+                current[key] = int(current.get(key, 0)) - amount
+            if not any(current.values()):
+                self._usage_delta.pop(guild_id, None)
 
     async def get_api_key(self) -> str | None:
         """The TypeSafe key from Red's shared token store, or None if unusable."""

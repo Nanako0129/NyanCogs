@@ -1938,6 +1938,83 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cog._usage_delta[1]["input_tokens"], 42)
 
 
+class TestUsageEdges(unittest.IsolatedAsyncioTestCase):
+    def test_an_infinite_token_count_is_discarded_not_converted(self) -> None:
+        # json.loads turns a bare `Infinity` into float("inf"), which is
+        # neither NaN nor negative, and int(inf) raises OverflowError from
+        # outside judge's JSON handler -- so it would escape a function that
+        # documents every failure as returning None and take the message event
+        # with it. Fourth conversion in this repo to meet this shape:
+        # float(10**400), int("²"), json.loads recursion, now int(inf).
+        for bad in (float("inf"), float("-inf"), float("nan"), -1, "500", True, None, 10**400):
+            with self.subTest(value=str(bad)[:12]):
+                self.assertIsNone(module._bounded_token_count(bad))
+        self.assertEqual(module._bounded_token_count(1234), 1234)
+        self.assertEqual(module._bounded_token_count(1234.0), 1234)
+
+    async def test_an_infinite_token_count_does_not_escape_judge(self) -> None:
+        # The guard is only worth having if the failure stays inside judge.
+        response = MagicMock()
+        response.status = 200
+        response.content.read = AsyncMock(
+            return_value=b'{"answers": {"any_scam": {"noul": 0.5}}, "usage": {"input_tokens": Infinity}}'
+        )
+        response_ctx = MagicMock()
+        response_ctx.__aenter__ = AsyncMock(return_value=response)
+        response_ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post.return_value = response_ctx
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=session)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
+            answers = await cog.judge([], "c", "k")
+        self.assertEqual(answers, {"any_scam": {"noul": 0.5}})
+        self.assertIsNone(cog._last_input_tokens)
+
+    async def test_a_flush_keeps_what_arrived_during_its_awaits(self) -> None:
+        # Red's context manager awaits on entry and on exit, and `flush` or
+        # `on_message` can increment the same dict in between. Popping the
+        # entry afterwards discarded those and undercounted silently.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        guild = MagicMock()
+        guild.id = 1
+        cog.bot.get_guild.return_value = guild
+        cog._usage_delta[1] = {"messages_queued": 10, "windows_judged": 2,
+                               "reports_sent": 0, "input_tokens": 3000}
+        stored: dict = {}
+
+        class Ctx:
+            async def __aenter__(self):
+                # A message arriving while Config is being read.
+                cog._usage_delta[1]["messages_queued"] += 5
+                return stored
+
+            async def __aexit__(self, *exc):
+                # And another while it is being written back.
+                cog._usage_delta[1]["input_tokens"] += 700
+                return False
+
+        scope = MagicMock()
+        scope.usage = MagicMock(return_value=Ctx())
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+
+        await cog._flush_usage()
+
+        self.assertEqual(stored["messages_queued"], 10)
+        self.assertEqual(stored["input_tokens"], 3000)
+        # The increments that landed mid-flush are still pending, not lost.
+        self.assertEqual(cog._usage_delta[1]["messages_queued"], 5)
+        self.assertEqual(cog._usage_delta[1]["input_tokens"], 700)
+
+
 class TestDashboard(unittest.IsolatedAsyncioTestCase):
     """`[p]watch dashboard` posts a live embed the sweep keeps current. These
     pin the two failure modes a message the sweep edits forever invites:
