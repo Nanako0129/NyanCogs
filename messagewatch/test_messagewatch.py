@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import pathlib
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1137,6 +1139,74 @@ class TestActionPermissions(unittest.IsolatedAsyncioTestCase):
         await MessageWatch.on_interaction(self.cog(), interaction)
         self.assertIn("找不到這位成員", interaction.response.send_message.await_args.args[0])
         interaction.response.send_modal.assert_not_awaited()
+
+
+class TestModlogAndRole(unittest.IsolatedAsyncioTestCase):
+    async def test_every_case_type_the_cog_uses_is_registered(self) -> None:
+        # create_case raises for an unregistered action type and _case swallows
+        # it, so without registration every action succeeds and none is logged
+        # -- while the disclosure, the data statement and the README all promise
+        # each one is recorded. Measured: Red raises
+        # "<name> is not a valid action type."
+        cog = object.__new__(MessageWatch)
+        registered = []
+        with patch("messagewatch.messagewatch.modlog.register_casetype",
+                   new=AsyncMock(side_effect=lambda **kw: registered.append(kw["name"]))):
+            await cog.cog_load()
+        self.assertEqual(sorted(registered), sorted(c["name"] for c in module.CASE_TYPES))
+
+        # Every name passed to _case has to be one of them.
+        source = (pathlib.Path(__file__).parent / "messagewatch.py").read_text(encoding="utf-8")
+        used = set(re.findall(r'self\._case\(\s*[^,]+,\s*"([a-z_]+)"', source))
+        self.assertTrue(used)
+        self.assertEqual(used - {c["name"] for c in module.CASE_TYPES}, set())
+
+    async def test_an_already_registered_case_type_is_not_fatal(self) -> None:
+        cog = object.__new__(MessageWatch)
+        with patch("messagewatch.messagewatch.modlog.register_casetype",
+                   new=AsyncMock(side_effect=RuntimeError("already registered"))):
+            await cog.cog_load()  # must not raise
+
+    async def test_the_role_comes_from_the_watched_channel_not_the_report_channel(self) -> None:
+        # `[p]watch action role` stores it on the watched channel; the report
+        # can be routed elsewhere entirely. Reading the interaction's channel
+        # found no role in any configuration.
+        cog = object.__new__(MessageWatch)
+        cog.bot = MagicMock()
+        scopes = {}
+
+        def channel_from_id(cid):
+            scope = MagicMock()
+            scope.all = AsyncMock(
+                return_value={**module.DEFAULT_CHANNEL,
+                              "action_role": 777 if cid == 5 else 0}
+            )
+            scopes[cid] = scope
+            return scope
+
+        cog.config = MagicMock()
+        cog.config.channel_from_id.side_effect = channel_from_id
+        cog._case = AsyncMock()
+        cog._audit = AsyncMock()
+
+        role = MagicMock()
+        role.name = "樹洞黑名單"
+        guild = MagicMock()
+        guild.get_role.return_value = role
+        member = MagicMock()
+        member.add_roles = AsyncMock()
+        member.mention = "<@42>"
+        interaction = MagicMock()
+        interaction.channel_id = 999  # the report channel, not the watched one
+        interaction.user = SimpleNamespace(id=7, mention="<@7>")
+        interaction.response.send_message = AsyncMock()
+
+        await cog._add_role(interaction, guild, member, 5)
+
+        guild.get_role.assert_called_once_with(777)
+        member.add_roles.assert_awaited_once()
+        self.assertIn(5, scopes)
+        self.assertNotIn(999, scopes)
 
 
 class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):

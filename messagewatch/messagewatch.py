@@ -111,6 +111,19 @@ ACTIONS: dict[str, tuple[str, str, str | None]] = {
 DEFAULT_ACTIONS = ["ok", "no"]
 MAX_TIMEOUT_MINUTES = 40_320  # Discord's own ceiling for a timeout: 28 days.
 
+# Registered in cog_load. Red raises for an unregistered action type, so an
+# action taken through a button would go unrecorded while four documents say it
+# is recorded. The names are this cog's own, prefixed, so a rename in Red core
+# cannot silently change what these cases mean.
+CASE_TYPES = [
+    {"name": "messagewatch_timeout", "default_setting": True,
+     "image": "\N{SPEAKER WITH CANCELLATION STROKE}", "case_str": "MessageWatch 禁言"},
+    {"name": "messagewatch_delete", "default_setting": True,
+     "image": "\N{WASTEBASKET}", "case_str": "MessageWatch 刪除訊息"},
+    {"name": "messagewatch_role", "default_setting": True,
+     "image": "\N{NO ENTRY SIGN}", "case_str": "MessageWatch 加上身分組"},
+]
+
 DEFAULT_CHANNEL = {
     "rules": [],
     "purpose": "",
@@ -580,6 +593,28 @@ class MessageWatch(commands.Cog):
         self._last_judged: dict[int, float] = {}
         self._last_error: dict[int, tuple[float, str]] = {}
 
+    async def cog_load(self) -> None:
+        """Register the case types this cog records under.
+
+        `modlog.create_case` raises ValueError for a type nobody registered, and
+        `_case` catches it, so without this every action would succeed and none
+        would be logged -- while the disclosure, the data statement and the
+        README all promise that each one is recorded under the moderator's name.
+        A false sentence in four places, produced by a silent except.
+        """
+        for case in CASE_TYPES:
+            try:
+                await modlog.register_casetype(**case)
+            except RuntimeError:
+                # Already registered, by Red or by an earlier load of this cog.
+                pass
+            except Exception as error:
+                log.warning(
+                    "messagewatch: could not register case type %s (%s)",
+                    case["name"],
+                    type(error).__name__,
+                )
+
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
         """Drop any pending message this user wrote that has not been sent yet."""
         for queue in self._pending.values():
@@ -1036,7 +1071,7 @@ class MessageWatch(commands.Cog):
             await interaction.response.send_message("禁言失敗。", ephemeral=True)
             return
         await interaction.response.send_message(f"已禁言 {minutes} 分鐘。", ephemeral=True)
-        await self._case(member.guild, "timeout", member, interaction.user, reason)
+        await self._case(member.guild, "messagewatch_timeout", member, interaction.user, reason)
         await self._audit(
             interaction, f"{interaction.user.mention} 禁言 {member.mention} {minutes} 分鐘"
         )
@@ -1086,7 +1121,7 @@ class MessageWatch(commands.Cog):
             await interaction.response.send_modal(TimeoutModal(self, target))
             return
         if action == "role":
-            await self._add_role(interaction, guild, target)
+            await self._add_role(interaction, guild, target, channel_id)
 
     async def _record_mark(
         self, interaction: discord.Interaction, guild: discord.Guild, kind: str, action: str
@@ -1124,13 +1159,22 @@ class MessageWatch(commands.Cog):
             await interaction.response.send_message("刪除失敗。", ephemeral=True)
             return
         await interaction.response.send_message("已刪除該訊息。", ephemeral=True)
-        await self._case(guild, "delete", message.author, interaction.user, "MessageWatch")
+        await self._case(guild, "messagewatch_delete", message.author, interaction.user, "MessageWatch")
         await self._audit(interaction, f"{interaction.user.mention} 刪除了該訊息")
 
     async def _add_role(
-        self, interaction: discord.Interaction, guild: discord.Guild, member: discord.Member
+        self,
+        interaction: discord.Interaction,
+        guild: discord.Guild,
+        member: discord.Member,
+        channel_id: int,
     ) -> None:
-        channel_settings = await self.config.channel_from_id(interaction.channel_id).all()
+        # The watched channel's id, carried in the custom_id -- not
+        # `interaction.channel_id`, which is wherever the report was posted.
+        # With `[p]watch route` those are different channels, and without it the
+        # report still sits in the moderator channel, so reading the role from
+        # the interaction's channel never found one.
+        channel_settings = await self.config.channel_from_id(channel_id).all()
         role_id = int(channel_settings.get("action_role") or 0)
         role = guild.get_role(role_id) if role_id else None
         if role is None:
