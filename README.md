@@ -2,11 +2,13 @@
 
 Cogs for [Red Discord Bot](https://github.com/Cog-Creators/Red-DiscordBot).
 
-Design notes live in [`docs/`](docs/): why MessageWatch is shaped the way it is
-([架構決策](docs/messagewatch-design.md)) and how its judgements are built on
-TypeSafe Jev, with the numbers each threshold came from
-([Jev 導入紀錄](docs/jev-integration.md)). Both are written in Traditional
-Chinese.
+Design notes live in [`docs/`](docs/), in English and Traditional Chinese: why
+MessageWatch is shaped the way it is
+([design decisions](docs/messagewatch-design.md) ·
+[架構決策](docs/messagewatch-design.zh-TW.md)) and how its judgements are built
+on TypeSafe Jev, with the numbers each threshold came from
+([Jev integration](docs/jev-integration.md) ·
+[Jev 導入紀錄](docs/jev-integration.zh-TW.md)).
 
 ## ChannelSummary
 
@@ -131,16 +133,17 @@ MessageWatch reports likely scam messages and hostile exchanges to a moderator
 channel. It judges short rolling windows of recent messages with
 [TypeSafe Jev](https://docs.typesafe.ai/), a model that returns calibrated
 probabilities rather than text. Its design rationale is in
-[`docs/messagewatch-design.md`](docs/messagewatch-design.md), and the question
+[`docs/messagewatch-design.md`](docs/messagewatch-design.md) and the question
 design and measurements behind every threshold are in
-[`docs/jev-integration.md`](docs/jev-integration.md).
+[`docs/jev-integration.md`](docs/jev-integration.md); both have a
+[繁體中文](docs/messagewatch-design.zh-TW.md) edition.
 
 It never deletes, edits, reacts to, or punishes
-anything on its own. A report can carry buttons, and only a moderator holding
-the matching Discord permission can press one: marking a report right or wrong
-records a count, while deleting a message, timing a member out or adding a role
-happen only on a press and are recorded in the modlog under that moderator's
-name. Which buttons a channel's reports carry is set per channel and defaults to
+anything on its own. A report can carry buttons. Marking a report right or wrong
+records a count and needs no permission beyond reaching the moderator channel;
+deleting a message, timing a member out and adding a role each require the
+person pressing to hold the matching Discord permission themselves, happen only
+on that press, and are recorded in the modlog under their name. Which buttons a channel's reports carry is set per channel and defaults to
 the two marks.
 
 ```text
@@ -163,8 +166,10 @@ where this export costs the most: what people write there is what they expect
 will not be repeated. Discord user IDs, display names and
 avatars are never sent; authors become labels such as `u1` generated per
 request and never stored. Attachments, embeds and links are
-not fetched or resolved. `[p]watch disable` stops a channel immediately and
-drops anything pending for it.
+not fetched or resolved. `[p]watch disable` drops everything queued for a channel
+immediately and stops it being read again. It does not cancel a report already
+in flight: it takes the same channel lock `flush` holds, so it waits for a flush
+that has already started, and that flush still delivers its report.
 
 Which buttons a report carries is per channel, and defaults to the two marks:
 

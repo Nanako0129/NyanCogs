@@ -1,165 +1,218 @@
-# MessageWatch 架構決策
+**English** | [繁體中文](messagewatch-design.zh-TW.md)
 
-這份文件記錄 MessageWatch 為什麼長成現在的形狀。它不是使用說明——那在
-[README](../README.md)——而是設計時做過的取捨，以及每個取捨背後實際發生過的事。
+# MessageWatch: design decisions
 
-Jev 的問題設計與實測另見 [Jev 導入紀錄](jev-integration.md)。
+This records why MessageWatch is shaped the way it is. It is not usage
+documentation — that is in the [README](../README.md) — but the trade-offs made
+while building it, and what forced each one.
+
+The question design and measurements behind the model side are in
+[Jev integration](jev-integration.md).
 
 ---
 
-## 1. 它做什麼、刻意不做什麼
+## 1. What it does, and what it deliberately does not
 
-MessageWatch 讀被啟用頻道裡的近期訊息，判斷「這段對話是否需要人看一眼」，然後把
-報告送進管理頻道。
+MessageWatch reads recent messages in an enabled channel, judges whether the
+exchange needs a person to look at it, and posts a report in a moderator
+channel.
 
-**它自己不處置。** 沒有自動刪除、自動禁言、自動提醒。報告上可以掛按鈕，但每顆按鈕
-都要管理員按下去，而且按下去的人必須自己持有對應的 Discord 權限。
+It never acts on its own. No automatic deletion, timeout, or reminder. A report
+can carry buttons, and every button needs someone to press it. The two mark
+buttons record a count and ask for no permission beyond reaching the moderator
+channel; the three that change something — deleting a message, timing a member
+out, adding a role — each require the person pressing to hold the matching
+Discord permission themselves.
 
-這條界線不是保守，是因為同一個 repo 裡曾經有一條看起來完整、實際什麼都不做的處罰
-路徑（舊的 `phishingchecker`：它的 ban/kick 分支從來沒有真的呼叫 `ban()`／
-`kick()`，而且用了 Red 3.5 已經不存在的 `modlog.case_create`）。一個會自己處置的
-機器人，錯誤的形狀是「安靜地對人做了什麼」；一個只會報告的機器人，錯誤的形狀是
-「安靜地什麼都沒報」。後者可以被人發現，前者不行。
+This is not caution for its own sake. The same repository used to contain a
+punishment path that looked complete and did nothing: the old `phishingchecker`
+called `modlog.case_create`, which does not exist in Red 3.5 (only `create_case`
+does), and neither its ban branch nor its kick branch ever actually called
+`ban()` or `kick()`. An automated punishment bot fails by quietly acting on
+someone. A reporting bot fails by quietly reporting nothing — a failure a
+person can notice.
 
-## 2. 判斷的單位是視窗，不是訊息
+## 2. The unit of judgement is a window, not a message
 
-敵意、火藥味、「在勸人不要難過」這些性質，都是**一段交換**的性質，單則訊息承載不
-了。所以 cog 不逐則判斷，而是累積一個視窗（預設 `window_size = 8`）再送出去。
+Hostility, heat, "someone is being lectured at when they wanted to be heard" —
+these are properties of an exchange. A single message cannot carry them. So
+the cog accumulates a window (`window_size`, 8 by default) before sending
+anything.
 
-- 滿視窗取走後**保留一半重疊**（8 則取走、留 4 則）。沒有重疊的話，一段對話被切在
-  中間的兩半永遠不會一起被看到。
-- 短視窗（閒置掃描取的）**整段取走不重疊**。後面已經沒有訊息可以讓重疊接上了，留
-  一半只會讓下一次掃描重判同一段尾巴。
-- 單則訊息不判。`MIN_PARTIAL_WINDOW = 2` 是這件事的地板。
+- A full window is taken with half of it left behind (take 8, keep 4).
+  Without the overlap, a conversation cut across the boundary is never seen
+  whole.
+- A short window, the kind the idle sweep takes, is consumed entirely. There
+  is no later message for an overlap to join it to, and leaving half behind only
+  makes the next sweep re-judge the same tail.
+- A lone message is never judged; `MIN_PARTIAL_WINDOW = 2` is the floor.
 
-## 3. 湊不滿視窗的頻道
+## 3. Channels that never fill a window
 
-最初的版本只有「滿 8 則就判」。這代表一個安靜的頻道——一則抒發、兩則回應，然後沒
-了——**永遠不會被判**。那正是這個 cog 最該看的頻道。
+The first version only judged at 8 messages. That meant a quiet channel — one
+confession, two replies, then nothing — was never judged at all. That is
+the exact kind of channel this cog was written to watch.
 
-解法是一個 `tasks.loop(seconds=60)` 的閒置掃描：佇列裡累積到 `MIN_PARTIAL_WINDOW`
-（2 則）以上、而且最後一則已經超過該 guild 的 `idle_seconds`（預設 600 秒）沒有新
-訊息，就以 `partial=True` 送出判斷。
+The answer is a `tasks.loop(seconds=60)` idle sweep: once a queue holds at least
+`MIN_PARTIAL_WINDOW` (2) messages and the newest one is older than the guild's
+`idle_seconds` (600 by default), it is sent with `partial=True`.
 
-所以實際行為是：
+So the real behaviour is:
 
-| 情況 | 何時被判 |
+| Situation | When it is judged |
 |---|---|
-| 8 則以上 | 立刻 |
-| 2–7 則，然後安靜 10 分鐘 | 安靜滿 10 分鐘後的下一次掃描（最多再等 60 秒） |
-| 只有 1 則，之後再也沒人說話 | 不判（見第 2 節：一則不成交換） |
+| 8 messages or more | Immediately |
+| 2–7 messages, then silence | Once the silence reaches 10 minutes, at the next sweep (up to 60 seconds later) |
+| Exactly 1 message, ever | Never — see §2, one message is not an exchange |
 
-不到 `MIN_PARTIAL_WINDOW` 的佇列在掃描裡是 `continue` 掉的，不是進 `flush` 再被
-`_take_window` 擋回來——否則每分鐘都會在診斷面板上替這個頻道記一次
-`no_api_key`／`no_report_channel`，在一個專門用來分辨「真的有問題」和「只是安靜」
-的介面裡製造假問題。
+A queue below `MIN_PARTIAL_WINDOW` is skipped in the sweep rather than allowed
+into `flush` and turned away by `_take_window`. Otherwise it would record
+`no_api_key` or `no_report_channel` against that channel every minute — noise
+on a diagnostic surface meant to separate real problems from quiet channels.
 
-掃描同時是使用量計數落盤與儀表板更新的地方：它本來就每 60 秒跑一次，這兩件事搭
-順風車不額外花成本。
+The sweep is also where usage counters are written to disk and the dashboard
+message is refreshed. It already runs every 60 seconds; both ride along without
+extra timer overhead.
 
-## 4. 幾乎所有東西都是逐頻道的
+## 4. Almost everything is per-channel
 
-啟用、規則、頻道用途說明、違規門檻、報告要送去哪、報告掛哪些按鈕、按鈕加哪個身分
-組、要不要讀圖——全部 per-channel。
+Enablement, rules, the channel's purpose note, the violation threshold, where
+reports are routed, which buttons a report carries, which role the role button
+adds, whether images are read — all per-channel.
 
-這個形狀是樹洞頻道逼出來的。它的版規禁止的是心靈雞湯、下指導棋、「這我有經驗」、
-揣測動機、替人圓場。這些在詐騙／敵意偵測器眼中全部接近 0 分，而它的處置也不是刪除
-或禁言，而是掛一個身分組讓人看不到頻道。同一套規則放到一般頻道會荒謬，同一組按鈕
-放到一般頻道也沒有意義。
+This shape was forced by one channel. The venting channel's rules forbid
+inspirational platitudes, unsolicited advice, "I've been through this too",
+speculation about motives, and smoothing things over on someone's behalf. Every
+one of those scores near zero to a scam or hostility detector, and its
+disposition is not deletion or a timeout but adding a role that hides the channel
+from the person. The same ruleset in a general channel would be absurd, and so
+would the same buttons.
 
-門檻的繼承規則是 `channel_value or guild_value`：per-channel 存 `0.0` 表示沿用
-guild 值，不是表示「門檻為零」。
+Threshold inheritance is `channel_value or guild_value`: a per-channel `0.0`
+means *inherit*, not *threshold of zero*.
 
-## 5. 揭露契約與版本
+## 5. The disclosure contract and its version
 
-`DISCLOSURE_VERSION` 現在是 4。guild 接受過的版本不等於現在的版本時，**整個 cog 對
-該 guild 停止送出任何東西**，直到管理員重新接受。
+`DISCLOSURE_VERSION` is currently 4. When the version a guild accepted does not
+match the current one, the cog stops sending anything at all for that guild
+until a manager accepts again.
 
-每次「離開 Discord 的東西變了」就要 bump：加入版規與頻道用途（成員寫不進去，但那是
-管理員寫的文字）、加入按鈕與處置、加入影像判讀。這條規則的代價要一起處理：bump 之
-後所有 guild 會靜默停止，所以 `[p]watch show` 必須把「因為揭露版本過期而停擺」明白
-顯示出來，否則這就是這個專案最在意的那種「安靜地什麼都沒做」。
+It is bumped every time what leaves Discord changes: adding rules and the purpose
+note (members cannot write those, but they are still text leaving the platform),
+adding buttons and dispositions, adding image reading. The cost of that rule has
+to be handled with it — after a bump every guild silently stops, so
+`[p]watch show` must state plainly that it is stopped because the disclosure
+version is stale. A cog that quietly does nothing is the failure this project
+guards against hardest.
 
-契約文字寫在四個地方——`DISCLOSURE_TEXT`、`info.json` 的
-`end_user_data_statement`、README、報告 embed 的頁尾。**四處必須一起改**，而且有一
-個測試把 `DEFAULT_CHANNEL` 的欄位集合釘在一張說明表上：新增任何一個會被儲存的欄位
-而沒有在揭露文裡點名它，測試就會紅。
+The contract text is stated in four places — `DISCLOSURE_TEXT`, the
+`end_user_data_statement` in `info.json`, the README, and the report embed's
+footer. All four move together, and a test pins the field set of
+`DEFAULT_CHANNEL` against a phrase map, so adding any stored field without naming
+it in the disclosure turns the suite red.
 
-## 6. 併發：一把鎖，從頭抓到尾
+## 6. Concurrency: one lock, held end to end
 
-`flush()` 整段都持有 `self._locks[channel.id]`。早期版本只在取視窗時抓鎖，結果是
-「取走視窗」和「送出報告」之間存在一個窗口，`[p]watch disable` 可以在那個窗口裡關掉
-頻道，而已經取走的訊息仍然會被送出去。
+`flush()` holds `self._locks[channel.id]` for its entire body. An earlier version
+took the lock only while lifting the window, which left a gap between taking the
+messages and sending the report — and `[p]watch disable` could land in that gap
+while the messages it had just disabled went out anyway.
 
-把鎖拉到整段之後，那個狀態就無法被表示出來了。送出前還有一次 `watched_channels` 的
-重讀，在鎖裡面——關掉頻道的指令也要拿同一把鎖，所以兩者不會交錯。
+Holding the lock across the whole body closes that race. There is
+still a re-read of `watched_channels` before sending, inside the lock; the
+disable command takes the same lock, so the two cannot interleave.
 
-## 7. 外部輸出一律當成不可信
+## 7. Provider output is never trusted
 
-provider 回來的 JSON 全部經過 `_bounded_probability` / `_bounded_score` /
-`_bounded_index` / `_bounded_token_count` 轉換。這不是防禦性程式設計的裝飾，是因為
-同一類缺陷在這個 cog 裡出現過四次，每次形狀不同：
+Everything that comes back from a provider goes through `_bounded_probability`,
+`_bounded_score`, `_bounded_index` or `_bounded_token_count`. This is not
+theoretical caution — the same class of defect appeared four times in this
+cog, in a different shape each time:
 
 - `float(10**400)` → `OverflowError`
-- `int("²")` → `ValueError`（是的，`"²"` 是 `str.isdigit()` 為真的字元）
-- 深度巢狀 JSON → `json.loads` 的 `RecursionError`
+- `int("²")` → `ValueError` (yes, `"²".isdigit()` is `True`)
+- Deeply nested JSON → `RecursionError` from `json.loads`
 - `int(float("inf"))` → `OverflowError`
 
-範圍檢查一律寫 `if not low <= parsed <= high`，不寫
-`if parsed < low or parsed > high`。後者放 NaN 過關（兩個比較都是 False），而一個
-NaN 門檻會讓 `probability < threshold` 恆為 False，也就是全部放行。
+Range checks are always written `if not low <= parsed <= high`, never
+`if parsed < low or parsed > high`. The second form lets NaN through — both
+comparisons are false — and a NaN threshold makes `probability < threshold`
+false for everything, which is to say it passes everything.
 
-## 8. 處置在人手上
+## 8. Disposition stays in human hands
 
-報告上的按鈕是 persistent view：`custom_id` 自己編碼成
-`mw:<action>:<kind>:<channel>:<message>:<author>`，最壞情況 69 字元。**discord.py 不
-會檢查 100 字元上限**（實測過），只有 Discord API 會擋，所以長度要自己界定。
-`cog_load` 用 `bot.add_view` 重新註冊，重啟後舊報告的按鈕仍然可用。
+Report buttons are a persistent view. The `custom_id` encodes
+`mw:<action>:<kind>:<channel>:<message>:<author>`, 69 characters at worst.
+discord.py does not enforce the 100-character limit (measured); only the
+Discord API rejects it, so the bound has to be kept by hand. `cog_load`
+re-registers the view with `bot.add_view`, so buttons on old reports still work
+after a restart.
 
-權限在每個 callback 裡，用**按下按鈕的人**的 `guild_permissions` 判定
-（`manage_messages` / `moderate_members` / `manage_roles`），不是用「看得到管理頻道」
-判定。每個動作寫進 Red modlog，掛在那位管理員名下。
+The three state-changing actions carry a required permission in the `ACTIONS`
+table; the two marks carry `None`. Where one is required, the check lives in the
+callback and reads the `guild_permissions` of the person who pressed the button
+(`manage_messages` / `moderate_members` / `manage_roles`), not "can see the
+moderator channel". Each action is written to the Red modlog under that
+moderator's name.
 
-## 9. 存了什麼
+## 9. What is stored
 
-存：guild 設定、報告頻道 ID、被啟用的頻道 ID 集合、per-channel 的規則與用途說明、
-按鈕清單、身分組 ID、門檻、以及**每條規則被標為誤判／屬實的次數**（只有計數）。
+Stored: guild settings, the report channel ID, the set of enabled channel IDs,
+per-channel rules and purpose note, the button list, the role ID, thresholds, and
+per-rule counts of how moderators marked reports. Counts only.
 
-不存：訊息內容、模型回應、任何判斷結果。
+Not stored: message content, model responses, any judgement.
 
-所以「誤判率」這個資料是可以累積的，而它累積的只是精確率。**召回率仍然量不到**——
-漏判需要真實漏抓的案例，按鈕看不到那些。目前所有門檻都來自合成案例的實測，這一點沒
-有被這幾個 PR 改變，寫在這裡是為了不讓它被忘掉。
+So false-positive data accumulates — and what accumulates is precision only.
+**Recall is still unmeasured.** A missed case needs a real missed case, and the
+buttons cannot see those. Every threshold in use came from measurements on
+synthetic cases. None of the recent work changed that, and it is written here so
+it does not get forgotten.
 
-## 10. 影像輔助（image aux）
+## 10. The image aux
 
-Jev 不讀圖。這裡最常見的詐騙形狀恰好是一張**只有截圖、沒有文字**的訊息，所以外掛一
-個多模態模型，但它只做一件事：**把圖裡的字逐字抄出來**。
+Jev does not read images. The commonest scam shape here is a message that is
+a screenshot and nothing else, so a multimodal model is bolted on to do one
+thing: transcribe the characters in the image, verbatim.
 
-不做「描述這張圖」。描述是開放式生成，錯了沒有人能對照圖片檢查；逐字轉錄可以，而且
-轉錄結果會直接顯示在報告裡，讓管理員自己比對。轉錄文字接進既有的詐騙判斷，不另立
-規則。
+Not "describe this image". A description is open-ended generation whose errors
+nobody can check against the picture; a verbatim transcription can be checked,
+and it is shown in the report so a moderator can do that. The transcription then
+feeds the scam judgement that already exists rather than getting a rule of its
+own — which means it travels twice, to the vision provider and on to TypeSafe,
+and the disclosure says so.
 
-- 送出前降採樣到長邊 1536 px 並重新編碼，順帶丟掉 EXIF（含 GPS）。
-- 每視窗最多 4 張，單張上限 8 MB／4000 萬像素。
-- 依附件 id 快取最多 256 筆，只在記憶體，`cog_unload` 與刪除資料請求都會整個丟掉
-  （快取沒有作者欄位，無法只刪某個人的，所以誠實的答案是全刪）。
-- **沒有預設模型**。哪一個多模態模型讀中文截圖最準還沒量過，隨便填一個就是把猜測
-  偽裝成預設值，所以未設定時這條路徑什麼都不送。
+- Downscaled to a 1536 px long edge and re-encoded before sending, which
+  discards EXIF including GPS.
+- At most 4 images per window; 8 MB and 40 megapixels per image.
+- Cached by attachment id, at most 256 entries, in memory only. `cog_unload` and
+  a data deletion request both drop the whole cache (it has no author field, so
+  it cannot be filtered to one person, and dropping all of it is the honest
+  answer).
+- **There is no default model.** Which multimodal model reads CJK screenshots
+  best has not been measured, and picking one without data would just be guessing,
+  so this path sends nothing until it is configured.
 
-`[p]watch vision` 和 `[p]watch set` 分開，因為後者那張表是純數值的（每一項都帶範
-圍），而 api_base 與 model 是自由字串；硬塞進去只會得到一個沒有意義的範圍檢查。
-`api_base` 必須是 `https://`——圖片是從這條線離開 Discord 的。
+The endpoint and model live in global config and only the bot owner can write
+them: the API key they spend is bot-wide and the owner's, so an administrator of
+any guild the bot has joined who could aim the endpoint would be able to send
+that bearer token, and every image, to a host of their own. `[p]watch vision` is
+separate from `[p]watch set` because that table is numeric — every entry carries
+a range — while these two are free strings, and forcing them in would have meant
+a range check that means nothing. `api_base` must be `https://`: the image
+leaves Discord over it.
 
-## 11. 成本可見性
+## 11. Cost visibility
 
-使用量（input tokens、判斷過的視窗數）累積在記憶體，隨閒置掃描每 60 秒落盤一次，
-`cog_unload` 再落一次，所以重啟最多損失最後一個 tick 的尾巴。管理員可以用
-`[p]watch dashboard` 在任一頻道釘一則會定期更新的 embed。
+Usage — input tokens and windows judged — accumulates in memory, is written to
+disk by the idle sweep every 60 seconds, and once more in `cog_unload`, so a
+restart loses at most the tail since the last tick. `[p]watch dashboard` pins an
+embed in any channel that refreshes on the same tick.
 
-## 12. 這裡沒有解決的
+## 12. What is not solved here
 
-- **召回率**（見第 9 節）。
-- 影像模型的選擇還沒實測。
-- `flush` 已經進入 discord.py dispatch task 之後，`cog_unload` 取消不了它——那些
-  task 不屬於這個 cog，所以卸載之後仍然可能再吐出一份報告。
+- **Recall** (see §9).
+- No vision model has been measured.
+- Once `flush` is inside a discord.py dispatch task, `cog_unload` cannot cancel
+  it — those tasks do not belong to the cog — so an unloaded cog can still emit
+  one more report.
