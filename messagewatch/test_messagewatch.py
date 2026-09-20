@@ -416,7 +416,7 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFlush(unittest.IsolatedAsyncioTestCase):
-    def cog(self, *, answers, rules=None, route=0, **overrides):
+    def cog(self, *, answers, rules=None, route=0, channel_threshold=0.0, **overrides):
         cog = object.__new__(MessageWatch)
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "report_channel": 77, "watched_channels": [5], "window_size": 3,
@@ -428,7 +428,7 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         channel_scope = MagicMock()
         channel_scope.all = AsyncMock(
             return_value={**module.DEFAULT_CHANNEL, "rules": list(rules or ()),
-                          "report_channel": route or 0}
+                          "report_channel": route or 0, "rule_threshold": channel_threshold}
         )
         cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
@@ -695,6 +695,51 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         await cog.flush(channel)
         cog.judge.assert_not_awaited()
         self.assertEqual(len(cog._pending[5]), 3)
+
+    # Rules are per-channel but rule_threshold was per-guild, and measured
+    # 2026-09-20 the separation between violating and clean messages differs
+    # by ruleset -- see DEFAULT_CHANNEL's comment. These four pin the effective
+    # value flush() actually judges against.
+    RULE_ANSWERS = {
+        "any_scam": {"noul": 0.01}, "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1},
+        "any_violation": {"noul": 0.75}, "meta_index": {"choice": "none"},
+        "which_rule": {"choice": "1", "confidence": 0.9}, "rule_index": {"choice": "0"},
+    }
+
+    async def test_a_channel_with_no_override_uses_the_guild_value(self) -> None:
+        # No channel override (0.0, the inherit sentinel) and a guild threshold
+        # of 0.5: the violation probability is 0.75, above the guild value, so
+        # this only reports if the guild value is actually what's compared.
+        cog = self.cog(
+            answers=self.RULE_ANSWERS, rules=["dummy"], channel_threshold=0.0, rule_threshold=0.5
+        )
+        channel, report = self.channel()
+        await cog.flush(channel)
+        report.send.assert_awaited_once()
+
+    async def test_a_channel_override_wins_and_the_guild_value_is_ignored(self) -> None:
+        # Channel override 0.95 against a guild threshold of 0.5: probability
+        # 0.75 clears the guild value but not the channel's, so a report here
+        # would mean the guild value was used instead of the channel's.
+        cog = self.cog(
+            answers=self.RULE_ANSWERS, rules=["dummy"], channel_threshold=0.95, rule_threshold=0.5
+        )
+        channel, report = self.channel()
+        await cog.flush(channel)
+        report.send.assert_not_awaited()
+
+    async def test_an_override_of_zero_inherits_rather_than_reporting_everything(self) -> None:
+        # The one that matters most: `channel_value or guild_value` treats 0.0
+        # as "inherit" correctly, but `if channel_value is not None` treats it
+        # as a real override of 0.0, under which every probability -- 0.01
+        # included -- clears the threshold and every window gets reported.
+        answers = {**self.RULE_ANSWERS, "any_violation": {"noul": 0.01}}
+        cog = self.cog(
+            answers=answers, rules=["dummy"], channel_threshold=0.0, rule_threshold=0.99
+        )
+        channel, report = self.channel()
+        await cog.flush(channel)
+        report.send.assert_not_awaited()
 
 
 class TestRules(unittest.TestCase):
@@ -1031,6 +1076,62 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
         await MessageWatch.watch_rule_add.callback(cog, ctx, channel, text="再一條")
         self.assertEqual(len(full), module.MAX_RULES)
         self.assertIn(str(module.MAX_RULES), ctx.send.await_args.args[0])
+
+    @staticmethod
+    def threshold_cog(channel_threshold, guild_threshold=module.DEFAULT_RULE_THRESHOLD):
+        cog = object.__new__(MessageWatch)
+        channel_scope = MagicMock()
+        channel_scope.all = AsyncMock(
+            return_value={**module.DEFAULT_CHANNEL, "rule_threshold": channel_threshold}
+        )
+        channel_scope.rule_threshold = MagicMock()
+        channel_scope.rule_threshold.set = AsyncMock()
+        guild_scope = MagicMock()
+        guild_scope.all = AsyncMock(return_value={**DEFAULT_GUILD, "rule_threshold": guild_threshold})
+        cog.config = MagicMock()
+        cog.config.channel.return_value = channel_scope
+        cog.config.guild.return_value = guild_scope
+        return cog
+
+    async def test_the_threshold_command_rejects_a_value_outside_0_to_1(self) -> None:
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+        for raw in ("1.5", "-0.1", "nan"):
+            with self.subTest(raw=raw):
+                cog = self.threshold_cog(0.0)
+                ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+                await MessageWatch.watch_rule_threshold.callback(cog, ctx, channel, raw)
+                cog.config.channel.return_value.rule_threshold.set.assert_not_awaited()
+                self.assertIn("必須介於", ctx.send.await_args.args[0])
+
+    async def test_the_threshold_command_stores_a_valid_value(self) -> None:
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+        cog = self.threshold_cog(0.0)
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_threshold.callback(cog, ctx, channel, "0.5")
+        cog.config.channel.return_value.rule_threshold.set.assert_awaited_once_with(0.5)
+        self.assertIn("0.5", ctx.send.await_args.args[0])
+
+    async def test_rule_list_states_the_effective_threshold_and_whether_it_is_inherited(
+        self,
+    ) -> None:
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+
+        # Inherited: the channel value is the sentinel, so the embed must show
+        # the guild's value with an "inherited" label.
+        cog = self.threshold_cog(0.0, guild_threshold=0.5)
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_list.callback(cog, ctx, channel)
+        rendered = json.dumps(ctx.send.await_args.kwargs["embed"].to_dict(), ensure_ascii=False)
+        self.assertIn("0.5", rendered)
+        self.assertIn("沿用伺服器設定", rendered)
+
+        # Overridden: the channel's own value shows, not the guild's.
+        cog = self.threshold_cog(0.9, guild_threshold=0.5)
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_list.callback(cog, ctx, channel)
+        rendered = json.dumps(ctx.send.await_args.kwargs["embed"].to_dict(), ensure_ascii=False)
+        self.assertIn("0.9", rendered)
+        self.assertIn("此頻道獨立設定", rendered)
 
 
 class TestActionAddressing(unittest.TestCase):
@@ -1854,6 +1955,7 @@ class TestDataStatement(unittest.TestCase):
             "report_channel": "the report-route channel ID set by [p]watch route",
             "actions": "the list of report buttons",
             "action_role": "the role ID the role button adds",
+            "rule_threshold": "a per-channel rule-violation threshold set by [p]watch rule threshold",
         }
         self.assertEqual(set(module.DEFAULT_CHANNEL), set(phrases))
         statement = self.statement()
