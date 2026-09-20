@@ -144,9 +144,11 @@ RULE_REASON_CHARS = 60
 
 # Buttons are addressed entirely through their own custom_id, so a report stays
 # usable after a restart with no view registration to keep in step. Discord caps
-# a custom_id at 100 characters: "mw" + action + kind + three snowflakes + five
-# separators is 71 at the widest, which CUSTOM_ID_LIMIT asserts at build time
-# rather than leaving to a rejected message nobody sees.
+# a custom_id at 100 characters: "mw" + the longest action + kind + three
+# snowflakes at Discord's own 64-bit ceiling (20 digits) + five separators
+# measures 72, which the test builds rather than derives. This comment said 71
+# until it was run. CUSTOM_ID_LIMIT asserts the bound at build time rather than
+# leaving it to a rejected message nobody sees.
 ACTION_PREFIX = "mw"
 CUSTOM_ID_LIMIT = 100
 

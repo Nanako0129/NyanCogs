@@ -1240,14 +1240,23 @@ class TestActionAddressing(unittest.TestCase):
         # Discord rejects the whole message when a custom_id is too long, so
         # the failure would be an alert that never arrives. discord.py does not
         # check it, which was measured.
-        widest = module.build_custom_id("mute", "s", 10**19 - 1, 10**19 - 1, 10**19 - 1)
+        # A real snowflake is an unsigned 64-bit integer, so 20 digits is the
+        # ceiling -- an earlier version of this test used 19 and reported a
+        # worst case three characters short of the true one.
+        snowflake = 2**64 - 1
+        widest = max(
+            (module.build_custom_id(action, "s", snowflake, snowflake, snowflake)
+             for action in module.ACTIONS),
+            key=len,
+        )
         self.assertLessEqual(len(widest), module.CUSTOM_ID_LIMIT)
+        self.assertEqual(len(widest), 72)
         # Asserting the built length only restates what the function produced;
         # it cannot fail when the guard is deleted. This drives the guard.
         with self.assertRaises(ValueError):
             module.build_custom_id("x" * 120, "s", 1, 2, 3)
         self.assertEqual(
-            module.parse_custom_id(widest), ("mute", "s", 10**19 - 1, 10**19 - 1, 10**19 - 1)
+            module.parse_custom_id(widest), ("mute", "s", snowflake, snowflake, snowflake)
         )
 
     def test_a_custom_id_is_untrusted_input(self) -> None:
