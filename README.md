@@ -183,6 +183,34 @@ somewhere other than the default with `[p]watch route`. A venting channel's
 reports carry what someone wrote there, and fewer people should see those than
 see a scam alert. Without a route, reports go to the guild-wide channel.
 
+A channel can have its image attachments read, off by default:
+
+```text
+[p]set api messagewatch_vision api_key <key>     # bot owner
+[p]watch set image_api_base https://openrouter.ai
+[p]watch set image_model <a model with image input>
+[p]watch images #一般討論 on
+```
+
+Only the **characters in the image** are asked for, verbatim — not a description
+of it. A scam here is a screenshot with text in it, the text is the evidence,
+and a description is open-ended generation whose errors nobody can check against
+the picture. The transcription goes into the same scam judgement that already
+exists, so it needs no rule of its own, and it is shown in the report: the
+extraction is generated text with nothing calibrated behind it, so a moderator
+has to be able to check it rather than trust a verdict built on it.
+
+Attachments are downscaled and re-encoded before they are sent, which discards
+EXIF including GPS tags. Results are cached by attachment id, so the same image
+reposted is paid for once. There is no default model: picking one without
+measuring which reads CJK screenshots best would be a guess dressed as a
+default, so the cog sends nothing until a model and an endpoint are set.
+
+This is the heaviest thing the cog sends and the only thing it sends anywhere
+other than TypeSafe — an image can carry a face, a document, or a screenshot of
+someone else's private conversation. It is decided one channel at a time and
+the disclosure says so.
+
 A channel can also be judged against its own posted rules:
 
 ```text
