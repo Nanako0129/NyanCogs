@@ -627,6 +627,7 @@ class MessageWatch(commands.Cog):
         self._last_error[channel_id] = (time.time(), reason)
 
     async def get_api_key(self) -> str | None:
+        """The TypeSafe key from Red's shared token store, or None if unusable."""
         tokens = await self.bot.get_shared_api_tokens(TOKEN_SERVICE)
         key = tokens.get("api_key") if isinstance(tokens, Mapping) else None
         return key if isinstance(key, str) and key else None
@@ -1141,6 +1142,11 @@ class MessageWatch(commands.Cog):
     async def _delete_target(
         self, interaction: discord.Interaction, guild: discord.Guild, channel_id: int, message_id: int
     ) -> None:
+        """Delete the message a report pointed at, on a moderator's press.
+
+        Every failure answers the presser rather than passing silently: someone
+        who pressed a button and saw nothing would not know whether it went.
+        """
         channel = guild.get_channel_or_thread(channel_id)
         if channel is None:
             await interaction.response.send_message("找不到原頻道。", ephemeral=True)
@@ -1169,6 +1175,11 @@ class MessageWatch(commands.Cog):
         member: discord.Member,
         channel_id: int,
     ) -> None:
+        """Add the channel's configured role to the flagged member.
+
+        The ruleset that prompted the rules feature enforces with a role rather
+        than a delete, which is why this action exists at all.
+        """
         # The watched channel's id, carried in the custom_id -- not
         # `interaction.channel_id`, which is wherever the report was posted.
         # With `[p]watch route` those are different channels, and without it the
@@ -1199,6 +1210,11 @@ class MessageWatch(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
+        """Queue one eligible message, and judge once the window is full.
+
+        Every gate here is cheap and local; the expensive work happens in
+        `flush`, which this calls outside the lock.
+        """
         guild = getattr(message, "guild", None)
         channel = getattr(message, "channel", None)
         author = getattr(message, "author", None)
