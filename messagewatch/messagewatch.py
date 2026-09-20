@@ -23,10 +23,11 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from itertools import islice
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NamedTuple
 
 import aiohttp
 import discord
+from discord import app_commands
 from redbot.core import Config, checks, commands, modlog
 from redbot.core.bot import Red
 from redbot.core.utils.views import SetApiView
@@ -188,17 +189,55 @@ DEFAULT_GUILD = {
     "idle_seconds": DEFAULT_IDLE_SECONDS,
 }
 
-SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
-    "scam_threshold": (float, 0.0, 1.0),
-    "hostile_threshold": (float, 0.0, 1.0),
-    "heat_threshold": (float, 0.0, 3.0),
-    "window_size": (int, 4, 25),
-    "cooldown_seconds": (int, 0, 86_400),
-    "rule_threshold": (float, 0.0, 1.0),
-    "rule_confidence": (float, 0.0, 1.0),
-    # 0 disables the sweep, which restores the pre-sweep behaviour exactly:
-    # a channel that never fills a window is never judged.
-    "idle_seconds": (int, 0, 86_400),
+class Setting(NamedTuple):
+    """One tunable, with what it means alongside what it accepts.
+
+    The label and the help live here rather than in the command, so the
+    dropdown, the settings table and the range check cannot disagree about
+    which settings exist or what they do.
+    """
+
+    kind: type
+    low: Any
+    high: Any
+    label: str
+    help: str
+
+
+SETTING_RULES: dict[str, Setting] = {
+    "scam_threshold": Setting(
+        float, 0.0, 1.0, "詐騙門檻",
+        "詐騙機率要多高才報告。實測：合成詐騙 0.93–0.97，而「提醒別人小心釣魚信」只有 0.06。",
+    ),
+    "hostile_threshold": Setting(
+        float, 0.0, 1.0, "敵意門檻",
+        "針對人的攻擊機率要多高才報告。實測：互相嘲諷 0.95，激烈但就事論事的技術爭論 0.03。",
+    ),
+    "heat_threshold": Setting(
+        float, 0.0, 3.0, "火藥味門檻",
+        "整段對話的衝突程度，滿分 3。97 則真實訊息量到的最高值是 1.53。",
+    ),
+    "rule_threshold": Setting(
+        float, 0.0, 1.0, "違規門檻",
+        "違反頻道規則的機率要多高才報告。只有設過 `[p]watch rule` 的頻道會用到。",
+    ),
+    "rule_confidence": Setting(
+        float, 0.0, 1.0, "條文信心下限",
+        "低於這個信心時，報告仍會送出，但會說「條文不確定」而不是斷定是第幾條。不是關掉報告的開關。",
+    ),
+    "window_size": Setting(
+        int, 4, 25, "視窗大小",
+        "幾則訊息判斷一次。每次判斷後往前推進一半，所以相鄰的兩次會重疊，跨界的對話不會被切開。",
+    ),
+    "cooldown_seconds": Setting(
+        int, 0, 86_400, "冷卻秒數",
+        "出過報告後，這個頻道多久內不再報告。冷卻期間的視窗會被直接丟棄、不送去判斷，所以那段時間等於沒在看。",
+    ),
+    "idle_seconds": Setting(
+        int, 0, 86_400, "閒置判斷秒數",
+        "安靜這麼久之後，就算湊不滿一個視窗也判斷（至少要 2 則）。設 0 會關掉它，"
+        "湊不滿視窗的安靜頻道將永遠不會被判斷。",
+    ),
 }
 
 # 2: a channel's rules and its purpose note began leaving Discord with every
@@ -1359,7 +1398,16 @@ class MessageWatch(commands.Cog):
     # and the help it sends is unreachable. A command group that answers
     # nothing is the same silent no-op this cog exists to avoid, just at the
     # command surface instead of the judging one.
-    @commands.group(name="watch", invoke_without_command=True)
+    # hybrid, so every subcommand below is reachable both as `[p]watch ...` and
+    # as `/watch ...`. HybridGroup.command and .group produce hybrid children,
+    # so this one decorator converts the whole tree. Discord allows groups to
+    # nest one level, which `/watch rule add` uses exactly.
+    #
+    # default_permissions hides the whole tree from members in Discord's own
+    # UI. It is a display filter, not the check -- the Red checks below still
+    # run, and a guild can override it in Integrations settings.
+    @commands.hybrid_group(name="watch", invoke_without_command=True)
+    @app_commands.default_permissions(manage_guild=True)
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def watch_group(self, ctx: commands.Context) -> None:
@@ -1617,12 +1665,37 @@ class MessageWatch(commands.Cog):
         await ctx.send(f"已設定 {channel.mention} 的用途說明。" if text else "已清除用途說明。")
 
     @watch_group.command(name="set")
-    async def watch_set(self, ctx: commands.Context, key: str, value: str) -> None:
-        """Change one threshold or window setting."""
+    # Built from SETTING_RULES rather than written out, so the dropdown cannot
+    # drift from what the command accepts. Discord caps choices at 25.
+    @app_commands.choices(
+        key=[
+            # Shown as the label, sent as the key. Built from SETTING_RULES so
+            # the dropdown cannot drift from what the command accepts.
+            app_commands.Choice(name=f"{rule.label}（{name}）", value=name)
+            for name, rule in sorted(SETTING_RULES.items())
+        ]
+    )
+    async def watch_set(
+        self, ctx: commands.Context, key: str = "", value: str = ""
+    ) -> None:
+        """Change one setting, or show every setting with what it means."""
         if key not in SETTING_RULES:
-            await ctx.send(f"可設定：{', '.join(sorted(SETTING_RULES))}")
+            # A bare invocation and a typo get the same answer: the table. A
+            # list of key names tells a moderator what is spelled correctly and
+            # nothing about what any of them does.
+            await ctx.send(embed=await self.settings_embed(ctx.guild, unknown=key))
             return
-        kind, low, high = SETTING_RULES[key]
+        if not value:
+            rule = SETTING_RULES[key]
+            current = await self.config.guild(ctx.guild).get_raw(key)
+            await ctx.send(
+                f"**{rule.label}**（`{key}`）目前是 `{current}`，可設定 `{rule.low}` 到 `{rule.high}`。\n"
+                f"{rule.help}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        rule = SETTING_RULES[key]
+        kind, low, high = rule.kind, rule.low, rule.high
         try:
             parsed = kind(value)
         except ValueError:
@@ -1633,6 +1706,26 @@ class MessageWatch(commands.Cog):
             return
         await self.config.guild(ctx.guild).set_raw(key, value=parsed)
         await ctx.send(f"`{key}` 設為 `{parsed}`。")
+
+    async def settings_embed(
+        self, guild: discord.Guild, unknown: str = ""
+    ) -> discord.Embed:
+        """Every setting with its meaning, range and current value."""
+        settings = await self.config.guild(guild).all()
+        embed = discord.Embed(
+            title="MessageWatch 可調設定",
+            description=(f"沒有 `{unknown}` 這個設定。\n" if unknown else "")
+            + "用 `[p]watch set <key> <value>` 修改，只給 key 會顯示該項說明。",
+            colour=discord.Colour.blurple(),
+        )
+        for key, rule in SETTING_RULES.items():
+            embed.add_field(
+                name=f"{rule.label}　`{key}`",
+                value=f"目前 `{settings[key]}`　範圍 `{rule.low}`–`{rule.high}`\n{rule.help}",
+                inline=False,
+            )
+        embed.set_footer(text="門檻的預設值來自 2026-09-20 對 jev-1.13.0 的實測，不是猜的。")
+        return embed
 
     @watch_group.command(name="show")
     async def watch_show(self, ctx: commands.Context) -> None:
