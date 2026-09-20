@@ -3,7 +3,41 @@
 
 reviews:
   auto_review:
-    # 0 disables the pause entirely, which is the schema's documented sentinel
+    # This repository is reviewed by GitHub Copilot, not CodeRabbit.
+    #
+    # CodeRabbit's OSS tier requires a public repository with fewer than 10
+    # stars to have its reviews triggered by hand, and this one has 4. So
+    # automatic review here stops on 2026-10-02 when the Advanced trial ends,
+    # whatever this file says. Turning it off now states the arrangement
+    # rather than letting it lapse into it, and avoids two reviewers on the
+    # same pull request for the remaining trial days.
+    #
+    # An on-demand '@coderabbitai review' comment still works.
+    #
+    # HOW TO GO BACK, once this repository reaches 10 stars.
+    #
+    # Nothing here reverts on its own -- the star count is CodeRabbit's
+    # constraint, not a trigger, and crossing it changes what is permitted,
+    # not what is configured. A configuration that cannot state its own exit
+    # condition becomes permanent by default, so the exit is written down:
+    #
+    #   1. Confirm the threshold has actually been crossed:
+    #      gh api repos/OWNER/NAME -q .stargazers_count
+    #   2. Set enabled: true here, in a pull request like any other change.
+    #   3. Disable the Copilot ruleset so two reviewers do not both run:
+    #      gh api repos/OWNER/NAME/rulesets            # find copilot-auto-review
+    #      gh api repos/OWNER/NAME/rulesets/ID -X PUT -f enforcement=disabled
+    #      Disable rather than delete: re-enabling is one field, rebuilding
+    #      is not, and this repository has crossed back before.
+    #   4. Confirm on the next pull request that CodeRabbit reviews it and
+    #      Copilot does not.
+    #
+    # Everything below stays as it is through that switch. The path
+    # instructions and code_guidelines already apply to a manually triggered
+    # review today, and apply unchanged to an automatic one afterwards.
+    enabled: false
+    # Inert while enabled is false; kept so re-enabling does not silently
+    # fall back to the default of 5. 0 disables the pause entirely, which is the schema's documented sentinel
     # ("Set to 0 to disable"), not a large number chosen by hand. At the default
     # of 5, automatic review stops silently once a pull request has five
     # reviewed commits, and a poller waiting on the verdict reads that pause as
