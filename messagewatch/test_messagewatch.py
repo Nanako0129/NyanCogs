@@ -1,0 +1,384 @@
+"""Focused tests for MessageWatch: what leaves, what is trusted, what is reported."""
+
+from __future__ import annotations
+
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import discord
+
+from . import messagewatch as module
+from .messagewatch import (
+    DEFAULT_GUILD,
+    DISCLOSURE_VERSION,
+    MAX_MESSAGE_CHARS,
+    MessageWatch,
+    anonymise,
+    build_questions,
+    build_state,
+    clean_text,
+)
+
+
+def window(*authors: int) -> list[dict[str, object]]:
+    return [
+        {"author_id": author, "text": f"m{index}", "jump_url": f"https://d/{index}"}
+        for index, author in enumerate(authors)
+    ]
+
+
+class TestOutboundPayload(unittest.TestCase):
+    def test_authors_become_per_request_labels_and_ids_never_leave(self) -> None:
+        items = anonymise(window(111111111111111111, 222222222222222222, 111111111111111111))
+        self.assertEqual([item["alias"] for item in items], ["u1", "u2", "u1"])
+
+        body = json.dumps(build_state("交誼廳", items), ensure_ascii=False)
+        for author in ("111111111111111111", "222222222222222222"):
+            with self.subTest(author=author):
+                self.assertNotIn(author, body)
+        self.assertNotIn("jump_url", body)
+        self.assertNotIn("https://d/", body)
+        self.assertIn("u1", body)
+
+    def test_labels_do_not_carry_across_requests(self) -> None:
+        first = anonymise(window(111, 222))
+        second = anonymise(window(222, 111))
+        # u1 is the first author seen in that request and nothing more. A label
+        # that meant the same person across requests would be an identifier.
+        self.assertEqual(first[0]["alias"], "u1")
+        self.assertEqual(second[0]["alias"], "u1")
+        self.assertNotEqual(first[0]["author_id"], second[0]["author_id"])
+
+    def test_mention_markup_and_length_are_bounded(self) -> None:
+        self.assertEqual(
+            clean_text("嗨 <@123456789012345678> 看 <#987654321> 這個 <a:party:112233> 訊息"),
+            "嗨 [mention] 看 [mention] 這個 [emoji] 訊息",
+        )
+        self.assertEqual(clean_text("<@!123456789012345678>"), "[mention]")
+        self.assertEqual(clean_text("  多   個    空白 "), "多 個 空白")
+        self.assertEqual(clean_text(""), "")
+        self.assertEqual(len(clean_text("字" * (MAX_MESSAGE_CHARS + 500))), MAX_MESSAGE_CHARS)
+
+    def test_scam_options_describe_the_message_they_select(self) -> None:
+        # An ordinal describes nothing. With labels that said only "第 6 則訊息"
+        # the model pointed one message off, 6 times out of 6 at confidence
+        # 0.77 to 0.93, so the label has to carry the message itself.
+        items = anonymise(window(111, 222, 111))
+        items[1]["text"] = "詐" * (module.SCAM_OPTION_LABEL_CHARS + 20)
+        criteria = build_questions(items)["scam_index"]["criteria"]
+        self.assertEqual(sorted(criteria), ["0", "1", "2", "none"])
+        self.assertTrue(criteria["0"].startswith("u1："))
+        self.assertTrue(criteria["1"].startswith("u2："))
+        self.assertEqual(
+            len(criteria["1"]), len("u2：") + module.SCAM_OPTION_LABEL_CHARS
+        )
+        # The model can only pick an option it was offered, so a short window
+        # must not be given indexes that are not in it.
+        self.assertEqual(len(build_questions(anonymise(window(*range(8))))["scam_index"]["criteria"]), 9)
+        self.assertEqual(module.QUESTIONS["scam_index"]["criteria"], {})
+
+
+class TestUntrustedAnswers(unittest.TestCase):
+    def test_probabilities_scores_and_indexes_are_bounded(self) -> None:
+        for value in (0.0, 0.5, 1.0):
+            self.assertEqual(module._bounded_probability(value), value)
+        for value in (True, False, -0.1, 1.1, "0.9", None, float("nan"), 10**400):
+            with self.subTest(value=value):
+                self.assertIsNone(module._bounded_probability(value))
+
+        self.assertEqual(module._bounded_score(2.5, 4), 2.5)
+        for value in (-0.1, 3.1, True, "2", None, float("nan"), 10**400):
+            with self.subTest(value=value):
+                self.assertIsNone(module._bounded_score(value, 4))
+
+        self.assertEqual(module._bounded_index("2", 8), 2)
+        for value in ("none", "8", "-1", "", 2, None, "1.5"):
+            with self.subTest(value=value):
+                self.assertIsNone(module._bounded_index(value, 8))
+
+    def test_findings_fire_only_above_their_threshold(self) -> None:
+        settings = dict(DEFAULT_GUILD)
+        quiet = {
+            "any_scam": {"noul": 0.05},
+            "is_hostile": {"noul": 0.15},
+            "heat": {"score": 1.53},
+        }
+        self.assertEqual(MessageWatch.findings(quiet, settings, 8), (None, []))
+
+        scam = {
+            "any_scam": {"noul": 0.97},
+            "scam_index": {"choice": "2"},
+            "is_hostile": {"noul": 0.02},
+            "heat": {"score": 0.3},
+        }
+        index, reasons = MessageWatch.findings(scam, settings, 8)
+        self.assertEqual(index, 2)
+        self.assertEqual(reasons, ["詐騙 0.97"])
+
+        fight = {
+            "any_scam": {"noul": 0.01},
+            "is_hostile": {"noul": 0.95},
+            "heat": {"score": 2.6},
+        }
+        index, reasons = MessageWatch.findings(fight, settings, 8)
+        self.assertIsNone(index)
+        self.assertEqual(reasons, ["敵意 0.95", "火藥味 2.60/3"])
+
+    def test_a_malformed_answer_reports_nothing_rather_than_guessing(self) -> None:
+        settings = dict(DEFAULT_GUILD)
+        for answers in (
+            {},
+            {"any_scam": "not a mapping"},
+            {"any_scam": {"noul": "0.99"}},
+            {"any_scam": {"noul": 1.4}},
+            {"is_hostile": {"noul": None}},
+            {"heat": {"score": 99}},
+        ):
+            with self.subTest(answers=answers):
+                self.assertEqual(MessageWatch.findings(answers, settings, 8), (None, []))
+
+    def test_an_out_of_range_index_degrades_to_a_range_report(self) -> None:
+        settings = dict(DEFAULT_GUILD)
+        answers = {"any_scam": {"noul": 0.99}, "scam_index": {"choice": "99"}}
+        index, reasons = MessageWatch.findings(answers, settings, 8)
+        self.assertIsNone(index)
+        self.assertEqual(reasons, ["詐騙 0.99"])
+
+
+class TestReport(unittest.TestCase):
+    def test_report_points_at_the_message_and_claims_no_authority(self) -> None:
+        channel = SimpleNamespace(id=5, mention="<#5>")
+        items = anonymise(window(111, 222, 333))
+        embed = MessageWatch.report_embed(channel, items, 1, ["詐騙 0.97"])
+        rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
+        self.assertIn("<@222>", rendered)
+        self.assertIn("https://d/1", rendered)
+        self.assertIn("<#5>", rendered)
+        self.assertIn("不會刪除、禁言或加反應", rendered)
+
+        # No index: the report still has to say where to look.
+        fallback = MessageWatch.report_embed(channel, items, None, ["敵意 0.95"])
+        self.assertIn("https://d/2", json.dumps(fallback.to_dict(), ensure_ascii=False))
+
+
+class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
+    def cog(self) -> MessageWatch:
+        cog = object.__new__(MessageWatch)
+        cog.bot = MagicMock()
+        return cog
+
+    async def request_with(self, status: int, body: bytes):
+        response = MagicMock()
+        response.status = status
+        response.content.read = AsyncMock(return_value=body)
+        response_ctx = MagicMock()
+        response_ctx.__aenter__ = AsyncMock(return_value=response)
+        response_ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post.return_value = response_ctx
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=session)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+        with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
+            return await self.cog().judge([], "c", "k")
+
+    async def test_a_good_answer_is_returned(self) -> None:
+        body = json.dumps({"answers": {"any_scam": {"noul": 0.9}}}).encode()
+        self.assertEqual(await self.request_with(200, body), {"any_scam": {"noul": 0.9}})
+
+    async def test_every_failure_returns_none_instead_of_raising(self) -> None:
+        # A moderation aid that breaks on_message is worse than one that misses
+        # a window, so none of these may escape.
+        for status, body in (
+            (401, b"{}"),
+            (429, b"{}"),
+            (500, b"{}"),
+            (200, b"not json"),
+            (200, json.dumps({"answers": "not a mapping"}).encode()),
+            (200, json.dumps({"no_answers": 1}).encode()),
+            (200, b"x" * (module.MAX_RESPONSE_BYTES + 1)),
+        ):
+            with self.subTest(status=status, body=body[:20]):
+                self.assertIsNone(await self.request_with(status, body))
+
+    async def test_a_transport_error_returns_none(self) -> None:
+        with patch(
+            "messagewatch.messagewatch.aiohttp.ClientSession",
+            side_effect=module.aiohttp.ClientError("boom"),
+        ):
+            self.assertIsNone(
+                await self.cog().judge([], "c", "k")
+            )
+
+
+class TestGating(unittest.IsolatedAsyncioTestCase):
+    def cog(self, **overrides):
+        cog = object.__new__(MessageWatch)
+        cog.bot = MagicMock()
+        settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
+                    "watched_channels": [5], **overrides}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        cog._pending = module.defaultdict(module.deque)
+        cog._last_report = {}
+        cog._locks = module.defaultdict(module.asyncio.Lock)
+        cog.flush = AsyncMock()
+        return cog
+
+    @staticmethod
+    def message(*, channel_id: int = 5, bot: bool = False, content: str = "hello", webhook=None):
+        return SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            channel=SimpleNamespace(id=channel_id, guild=SimpleNamespace(id=1), name="c"),
+            author=SimpleNamespace(id=42, bot=bot),
+            content=content,
+            webhook_id=webhook,
+            jump_url="https://d/1",
+        )
+
+    async def test_a_watched_channel_queues_the_message(self) -> None:
+        cog = self.cog()
+        await cog.on_message(self.message())
+        self.assertEqual(len(cog._pending[5]), 1)
+        self.assertEqual(cog._pending[5][0]["author_id"], 42)
+
+    async def test_nothing_is_queued_without_an_accepted_disclosure(self) -> None:
+        cog = self.cog(disclosure_version=0)
+        await cog.on_message(self.message())
+        self.assertEqual(len(cog._pending[5]), 0)
+
+    async def test_nothing_is_queued_for_an_unwatched_channel(self) -> None:
+        cog = self.cog(watched_channels=[])
+        await cog.on_message(self.message())
+        self.assertEqual(len(cog._pending[5]), 0)
+        cog = self.cog()
+        await cog.on_message(self.message(channel_id=6))
+        self.assertEqual(len(cog._pending[6]), 0)
+
+    async def test_bots_webhooks_and_empty_text_are_ignored(self) -> None:
+        for kwargs in ({"bot": True}, {"webhook": 9}, {"content": "   "}, {"content": ""}):
+            with self.subTest(kwargs=kwargs):
+                cog = self.cog()
+                await cog.on_message(self.message(**kwargs))
+                self.assertEqual(len(cog._pending[5]), 0)
+
+    async def test_the_window_flushes_only_when_it_is_full(self) -> None:
+        cog = self.cog(window_size=3)
+        for _ in range(2):
+            await cog.on_message(self.message())
+        cog.flush.assert_not_awaited()
+        await cog.on_message(self.message())
+        cog.flush.assert_awaited_once()
+
+
+class TestFlush(unittest.IsolatedAsyncioTestCase):
+    def cog(self, *, answers, **overrides):
+        cog = object.__new__(MessageWatch)
+        settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
+                    "report_channel": 77, "window_size": 3, **overrides}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        cog.get_api_key = AsyncMock(return_value="k")
+        cog.judge = AsyncMock(return_value=answers)
+        cog._pending = module.defaultdict(module.deque)
+        cog._last_report = {}
+        cog._locks = module.defaultdict(module.asyncio.Lock)
+        cog._pending[5].extend(window(111, 222, 333))
+        return cog
+
+    @staticmethod
+    def channel():
+        report = MagicMock(spec=discord.TextChannel)
+        report.send = AsyncMock()
+        guild = MagicMock()
+        guild.get_channel.return_value = report
+        channel = SimpleNamespace(id=5, guild=guild, name="c", mention="<#5>")
+        return channel, report
+
+    SCAM = {"any_scam": {"noul": 0.97}, "scam_index": {"choice": "1"},
+            "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}
+    QUIET = {"any_scam": {"noul": 0.03}, "is_hostile": {"noul": 0.05}, "heat": {"score": 0.4}}
+
+    async def test_a_crossing_window_reports_once_and_consumes_it(self) -> None:
+        cog = self.cog(answers=self.SCAM)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        report.send.assert_awaited_once()
+        self.assertEqual(len(cog._pending[5]), 0)
+        kwargs = report.send.await_args.kwargs
+        self.assertEqual(kwargs["allowed_mentions"].users, False)
+
+    async def test_a_quiet_window_reports_nothing(self) -> None:
+        cog = self.cog(answers=self.QUIET)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        report.send.assert_not_awaited()
+
+    async def test_the_cooldown_suppresses_a_second_report(self) -> None:
+        # One argument spans many windows; without this the moderator channel
+        # gets a report every few messages about the same exchange.
+        cog = self.cog(answers=self.SCAM, cooldown_seconds=300)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        cog._pending[5].extend(window(111, 222, 333))
+        await cog.flush(channel)
+        self.assertEqual(report.send.await_count, 1)
+
+    async def test_nothing_is_sent_without_a_report_channel_or_a_key(self) -> None:
+        for overrides, key in (({"report_channel": 0}, "k"), ({}, None)):
+            with self.subTest(overrides=overrides, key=key):
+                cog = self.cog(answers=self.SCAM, **overrides)
+                cog.get_api_key = AsyncMock(return_value=key)
+                channel, report = self.channel()
+                await cog.flush(channel)
+                report.send.assert_not_awaited()
+                cog.judge.assert_not_awaited()
+
+    async def test_a_service_failure_leaves_the_channel_working(self) -> None:
+        cog = self.cog(answers=None)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        report.send.assert_not_awaited()
+
+    async def test_a_partial_window_is_not_judged(self) -> None:
+        cog = self.cog(answers=self.SCAM, window_size=8)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        cog.judge.assert_not_awaited()
+        self.assertEqual(len(cog._pending[5]), 3)
+
+
+class TestDataStatement(unittest.TestCase):
+    def test_the_statement_names_what_leaves_and_what_does_not(self) -> None:
+        from pathlib import Path
+
+        statement = json.loads(
+            (Path(__file__).parent / "info.json").read_text(encoding="utf-8")
+        )["end_user_data_statement"]
+        for phrase in (
+            "Discord user IDs, display names, and avatars are never sent",
+            "never deletes, edits, reacts to, or punishes anything",
+            "a guild manager enables it individually",
+            "It does not store message content",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, statement)
+
+    def test_the_disclosure_says_it_is_continuous_and_untriggered(self) -> None:
+        for phrase in (
+            "with nobody triggering it",
+            "never deletes, edits, reacts to, or punishes anything",
+            "generated per request and never stored",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, module.DISCLOSURE_TEXT)
+
+
+if __name__ == "__main__":
+    unittest.main()

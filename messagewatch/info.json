@@ -1,0 +1,23 @@
+{
+    "name": "MessageWatch",
+    "author": [
+        "Nyanako"
+    ],
+    "short": "Flag scam and hostile messages to moderators with a System One model.",
+    "description": "Watches explicitly enabled channels, judges short rolling windows of messages with TypeSafe Jev, and reports scam attempts and hostile exchanges to a moderator channel. It never deletes, edits, reacts to, or punishes anything.",
+    "install_msg": "Load with `[p]load messagewatch`, store the key with `[p]watch key`, set a report channel, then enable each watched channel one at a time with `[p]watch enable`. Read the displayed disclosure first: enabled channels send message text off Discord continuously, with nobody triggering it.",
+    "tags": [
+        "moderation",
+        "safety",
+        "llm",
+        "utility"
+    ],
+    "min_bot_version": "3.5.24",
+    "min_python_version": [
+        3,
+        11,
+        0
+    ],
+    "requirements": [],
+    "end_user_data_statement": "This cog stores per-guild settings, the report channel ID, and the set of channel IDs a guild manager has explicitly enabled. It does not store message content, model responses, or any judgement. The API key is stored only by Red's shared API token system. In an enabled channel, the text, a per-run pseudonymous author label, and the message ID of recent human messages are sent to TypeSafe for judgement. Discord user IDs, display names, and avatars are never sent: authors are replaced with labels such as u1 and u2 that are generated per request and never persisted. Attachments, embeds, and links are not fetched or resolved. TypeSafe states it does not train on customer input; its retention terms and the accuracy of its judgements are unverified by this cog. A channel sends nothing until a guild manager enables it individually, and disabling it stops the sending immediately. Reports name the channel, the flagged message and its author so a moderator can act; the cog itself never deletes, edits, reacts to, or punishes anything."
+}
