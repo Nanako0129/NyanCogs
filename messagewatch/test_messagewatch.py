@@ -523,6 +523,19 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         await cog.flush(channel)
         self.assertNotIn(5, cog._last_report)
 
+    async def test_a_stale_disclosure_stops_the_export_in_flush_too(self) -> None:
+        # on_message checks consent outside the lock; flush is where text
+        # actually leaves. Nothing revokes consent at runtime today, so this
+        # closes a window that is currently unreachable -- the point is that
+        # it stops depending on that argument being re-derived correctly.
+        cog = self.cog(answers=self.SCAM, disclosure_version=DISCLOSURE_VERSION - 1)
+        channel, report = self.channel()
+        await cog.flush(channel)
+        cog.judge.assert_not_awaited()
+        report.send.assert_not_awaited()
+        self.assertEqual(len(cog._pending[5]), 0)
+        self.assertEqual(cog._last_error[5][1], "disclosure_stale")
+
     async def test_an_unwatched_channel_exports_nothing(self) -> None:
         # `[p]watch disable` leaves the watched set before it clears the queue;
         # a window that filled just before it must not still be sent.

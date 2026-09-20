@@ -727,6 +727,20 @@ class MessageWatch(commands.Cog):
         async with self._locks[channel.id]:
             guild = channel.guild
             settings = await self.config.guild(guild).all()
+            if int(settings["disclosure_version"]) != DISCLOSURE_VERSION:
+                # Consent is checked here as well as in `on_message`, because
+                # this is the function where text actually leaves. Nothing
+                # revokes consent while the process runs today -- the only
+                # write sets it to the current version, and a reload that
+                # changes the constant builds a new instance with an empty
+                # queue -- so the window a reviewer described is not reachable.
+                # That reachability argument is exactly what the next person
+                # adding a revoke command would have to remember, and this line
+                # is what makes remembering unnecessary. Pending text is
+                # dropped rather than held, because consent for it is stale.
+                self._pending.pop(channel.id, None)
+                self._note(channel.id, "disclosure_stale")
+                return
             if channel.id not in set(settings["watched_channels"]):
                 self._pending.pop(channel.id, None)
                 return
