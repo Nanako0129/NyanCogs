@@ -17,6 +17,7 @@ from .messagewatch import (
     MessageWatch,
     anonymise,
     build_questions,
+    build_rule_questions,
     build_state,
     clean_text,
 )
@@ -369,7 +370,7 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFlush(unittest.IsolatedAsyncioTestCase):
-    def cog(self, *, answers, **overrides):
+    def cog(self, *, answers, rules=None, **overrides):
         cog = object.__new__(MessageWatch)
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "report_channel": 77, "watched_channels": [5], "window_size": 3,
@@ -378,6 +379,11 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         scope.all = AsyncMock(return_value=settings)
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
+        channel_scope = MagicMock()
+        channel_scope.all = AsyncMock(
+            return_value={**module.DEFAULT_CHANNEL, "rules": list(rules or ())}
+        )
+        cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
         cog.judge = AsyncMock(return_value=answers)
         cog._pending = pending()
@@ -607,6 +613,175 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(cog._pending[5]), 3)
 
 
+class TestRules(unittest.TestCase):
+    RULES = ["心靈雞湯：用勵志、正能量、「明天會更好」這類話語回應",
+              "下指導棋：告訴發文者應該怎麼做、給建議或行動方案",
+              "這我有經驗：把話題轉到自己身上，講自己也遇過"]
+
+    @staticmethod
+    def settings(**overrides):
+        return {**DEFAULT_GUILD, **overrides}
+
+    @staticmethod
+    def answers(*, violation=0.96, meta="none", rule="2", confidence=0.98, index="1"):
+        return {
+            "any_scam": {"noul": 0.01},
+            "is_hostile": {"noul": 0.02},
+            "heat": {"score": 0.3},
+            "any_violation": {"noul": violation},
+            "meta_index": {"choice": meta},
+            "which_rule": {"choice": rule, "confidence": confidence},
+            "rule_index": {"choice": index},
+        }
+
+    def test_a_channel_without_rules_asks_exactly_what_it_asked_before(self) -> None:
+        # The feature has to be absent, not disabled: an unused question still
+        # costs tokens and still returns answers that could be misread.
+        items = anonymise(window(1, 2))
+        self.assertEqual(build_rule_questions(items, []), {})
+        self.assertEqual(set(build_questions(items)), set(module.QUESTIONS))
+        self.assertNotIn("channel_rules", build_state("c", items))
+        self.assertNotIn("channel_purpose", build_state("c", items))
+        # And a rule answer present without configured rules is ignored.
+        self.assertEqual(
+            MessageWatch.findings(self.answers(), self.settings(), 2), (None, [])
+        )
+
+    def test_the_rule_text_is_the_option_label_and_never_the_state(self) -> None:
+        # The same lesson the scam question learned: an option has to describe
+        # what it selects. And the text stays out of state, where a member
+        # writes, so a member cannot introduce or edit a rule.
+        items = anonymise(window(1, 2))
+        questions = build_rule_questions(items, self.RULES)
+        self.assertEqual(
+            questions["which_rule"]["criteria"],
+            {"1": self.RULES[0], "2": self.RULES[1], "3": self.RULES[2],
+             "none": "沒有任何一則違反上列規則"},
+        )
+        body = json.dumps(build_state("樹洞", items, "倒垃圾用", self.RULES), ensure_ascii=False)
+        for rule in self.RULES:
+            with self.subTest(rule=rule[:8]):
+                self.assertNotIn(rule, body)
+        self.assertIn("第 1 條", body)
+        self.assertIn("倒垃圾用", body)
+
+    def test_a_violation_names_the_rule_and_the_message(self) -> None:
+        index, reasons = MessageWatch.findings(
+            self.answers(), self.settings(), 4, self.RULES
+        )
+        self.assertEqual(index, 1)
+        self.assertEqual(len(reasons), 1)
+        self.assertTrue(reasons[0].startswith("違反第 2 條：下指導棋"))
+
+    def test_commentary_about_a_rule_is_vetoed(self) -> None:
+        # Measured against the real ruleset: "你這樣算下指導棋喔" was reported as
+        # a violation of the very rule it was citing, because jev reads
+        # literally and the words were in the sentence. The veto is a separate
+        # question compared in code -- and it has to name the message, not
+        # merely say commentary is present.
+        self.assertEqual(
+            MessageWatch.findings(self.answers(meta="1"), self.settings(), 4, self.RULES),
+            (None, []),
+        )
+
+    def test_commentary_elsewhere_does_not_veto_a_real_violation(self) -> None:
+        # One member breaking a rule while another points at a different
+        # message must still be reported; a veto that fired on any commentary
+        # anywhere would silence the violation.
+        index, reasons = MessageWatch.findings(
+            self.answers(meta="3", index="1"), self.settings(), 4, self.RULES
+        )
+        self.assertEqual(index, 1)
+        self.assertTrue(reasons[0].startswith("違反第 2 條"))
+
+    def test_an_unreadable_veto_is_treated_as_a_veto(self) -> None:
+        # This decides whether to name a person, so "cannot tell" must mean
+        # "do not accuse".
+        for meta in ("9", "-1", "", "²", 1, None, float("nan")):
+            with self.subTest(meta=str(meta)[:10]):
+                self.assertEqual(
+                    MessageWatch.findings(
+                        self.answers(meta=meta), self.settings(), 4, self.RULES
+                    ),
+                    (None, []),
+                )
+        answers = self.answers()
+        del answers["meta_index"]
+        self.assertEqual(
+            MessageWatch.findings(answers, self.settings(), 4, self.RULES), (None, [])
+        )
+
+    def test_a_rule_report_must_name_a_message(self) -> None:
+        # Without one there is nothing to act on, and no way to tell the
+        # violation apart from a message commenting on it.
+        for index in ("none", "9", "", None):
+            with self.subTest(index=str(index)):
+                self.assertEqual(
+                    MessageWatch.findings(
+                        self.answers(index=index), self.settings(), 4, self.RULES
+                    ),
+                    (None, []),
+                )
+
+    def test_an_uncertain_choice_reports_nothing(self) -> None:
+        # Measured: "我也是" came back at 0.61 with confidence 0.43 -- the model
+        # correctly saying it did not know -- while real violations held 0.87
+        # to 1.00. Probability alone would have reported it.
+        self.assertEqual(
+            MessageWatch.findings(
+                self.answers(violation=0.61, confidence=0.43), self.settings(), 4, self.RULES
+            ),
+            (None, []),
+        )
+
+    def test_a_rule_number_outside_the_configured_set_is_discarded(self) -> None:
+        for rule in ("none", "0", "4", "-1", "", "²", 2, None):
+            with self.subTest(rule=str(rule)[:8]):
+                self.assertEqual(
+                    MessageWatch.findings(
+                        self.answers(rule=rule), self.settings(), 4, self.RULES
+                    ),
+                    (None, []),
+                )
+
+    def test_a_quiet_window_under_rules_reports_nothing(self) -> None:
+        self.assertEqual(
+            MessageWatch.findings(
+                self.answers(violation=0.07, rule="none"), self.settings(), 4, self.RULES
+            ),
+            (None, []),
+        )
+
+    def test_an_uncertain_rule_is_reported_as_uncertain_not_suppressed(self) -> None:
+        # Measured: "他應該不是針對你，可能只是那天壓力大" came back with
+        # any_violation 0.94 and the right rule at confidence 0.67 -- sure a
+        # rule was broken, unsure which of two neighbouring rules. Suppressing
+        # that threw away a true positive to hide an uncertainty the moderator
+        # is better off seeing. Whether a violation happened at all is decided
+        # by a separate calibrated probability.
+        index, reasons = MessageWatch.findings(
+            self.answers(violation=0.94, confidence=0.67), self.settings(), 4, self.RULES
+        )
+        self.assertEqual(index, 1)
+        self.assertTrue(reasons[0].startswith("疑似違規，條文不確定，最接近第 2 條"))
+
+        # An unreadable confidence is uncertainty too, not a reason to drop it.
+        for bad in (None, "0.9", float("nan"), True, 10**400):
+            with self.subTest(confidence=str(bad)[:10]):
+                _, reasons = MessageWatch.findings(
+                    self.answers(confidence=bad), self.settings(), 4, self.RULES
+                )
+                self.assertTrue(reasons and reasons[0].startswith("疑似違規"))
+
+    def test_a_rule_finding_joins_the_other_reasons(self) -> None:
+        answers = self.answers()
+        answers["is_hostile"] = {"noul": 0.95}
+        index, reasons = MessageWatch.findings(answers, self.settings(), 4, self.RULES)
+        self.assertEqual(len(reasons), 2)
+        self.assertTrue(reasons[0].startswith("敵意"))
+        self.assertTrue(reasons[1].startswith("違反第 2 條"))
+
+
 class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
     async def test_watch_show_stays_inside_the_embed_field_limit(self) -> None:
         # The guild that needs this surface most is the one watching enough
@@ -665,6 +840,9 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
         scope.watched_channels = AsyncMock(return_value=settings["watched_channels"])
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
+        channel_scope = MagicMock()
+        channel_scope.all = AsyncMock(return_value=dict(module.DEFAULT_CHANNEL))
+        cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
         cog._pending = pending()
         cog._last_report = {}
@@ -737,9 +915,16 @@ class TestDataStatement(unittest.TestCase):
         # captured one. A list of phrases cannot catch a claim about a field
         # that does not exist, so this pins the payload's own shape: adding a
         # field here fails until the statement is rewritten to name it.
-        state = build_state("交誼廳", anonymise(window(111, 222)))
+        items = anonymise(window(111, 222))
+        state = build_state("交誼廳", items)
         self.assertEqual(set(state), {"channel", "recent_messages"})
         self.assertEqual(set(state["recent_messages"][0]), {"i", "author", "text"})
+        # With a channel's rules configured, two moderator-written fields go
+        # out as well, and the statement has to name them.
+        with_rules = build_state("樹洞", items, "倒垃圾用", ["第一條規則"])
+        self.assertEqual(
+            set(with_rules), {"channel", "recent_messages", "channel_purpose", "channel_rules"}
+        )
 
         statement = self.statement()
         self.assertNotIn("message ID", statement)
@@ -748,6 +933,8 @@ class TestDataStatement(unittest.TestCase):
             "its position in the window",
             "a per-run pseudonymous author label",
             CHANNEL_CLAUSE,
+            "those rules and the channel's purpose note",
+            "The configured rules and purpose note are stored per channel",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, statement)
