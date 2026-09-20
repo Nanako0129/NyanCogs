@@ -692,6 +692,10 @@ class TestRules(unittest.TestCase):
         self.assertEqual(set(build_questions(items)), set(module.QUESTIONS))
         self.assertNotIn("channel_rules", build_state("c", items))
         self.assertNotIn("channel_purpose", build_state("c", items))
+        # A purpose can be set without any rules, and `[p]watch rule clear`
+        # leaves one behind. Neither may keep an outbound field alive on its
+        # own: the purpose exists to sharpen a rule judgement.
+        self.assertEqual(set(build_state("c", items, "倒垃圾用")), {"channel", "recent_messages"})
         # And a rule answer present without configured rules is ignored.
         self.assertEqual(
             MessageWatch.findings(self.answers(), self.settings(), 2), (None, [], None)
@@ -893,6 +897,42 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
         message = ctx.send.await_args.args[0]
         self.assertIn("watch report", message)
         self.assertIn("watch route", message)
+
+    async def test_a_threshold_cannot_be_set_to_something_that_is_not_a_number(self) -> None:
+        # Not a defect in the current guard: `if not low <= parsed <= high` is
+        # False for NaN, so `not` makes it reject, which was measured. It is
+        # pinned because the obvious rewrite, `if parsed < low or parsed >
+        # high`, lets NaN through -- and a NaN threshold makes every comparison
+        # against it false, so every rule probability would pass.
+        #
+        # This drives the command rather than re-evaluating the comparison. A
+        # test that restates the logic it is checking cannot fail when that
+        # logic is rewritten, which is how the first version of this passed
+        # against the rewrite it exists to catch.
+        floats = [key for key, (kind, _, _) in module.SETTING_RULES.items() if kind is float]
+        self.assertTrue(floats)
+        for key in floats:
+            for raw in ("nan", "inf", "-inf", "NaN"):
+                with self.subTest(key=key, raw=raw):
+                    cog = object.__new__(MessageWatch)
+                    scope = MagicMock()
+                    scope.set_raw = AsyncMock()
+                    cog.config = MagicMock()
+                    cog.config.guild.return_value = scope
+                    ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+                    await MessageWatch.watch_set.callback(cog, ctx, key, raw)
+                    scope.set_raw.assert_not_awaited()
+                    self.assertIn("必須介於", ctx.send.await_args.args[0])
+
+        # And a value inside the range still stores.
+        cog = object.__new__(MessageWatch)
+        scope = MagicMock()
+        scope.set_raw = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_set.callback(cog, ctx, "rule_threshold", "0.5")
+        scope.set_raw.assert_awaited_once()
 
     async def test_a_rule_is_bounded_and_counted(self) -> None:
         channel = SimpleNamespace(id=5, mention="<#5>", name="c")

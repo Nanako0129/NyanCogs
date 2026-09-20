@@ -361,9 +361,15 @@ def build_state(
             for index, item in enumerate(window)
         ],
     }
-    if purpose:
-        state["channel_purpose"] = purpose
+    # Both fields are gated on the rules, not on the purpose being set. The
+    # purpose exists to sharpen a rule judgement, so with no rules configured it
+    # would be an outbound field bought for nothing -- and it would quietly
+    # break the guarantee that a channel without rules asks exactly what it
+    # asked before this feature existed. `[p]watch rule clear` therefore stops
+    # the purpose leaving too, rather than leaving half the export behind.
     if rules:
+        if purpose:
+            state["channel_purpose"] = purpose
         state["channel_rules"] = [
             f"第 {number} 條" for number in range(1, len(rules) + 1)
         ]
