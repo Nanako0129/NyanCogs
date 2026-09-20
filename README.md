@@ -210,6 +210,19 @@ rules on a genuinely borderline phrase), and no false positives among the five
 clean replies. Nineteen earlier cases were used while iterating and are not
 independent evidence.
 
+Every command is also a slash command: `/watch enable`, `/watch rule add`,
+`/watch set`. The tree is hidden from members who lack Manage Server in
+Discord's own UI, which is a display filter — the permission checks still run
+regardless. **Slash commands do not appear until the bot owner runs
+`[p]slash enable` and `[p]slash sync`**; without that they exist in the cog and
+are invisible in Discord, which looks exactly like the feature not working.
+
+`[p]watch set` with no arguments prints every setting with what it means, what
+it accepts and what it is currently set to, rather than a list of key names. A
+key with no value explains that one setting. As a slash command the key is a
+dropdown built from the same table, so it cannot offer a setting the command
+would reject.
+
 `[p]watch show` is the diagnostic surface: per watched channel it prints how
 many messages are pending, when that channel was last actually judged, and the
 last reason nothing happened. Without those, a channel whose report channel lost

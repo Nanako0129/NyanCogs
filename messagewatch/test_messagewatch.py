@@ -405,7 +405,7 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         # without a cap it retains every message in process memory.
         with patch("messagewatch.messagewatch.Config"):
             cog = MessageWatch(MagicMock())
-        self.assertGreater(module.MAX_PENDING_MESSAGES, module.SETTING_RULES["window_size"][2])
+        self.assertGreater(module.MAX_PENDING_MESSAGES, module.SETTING_RULES["window_size"].high)
         queue = cog._pending[5]
         for index in range(module.MAX_PENDING_MESSAGES + 5):
             queue.append({"text": str(index)})
@@ -991,7 +991,7 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
         # test that restates the logic it is checking cannot fail when that
         # logic is rewritten, which is how the first version of this passed
         # against the rewrite it exists to catch.
-        floats = [key for key, (kind, _, _) in module.SETTING_RULES.items() if kind is float]
+        floats = [key for key, rule in module.SETTING_RULES.items() if rule.kind is float]
         self.assertTrue(floats)
         for key in floats:
             for raw in ("nan", "inf", "-inf", "NaN"):
@@ -1453,6 +1453,111 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(cog._take_window(5, 8))
 
 
+
+
+class TestSlashAndSettings(unittest.IsolatedAsyncioTestCase):
+    def test_every_command_is_reachable_as_a_slash_command(self) -> None:
+        # HybridGroup.command and .group produce hybrid children, so the one
+        # decorator on the group converts the tree -- and any command added
+        # later is a slash command without touching it.
+        with patch("messagewatch.messagewatch.Config"):
+            cog = MessageWatch(MagicMock())
+        self.addCleanup(cog._sweep.cancel)
+        group = cog.watch_group
+        self.assertIsNotNone(group.app_command)
+
+        seen = []
+        def walk(node):
+            for child in getattr(node, "commands", []):
+                seen.append(child.qualified_name)
+                self.assertIsNotNone(
+                    getattr(child, "app_command", None), f"{child.qualified_name} 不是 slash"
+                )
+                walk(child)
+        walk(group)
+        # Discord allows one level of group nesting; `/watch rule add` uses it
+        # exactly, and a third would be rejected at registration.
+        self.assertLessEqual(max(name.count(" ") for name in seen), 2)
+        self.assertIn("watch rule add", seen)
+        self.assertIn("watch action role", seen)
+
+    def test_the_tree_is_hidden_from_members_in_discord_ui(self) -> None:
+        # A display filter, not the check -- the Red checks still run. Without
+        # it every member sees a moderation command tree they cannot use.
+        from discord.app_commands import AppCommandContext, AppInstallationType
+
+        with patch("messagewatch.messagewatch.Config"):
+            cog = MessageWatch(MagicMock())
+        self.addCleanup(cog._sweep.cancel)
+        tree = MagicMock()
+        tree.allowed_contexts = AppCommandContext()
+        tree.allowed_installs = AppInstallationType()
+        payload = cog.watch_group.app_command.to_dict(tree)
+        self.assertIsNotNone(payload.get("default_member_permissions"))
+        self.assertEqual(int(payload["default_member_permissions"]), 32)  # manage_guild
+
+    def test_the_dropdown_offers_exactly_the_settable_keys(self) -> None:
+        with patch("messagewatch.messagewatch.Config"):
+            cog = MessageWatch(MagicMock())
+        self.addCleanup(cog._sweep.cancel)
+        choices = cog.watch_set.app_command.parameters[0].choices
+        self.assertEqual(sorted(c.value for c in choices), sorted(module.SETTING_RULES))
+        self.assertLessEqual(len(choices), 25)  # Discord's ceiling
+        for choice in choices:
+            with self.subTest(choice=choice.value):
+                self.assertIn(module.SETTING_RULES[choice.value].label, choice.name)
+
+    def test_every_setting_says_what_it_means_and_what_it_takes(self) -> None:
+        # A list of key names tells a moderator what is spelled correctly and
+        # nothing about what any of them does.
+        for key, rule in module.SETTING_RULES.items():
+            with self.subTest(key=key):
+                self.assertTrue(rule.label.strip())
+                self.assertGreater(len(rule.help), 20)
+                self.assertIn(rule.kind, (int, float))
+                self.assertLess(rule.low, rule.high)
+
+    async def test_a_bare_or_mistyped_set_shows_the_table(self) -> None:
+        cog = object.__new__(MessageWatch)
+        settings = dict(DEFAULT_GUILD)
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+
+        await MessageWatch.watch_set.callback(cog, ctx, "", "")
+        embed = ctx.send.await_args.kwargs["embed"]
+        rendered = json.dumps(embed.to_dict(), ensure_ascii=False)
+        for key, rule in module.SETTING_RULES.items():
+            with self.subTest(key=key):
+                self.assertIn(key, rendered)
+                self.assertIn(rule.label, rendered)
+                self.assertIn(str(settings[key]), rendered)
+                # The help is the point of the table. Key, label and value
+                # together still do not say what any of them does.
+                self.assertIn(rule.help[:16], rendered)
+                self.assertIn(str(rule.low), rendered)
+                self.assertIn(str(rule.high), rendered)
+
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_set.callback(cog, ctx, "nonsense", "")
+        self.assertIn("nonsense", json.dumps(
+            ctx.send.await_args.kwargs["embed"].to_dict(), ensure_ascii=False))
+
+    async def test_a_key_with_no_value_explains_that_one_setting(self) -> None:
+        cog = object.__new__(MessageWatch)
+        scope = MagicMock()
+        scope.get_raw = AsyncMock(return_value=0.9)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_set.callback(cog, ctx, "scam_threshold", "")
+        said = ctx.send.await_args.args[0]
+        rule = module.SETTING_RULES["scam_threshold"]
+        self.assertIn(rule.label, said)
+        self.assertIn(rule.help[:12], said)
+        self.assertIn("0.9", said)
 
 
 class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
