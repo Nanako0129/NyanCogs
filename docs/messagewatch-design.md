@@ -136,7 +136,9 @@ Operational parameters:
 - Attachments are cached in memory by attachment ID up to 256 entries. The cache contains no user identifiers; consequently, `cog_unload` and GDPR data deletion requests flush the entire cache.
 - **No default vision model is configured.** Because transcription accuracy across CJK screenshots remains unmeasured, the pipeline remains inactive until explicitly configured by an operator.
 
-Vision endpoints and model names are stored in global configuration, editable only by the bot owner via `[p]watch vision`. Because vision calls consume the bot owner's global API credentials, restricting this setting prevents server administrators from redirecting API keys or image data to unauthorized hosts. `api_base` must use an `https://` scheme.
+Vision endpoints and model names are stored in global configuration, editable only by the bot owner via `[p]watch vision`. Because vision calls consume the bot owner's global API credentials, restricting this setting prevents server administrators from redirecting API keys or image data to unauthorized hosts. `api_base` takes `https://` to any host, or `http://` to a literal address inside RFC1918, IPv6 ULA or loopback. The plain-HTTP form exists because a bot behind a geo-block reaches its provider through a proxy on a private network; the image bytes and the API key then cross that network unencrypted, which the disclosure says.
+
+A hostname is refused for `http://` even when it would resolve inside those ranges. ChannelSummary, which has to accept hostnames, resolves them and checks every record at request time; this setting does not have to, so it takes the smaller rule instead: with no name there is no lookup, and with no lookup there is nothing for a later DNS answer to move.
 
 ## 11. Cost visibility
 

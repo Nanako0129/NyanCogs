@@ -2499,6 +2499,30 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(0, cog._image_cache)
         self.assertIn(module.IMAGE_CACHE_SIZE + 4, cog._image_cache)
 
+    def test_the_endpoint_rule_admits_a_lan_proxy_and_nothing_else(self) -> None:
+        # https anywhere, or http to a literal private address. A hostname is
+        # refused for http even when it would resolve inside those ranges: with
+        # no name there is no lookup, and with no lookup there is nothing for a
+        # later DNS answer to move.
+        for value in (
+            "https://openrouter.ai",
+            "http://192.168.123.208:8318",
+            "http://10.1.2.3", "http://172.16.0.1", "http://127.0.0.1:8318",
+            "http://[fd00::1]:8318", "http://[::1]",
+        ):
+            with self.subTest(allowed=value):
+                self.assertTrue(module.endpoint_is_allowed(value))
+        for value in (
+            "http://openrouter.ai",          # a name, not an address
+            "http://8.8.8.8",                # public
+            "http://172.32.0.1",             # one network past 172.16/12
+            "http://192.168.1.1@evil.com",   # userinfo, host is evil.com
+            "http://user:pw@192.168.1.1",    # credentials in the URL
+            "ftp://192.168.1.1", "http://", "https://", "",
+        ):
+            with self.subTest(refused=value):
+                self.assertFalse(module.endpoint_is_allowed(value))
+
     async def test_the_vision_endpoint_must_be_https(self) -> None:
         # The image leaves Discord over this. Plain HTTP would put a member's
         # screenshot on the wire in clear, so the command refuses rather than
@@ -2515,6 +2539,12 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
 
         await command(cog, ctx, "api_base", value="http://openrouter.ai")
         scope.set_raw.assert_not_awaited()
+        await command(cog, ctx, "api_base", value="http://8.8.8.8")
+        scope.set_raw.assert_not_awaited()
+        # A LAN proxy is the reason this is not simply an https check.
+        await command(cog, ctx, "api_base", value="http://192.168.123.208:8318")
+        scope.set_raw.assert_awaited_with("image_api_base", value="http://192.168.123.208:8318")
+        scope.set_raw.reset_mock()
         await command(cog, ctx, "api_base", value="x" * 201)
         scope.set_raw.assert_not_awaited()
 
