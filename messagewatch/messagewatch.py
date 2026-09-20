@@ -76,6 +76,43 @@ DEFAULT_SCAM_THRESHOLD = 0.90
 DEFAULT_HOSTILE_THRESHOLD = 0.80
 DEFAULT_HEAT_THRESHOLD = 2.50
 
+# Rules live in the question's `criteria`, never in `state`. Two reasons, both
+# from TypeSafe's own list of jev-1.13 failure modes. #5: accuracy falls as the
+# state grows with content unrelated to the decision, and a whole ruleset is
+# mostly irrelevant to any one window. #6: state is data the model does not
+# treat as hostile, and members write the state -- a rule placed there is a rule
+# a member could try to write.
+MAX_RULES = 20
+MAX_RULE_CHARS = 200
+MAX_PURPOSE_CHARS = 500
+# How much of a rule is echoed into the report's reason line.
+RULE_REASON_CHARS = 60
+
+DEFAULT_CHANNEL = {
+    "rules": [],
+    "purpose": "",
+    # 0 means "use the guild's report channel". A watched channel can send its
+    # reports somewhere else, because a report quotes the channel it came from:
+    # a venting channel's findings carry what someone wrote there, and fewer
+    # people should see those than see a scam alert.
+    "report_channel": 0,
+}
+
+# Measured 2026-09-20 against jev-1.13.0 with a real channel ruleset (the one
+# for a venting channel: no advice, no platitudes, no "I've been there", no
+# religion, no guessing at motives, no speaking for others). Nine exemplar
+# cases separated at 0.94-0.98 against 0.05-0.08 for replies that are pure
+# company, so the threshold sits between them with room on both sides.
+DEFAULT_RULE_THRESHOLD = 0.85
+# Below this, the report says a rule was broken without claiming which one.
+# It does not suppress the report, and the distinction was measured: "他應該不是
+# 針對你，可能只是那天壓力大" came back with any_violation 0.94 and the right rule
+# at confidence 0.67. The model was sure a rule was broken and unsure which of
+# two neighbouring rules it was -- both are about speaking for someone else --
+# so suppressing it threw away a true positive to hide an uncertainty that
+# belongs in the report instead. Whether a violation happened at all is what
+# DEFAULT_RULE_THRESHOLD decides, on a separate calibrated probability.
+DEFAULT_RULE_CONFIDENCE = 0.70
 DEFAULT_GUILD = {
     "report_channel": 0,
     "watched_channels": [],
@@ -85,6 +122,8 @@ DEFAULT_GUILD = {
     "heat_threshold": DEFAULT_HEAT_THRESHOLD,
     "window_size": 8,
     "cooldown_seconds": 300,
+    "rule_threshold": DEFAULT_RULE_THRESHOLD,
+    "rule_confidence": DEFAULT_RULE_CONFIDENCE,
 }
 
 SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
@@ -93,14 +132,23 @@ SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
     "heat_threshold": (float, 0.0, 3.0),
     "window_size": (int, 4, 25),
     "cooldown_seconds": (int, 0, 86_400),
+    "rule_threshold": (float, 0.0, 1.0),
+    "rule_confidence": (float, 0.0, 1.0),
 }
 
-DISCLOSURE_VERSION = 1
+# 2: a channel's rules and its purpose note began leaving Discord with every
+# request. The disclosure is about what leaves, so new outbound fields are
+# exactly what it exists to re-ask about, and a guild that accepted version 1
+# never saw them. Bumping halts every guild until a manager accepts again,
+# which is why `[p]watch show` says so in its first field.
+DISCLOSURE_VERSION = 2
 DISCLOSURE_TEXT = (
     "**What leaves Discord:** in an enabled channel, the text of recent human messages is sent "
     "to TypeSafe continuously, together with the name of the channel, with nobody triggering "
     "it. This is unlike an on-demand command: enabling a channel is a standing export of what "
-    "people say in it.\n"
+    "people say in it. Where rules are configured for a channel, those rules and its purpose "
+    "note go with every request too.\n"    "**Consider the channel:** a venting or confession channel is where this export costs the "
+    "most, because what people write there is what they expect will not be repeated.\n"
     "**What does not:** Discord user IDs, display names and avatars are never sent. Authors are "
     "replaced with labels such as u1 and u2, generated per request and never stored. Attachments, "
     "embeds and links are not fetched or resolved.\n"
@@ -205,7 +253,76 @@ def _bounded_index(value: Any, size: int) -> int | None:
     return index if 0 <= index < size else None
 
 
-def build_questions(window: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+def _message_options(items: list[Mapping[str, Any]], none_label: str) -> dict[str, str]:
+    """One option per message, each labelled with the message it selects."""
+    return {
+        **{
+            str(index): f"{item['alias']}：{item['text'][:SCAM_OPTION_LABEL_CHARS]}"
+            for index, item in enumerate(items)
+        },
+        "none": none_label,
+    }
+
+
+def build_rule_questions(
+    window: Iterable[Mapping[str, Any]], rules: list[str]
+) -> dict[str, dict[str, Any]]:
+    """The four rule questions, or nothing at all when a channel has no rules.
+
+    A channel without rules asks exactly what it asked before this feature
+    existed, which is why this returns an empty mapping rather than a disabled
+    question: an unused question still costs tokens and still has answers that
+    could be misread.
+
+    The rules are the option labels. That is the same lesson the scam question
+    learned the hard way -- an option has to describe what it selects -- and it
+    is also why the ruleset is not in the state: see MAX_RULES above.
+    """
+    if not rules:
+        return {}
+    items = list(window)
+    numbered = {str(number): rule for number, rule in enumerate(rules, start=1)}
+    joined = "；".join(numbered.values())
+    return {
+        "any_violation": {
+            "type": "noul",
+            "instructions": (
+                "在 `recent_messages` 裡，是否有訊息違反了 `channel_rules` 所列的任一條規則？"
+                "只判斷訊息本身做了什麼，不判斷它談論了什麼。"
+            ),
+            "criteria": {
+                "true": f"某則訊息本身做出了以下任一種行為：{joined}",
+                "false": (
+                    "沒有訊息做出這些行為；或訊息只是在談論、引用、警告這些行為，"
+                    "或是在指出別人違反規則"
+                ),
+            },
+        },
+        "meta_index": {
+            "type": "choice",
+            "instructions": (
+                "哪一則訊息是在談論這個頻道的規則本身——例如指出別人違規、引用規則、"
+                "或討論什麼行為在這裡可不可以？選項是各則訊息的開頭。"
+                "注意：解讀或評論某個人，不算談論規則。"
+            ),
+            "criteria": _message_options(items, "沒有任何一則在談論這個頻道的規則"),
+        },
+        "which_rule": {
+            "type": "choice",
+            "instructions": "若有訊息違反規則，違反的是哪一條？只看訊息字面上做了什麼。",
+            "criteria": {**numbered, "none": "沒有任何一則違反上列規則"},
+        },
+        "rule_index": {
+            "type": "choice",
+            "instructions": "若有訊息違反規則，是哪一則？選項是各則訊息的開頭。",
+            "criteria": _message_options(items, "沒有任何一則違反規則"),
+        },
+    }
+
+
+def build_questions(
+    window: Iterable[Mapping[str, Any]], rules: list[str] | None = None
+) -> dict[str, dict[str, Any]]:
     """The question block for this exact window.
 
     Options are built per request for two reasons. The model can only pick an
@@ -216,25 +333,47 @@ def build_questions(window: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, 
     """
     items = list(window)
     questions = {key: dict(value) for key, value in QUESTIONS.items()}
-    questions["scam_index"]["criteria"] = {
-        **{
-            str(index): f"{item['alias']}：{item['text'][:SCAM_OPTION_LABEL_CHARS]}"
-            for index, item in enumerate(items)
-        },
-        "none": "沒有任何一則是詐騙",
-    }
+    questions["scam_index"]["criteria"] = _message_options(items, "沒有任何一則是詐騙")
+    questions.update(build_rule_questions(items, list(rules or ())))
     return questions
 
 
-def build_state(channel_name: str, window: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """The request state: text and a per-request label, never a Discord identity."""
-    return {
+def build_state(
+    channel_name: str,
+    window: Iterable[Mapping[str, Any]],
+    purpose: str = "",
+    rules: list[str] | None = None,
+) -> dict[str, Any]:
+    """The request state: text and a per-request label, never a Discord identity.
+
+    The channel's purpose is one sentence of moderator-written context, and it
+    earns its place: with the venting channel's own "people here want to be
+    heard, not advised" present, replies that are pure company held at 0.05-0.08
+    while advice held at 0.94-0.98. The rules are listed by number only, so the
+    model can refer to "第 3 條" without the text of every rule sitting in the
+    state -- the text lives in the question's criteria, where a member cannot
+    write to it.
+    """
+    state: dict[str, Any] = {
         "channel": channel_name,
         "recent_messages": [
             {"i": index, "author": item["alias"], "text": item["text"]}
             for index, item in enumerate(window)
         ],
     }
+    # Both fields are gated on the rules, not on the purpose being set. The
+    # purpose exists to sharpen a rule judgement, so with no rules configured it
+    # would be an outbound field bought for nothing -- and it would quietly
+    # break the guarantee that a channel without rules asks exactly what it
+    # asked before this feature existed. `[p]watch rule clear` therefore stops
+    # the purpose leaving too, rather than leaving half the export behind.
+    if rules:
+        if purpose:
+            state["channel_purpose"] = purpose
+        state["channel_rules"] = [
+            f"第 {number} 條" for number in range(1, len(rules) + 1)
+        ]
+    return state
 
 
 def anonymise(window: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -263,6 +402,10 @@ class MessageWatch(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=0x4E59414E4D57415401, force_registration=True)
         self.config.register_guild(**DEFAULT_GUILD)
+        # Rules are per channel, not per guild: a venting channel's rules would
+        # be absurd in a help channel, and it is the channel's own posted rules
+        # that members agreed to.
+        self.config.register_channel(**DEFAULT_CHANNEL)
         # Per channel: the pending window, and when that channel last reported.
         # Both are process memory on purpose. A restart losing a half-filled
         # window costs one late report; persisting message text would
@@ -294,7 +437,12 @@ class MessageWatch(commands.Cog):
         return key if isinstance(key, str) and key else None
 
     async def judge(
-        self, window: list[dict[str, Any]], channel_name: str, key: str
+        self,
+        window: list[dict[str, Any]],
+        channel_name: str,
+        key: str,
+        purpose: str = "",
+        rules: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """One bounded request, or None when the service could not answer.
 
@@ -304,9 +452,9 @@ class MessageWatch(commands.Cog):
         """
         payload = json.dumps(
             {
-                "state": build_state(channel_name, window),
+                "state": build_state(channel_name, window, purpose, rules),
                 "model": MODEL,
-                "questions": build_questions(window),
+                "questions": build_questions(window, rules),
             },
             ensure_ascii=False,
         ).encode()
@@ -358,10 +506,89 @@ class MessageWatch(commands.Cog):
         return answers
 
     @staticmethod
+    def _rule_finding(
+        answers: Mapping[str, Any], settings: Mapping[str, Any], rules: list[str], size: int
+    ) -> tuple[int | None, str | None]:
+        """Which rule this window broke, or None -- combined here, not by the model.
+
+        Four separate answers decide one thing, which is the documented way to
+        handle a question the model reads too literally to answer in one go.
+
+        The veto exists because members police each other in a channel with
+        posted rules: "你這樣算下指導棋喔" scored 0.84 as a violation of the very
+        rule it was citing, since jev reads literally and the words were in the
+        sentence. Saying so in the criteria did not fix it.
+
+        The veto asks which message is the commentary, not whether commentary
+        is present, and the two are not interchangeable. A first attempt asked
+        about "the most suspicious message", which made the model resolve one
+        question inside another; measured against the real ruleset it let the
+        case straight through. Naming the message and comparing the two indexes
+        in code is what actually holds.
+
+        The veto is also deliberately about the *rules*, not about commenting
+        on people. Asking the broader question collided with the ruleset it was
+        meant to protect: a channel forbidding "guessing at someone's motives"
+        and "speaking for someone else" has rules that are themselves about
+        interpreting a person, so a veto phrased that way swallowed two real
+        violations. Measured: 17/19 with the broad wording, 19/19 with this one.
+        """
+        violation = answers.get("any_violation")
+        probability = (
+            _bounded_probability(violation.get("noul")) if isinstance(violation, Mapping) else None
+        )
+        if probability is None or probability < float(settings["rule_threshold"]):
+            return None, None
+
+        picked = answers.get("which_rule")
+        if not isinstance(picked, Mapping):
+            return None, None
+        number = _bounded_index(picked.get("choice"), len(rules) + 1)
+        if number is None or number < 1:
+            return None, None
+        confidence = _bounded_probability(picked.get("confidence"))
+        sure = confidence is not None and confidence >= float(settings["rule_confidence"])
+
+        where = answers.get("rule_index")
+        index = _bounded_index(where.get("choice"), size) if isinstance(where, Mapping) else None
+        # A rule report has to name the message. Without one there is nothing a
+        # moderator can act on, and no way to tell the violation apart from the
+        # message commenting on it.
+        if index is None:
+            return None, None
+
+        commentary = answers.get("meta_index")
+        if not isinstance(commentary, Mapping):
+            return None, None
+        raw = commentary.get("choice")
+        if raw != "none":
+            meta_index = _bounded_index(raw, size)
+            # Unreadable, so the veto cannot be evaluated. This decides whether
+            # to name a person, and "cannot tell" has to mean "do not accuse".
+            if meta_index is None or meta_index == index:
+                return None, None
+
+        text = rules[number - 1][:RULE_REASON_CHARS]
+        if sure:
+            return index, f"違反第 {number} 條：{text}"
+        # The model is confident a rule was broken and not confident which one.
+        # Saying so beats both suppressing the report and asserting a number.
+        return index, f"疑似違規，條文不確定，最接近第 {number} 條：{text}"
+
+    @staticmethod
     def findings(
-        answers: Mapping[str, Any], settings: Mapping[str, Any], window_size: int
-    ) -> tuple[int | None, list[str]]:
-        """Which thresholds this window crossed, and which message to point at."""
+        answers: Mapping[str, Any],
+        settings: Mapping[str, Any],
+        window_size: int,
+        rules: list[str] | None = None,
+    ) -> tuple[int | None, list[str], int | None]:
+        """Which thresholds this window crossed, and which messages to point at.
+
+        The rule pointer is returned separately because the two judgements can
+        name different messages: a scam and a rule violation in one window are
+        two findings about two people, and showing one link beside both reasons
+        would put a rule's name next to somebody else's message.
+        """
         reasons: list[str] = []
         index: int | None = None
 
@@ -388,7 +615,23 @@ class MessageWatch(commands.Cog):
         if heat is not None and heat >= float(settings["heat_threshold"]):
             reasons.append(f"火藥味 {heat:.2f}/{levels - 1}")
 
-        return index, reasons
+        rules = list(rules or ())
+        rule_index: int | None = None
+        if rules:
+            found, rule_reason = MessageWatch._rule_finding(
+                answers, settings, rules, window_size
+            )
+            if rule_reason is not None:
+                reasons.append(rule_reason)
+                # Deliberately not filled in as `index`. A scam finding whose
+                # own pointer was unreadable leaves `index` None so the report
+                # shows a range; borrowing the rule's pointer there would put
+                # the rule-breaker's name under a 詐騙 reason. The rule keeps
+                # its own field, and a report with only a rule finding shows
+                # the range plus that field.
+                rule_index = found
+
+        return index, reasons, rule_index
 
     @staticmethod
     def report_embed(
@@ -396,6 +639,7 @@ class MessageWatch(commands.Cog):
         window: list[dict[str, Any]],
         index: int | None,
         reasons: list[str],
+        rule_index: int | None = None,
     ) -> discord.Embed:
         """The moderator-facing report. Judgement stays with the moderator."""
         embed = discord.Embed(
@@ -423,6 +667,16 @@ class MessageWatch(commands.Cog):
                     f"[開頭]({window[0]['jump_url']}) → [結尾]({window[-1]['jump_url']})"
                     f"（{len(window)} 則）"
                 ),
+                inline=False,
+            )
+        # A scam and a rule violation in one window are findings about two
+        # different people. One link beside both reasons would put a rule's
+        # name next to somebody else's message.
+        if rule_index is not None and rule_index != index and 0 <= rule_index < len(window):
+            flagged = window[rule_index]
+            embed.add_field(
+                name="違規的訊息",
+                value=f"<@{flagged['author_id']}> · [跳至訊息]({flagged['jump_url']})",
                 inline=False,
             )
         embed.set_footer(
@@ -477,10 +731,26 @@ class MessageWatch(commands.Cog):
         async with self._locks[channel.id]:
             guild = channel.guild
             settings = await self.config.guild(guild).all()
+            if int(settings["disclosure_version"]) != DISCLOSURE_VERSION:
+                # Consent is checked here as well as in `on_message`, because
+                # this is the function where text actually leaves. Nothing
+                # revokes consent while the process runs today -- the only
+                # write sets it to the current version, and a reload that
+                # changes the constant builds a new instance with an empty
+                # queue -- so the window a reviewer described is not reachable.
+                # That reachability argument is exactly what the next person
+                # adding a revoke command would have to remember, and this line
+                # is what makes remembering unnecessary. Pending text is
+                # dropped rather than held, because consent for it is stale.
+                self._pending.pop(channel.id, None)
+                self._note(channel.id, "disclosure_stale")
+                return
             if channel.id not in set(settings["watched_channels"]):
                 self._pending.pop(channel.id, None)
                 return
-            report_id = int(settings["report_channel"])
+            channel_settings = await self.config.channel(channel).all()
+            rules = list(channel_settings["rules"])
+            report_id = int(channel_settings["report_channel"]) or int(settings["report_channel"])
             if not report_id:
                 self._note(channel.id, "no_report_channel")
                 return
@@ -508,19 +778,25 @@ class MessageWatch(commands.Cog):
                 return
 
             anonymise(window)
-            answers = await self.judge(window, getattr(channel, "name", str(channel.id)), key)
+            answers = await self.judge(
+                window,
+                getattr(channel, "name", str(channel.id)),
+                key,
+                str(channel_settings["purpose"]),
+                rules,
+            )
             if answers is None:
                 self._note(channel.id, "provider_unavailable")
                 return
             self._last_judged[channel.id] = time.time()
             self._last_error.pop(channel.id, None)
 
-            index, reasons = self.findings(answers, settings, len(window))
+            index, reasons, rule_index = self.findings(answers, settings, len(window), rules)
             if not reasons:
                 return
             try:
                 await report_channel.send(
-                    embed=self.report_embed(channel, window, index, reasons),
+                    embed=self.report_embed(channel, window, index, reasons, rule_index),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except discord.Forbidden:
@@ -580,11 +856,17 @@ class MessageWatch(commands.Cog):
         if full:
             await self.flush(channel)
 
-    @commands.group(name="watch")
+    # invoke_without_command, or the callback never runs for a bare `[p]watch`
+    # and the help it sends is unreachable. A command group that answers
+    # nothing is the same silent no-op this cog exists to avoid, just at the
+    # command surface instead of the judging one.
+    @commands.group(name="watch", invoke_without_command=True)
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
     async def watch_group(self, ctx: commands.Context) -> None:
         """Configure scam and hostility reporting."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
 
     @watch_group.command(name="key")
     @checks.is_owner()
@@ -598,6 +880,25 @@ class MessageWatch(commands.Cog):
         """Set the moderator channel that receives reports."""
         await self.config.guild(ctx.guild).report_channel.set(channel.id)
         await ctx.send(f"報告會送到 {channel.mention}。")
+
+    @watch_group.command(name="route")
+    async def watch_route(
+        self,
+        ctx: commands.Context,
+        channel: discord.TextChannel,
+        destination: discord.TextChannel | None = None,
+    ) -> None:
+        """Send one watched channel's reports somewhere other than the default.
+
+        `[p]watch route #樹洞 #樹洞管理` routes them; `[p]watch route #樹洞`
+        with no destination clears the route and falls back to `[p]watch report`.
+        """
+        if destination is None:
+            await self.config.channel(channel).report_channel.set(0)
+            await ctx.send(f"{channel.mention} 的報告改回送到伺服器預設的報告頻道。")
+            return
+        await self.config.channel(channel).report_channel.set(destination.id)
+        await ctx.send(f"{channel.mention} 的報告會送到 {destination.mention}。")
 
     @watch_group.command(name="disclosure")
     async def watch_disclosure(self, ctx: commands.Context, confirmation: str = "") -> None:
@@ -621,8 +922,12 @@ class MessageWatch(commands.Cog):
         if await scope.disclosure_version() != DISCLOSURE_VERSION:
             await ctx.send("請先閱讀並接受 `[p]watch disclosure`。")
             return
-        if not await scope.report_channel():
-            await ctx.send("請先用 `[p]watch report` 指定報告頻道。")
+        routed = await self.config.channel(channel).report_channel()
+        if not routed and not await scope.report_channel():
+            await ctx.send(
+                "請先用 `[p]watch report` 指定伺服器預設的報告頻道，"
+                "或用 `[p]watch route` 單獨指定這個頻道的報告去處。"
+            )
             return
         async with scope.watched_channels() as watched:
             if channel.id in watched:
@@ -657,6 +962,91 @@ class MessageWatch(commands.Cog):
                         message = f"停止監看 {channel.mention}，未送出的暫存也已清除。"
         await ctx.send(message)
 
+    @watch_group.group(name="rule", invoke_without_command=True)
+    async def watch_rule(self, ctx: commands.Context) -> None:
+        """Manage the rules a watched channel is judged against."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @watch_rule.command(name="add")
+    async def watch_rule_add(
+        self, ctx: commands.Context, channel: discord.TextChannel, *, text: str
+    ) -> None:
+        """Add one rule to one channel. One rule per command, deliberately."""
+        text = " ".join(text.split())
+        if not text:
+            await ctx.send("規則內容不能是空的。")
+            return
+        if len(text) > MAX_RULE_CHARS:
+            await ctx.send(f"單條規則請控制在 {MAX_RULE_CHARS} 字以內（目前 {len(text)} 字）。")
+            return
+        async with self.config.channel(channel).rules() as rules:
+            if len(rules) >= MAX_RULES:
+                await ctx.send(f"一個頻道最多 {MAX_RULES} 條規則，請先刪除不需要的。")
+                return
+            rules.append(text)
+            number = len(rules)
+        # A rule is moderator-written text echoed back verbatim, so a rule
+        # containing @everyone would otherwise ping the guild from here.
+        await ctx.send(
+            f"{channel.mention} 第 {number} 條：{text}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @watch_rule.command(name="list")
+    async def watch_rule_list(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ) -> None:
+        """Show a channel's rules, exactly as the model is given them."""
+        settings = await self.config.channel(channel).all()
+        rules = list(settings["rules"])
+        lines = [f"{number}. {rule}" for number, rule in enumerate(rules, start=1)]
+        embed = discord.Embed(
+            title=f"#{channel.name} 的判斷規則",
+            description="\n".join(lines) or "（尚未設定，這個頻道只做詐騙與敵意判斷）",
+            colour=discord.Colour.blurple(),
+        )
+        if settings["purpose"]:
+            embed.add_field(name="頻道用途", value=settings["purpose"], inline=False)
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @watch_rule.command(name="remove")
+    async def watch_rule_remove(
+        self, ctx: commands.Context, channel: discord.TextChannel, number: int
+    ) -> None:
+        """Remove one rule by the number `[p]watch rule list` shows."""
+        async with self.config.channel(channel).rules() as rules:
+            if not 1 <= number <= len(rules):
+                await ctx.send(f"沒有第 {number} 條。目前有 {len(rules)} 條。")
+                return
+            removed = rules.pop(number - 1)
+        # The numbers are positions, so removing one renumbers the rest. Saying
+        # so beats a moderator deleting the wrong rule next time.
+        await ctx.send(
+            f"已刪除第 {number} 條：{removed}\n後面的規則會往前遞補編號。",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @watch_rule.command(name="clear")
+    async def watch_rule_clear(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ) -> None:
+        """Remove every rule for one channel."""
+        await self.config.channel(channel).rules.set([])
+        await ctx.send(f"已清除 {channel.mention} 的所有規則，該頻道回到只做詐騙與敵意判斷。")
+
+    @watch_rule.command(name="purpose")
+    async def watch_rule_purpose(
+        self, ctx: commands.Context, channel: discord.TextChannel, *, text: str = ""
+    ) -> None:
+        """Set one sentence saying what this channel is for."""
+        text = " ".join(text.split())
+        if len(text) > MAX_PURPOSE_CHARS:
+            await ctx.send(f"請控制在 {MAX_PURPOSE_CHARS} 字以內（目前 {len(text)} 字）。")
+            return
+        await self.config.channel(channel).purpose.set(text)
+        await ctx.send(f"已設定 {channel.mention} 的用途說明。" if text else "已清除用途說明。")
+
     @watch_group.command(name="set")
     async def watch_set(self, ctx: commands.Context, key: str, value: str) -> None:
         """Change one threshold or window setting."""
@@ -685,6 +1075,9 @@ class MessageWatch(commands.Cog):
         rows = []
         for item in settings["watched_channels"]:
             parts = [f"<#{item}>", f"待判 `{len(self._pending.get(item, ()))}`"]
+            routed = int(await self.config.channel_from_id(item).report_channel())
+            if routed:
+                parts.append(f"→ <#{routed}>")
             judged = self._last_judged.get(item)
             parts.append(f"上次判斷 <t:{int(judged)}:R>" if judged else "尚未判斷過")
             noted = self._last_error.get(item)
@@ -703,17 +1096,25 @@ class MessageWatch(commands.Cog):
         watched = "\n".join(rows) or "（無）"
         report = f"<#{settings['report_channel']}>" if settings["report_channel"] else "（未設定）"
         embed = discord.Embed(title="MessageWatch 設定", colour=discord.Colour.blurple())
-        embed.add_field(
-            name="狀態",
-            value=f"揭露=`v{settings['disclosure_version']}` · 報告頻道={report}",
-            inline=False,
-        )
+        accepted = int(settings["disclosure_version"])
+        # A bumped disclosure halts every channel, and a list that still says
+        # "監看中" while nothing is judged is the silent no-op this cog exists
+        # to avoid producing.
+        if accepted != DISCLOSURE_VERSION:
+            state = (
+                f"⚠️ **已暫停**：目前接受的是 `v{accepted}`，最新為 `v{DISCLOSURE_VERSION}`。"
+                f"在管理員重新執行 `[p]watch disclosure` 並接受之前，所有頻道都不會送出或判斷任何訊息。"
+            )
+        else:
+            state = f"揭露=`v{accepted}` · 報告頻道={report}"
+        embed.add_field(name="狀態", value=state, inline=False)
         embed.add_field(name="監看中的頻道", value=watched, inline=False)
         embed.add_field(
             name="門檻",
             value=(
                 f"詐騙=`{settings['scam_threshold']}` · 敵意=`{settings['hostile_threshold']}` · "
-                f"火藥味=`{settings['heat_threshold']}`"
+                f"火藥味=`{settings['heat_threshold']}`\n"
+                f"違規=`{settings['rule_threshold']}` · 條文信心下限=`{settings['rule_confidence']}`"
             ),
             inline=False,
         )

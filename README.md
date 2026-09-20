@@ -131,7 +131,8 @@ anything: the entire output is one report a moderator reads and acts on.
 [p]cog install NyanCogs messagewatch
 [p]load messagewatch
 [p]watch key                     # owner only, stores the TypeSafe api_key
-[p]watch report #mod-log
+[p]watch report #mod-log         # the guild-wide default
+[p]watch route #樹洞 #樹洞管理    # one channel's reports, sent elsewhere
 [p]watch disclosure              # read it
 [p]watch disclosure I_ACCEPT
 [p]watch enable #a-channel       # one channel at a time
@@ -140,11 +141,46 @@ anything: the entire output is one report a moderator reads and acts on.
 Every channel is opted in separately and sends nothing until it is. An enabled
 channel is a standing export: message text goes to TypeSafe continuously, with
 nobody triggering it, which is unlike the on-demand `/summary`. Each request
-also carries the name of the channel. Discord user IDs, display names and
+also carries the name of the channel, and, where rules are configured for that
+channel, those rules and its purpose note. A venting or confession channel is
+where this export costs the most: what people write there is what they expect
+will not be repeated. Discord user IDs, display names and
 avatars are never sent; authors become labels such as `u1` generated per
 request and never stored. Attachments, embeds and links are
 not fetched or resolved. `[p]watch disable` stops a channel immediately and
 drops anything pending for it.
+
+A report quotes the channel it came from, so a channel can send its findings
+somewhere other than the default with `[p]watch route`. A venting channel's
+reports carry what someone wrote there, and fewer people should see those than
+see a scam alert. Without a route, reports go to the guild-wide channel.
+
+A channel can also be judged against its own posted rules:
+
+```text
+[p]watch rule purpose #樹洞 這裡是倒垃圾的地方，發文的人要的是被聽見，不是被指導
+[p]watch rule add #樹洞 下指導棋：告訴發文的人應該怎麼做、給建議或行動方案
+[p]watch rule list #樹洞
+```
+
+Rules are per channel, because a venting channel's rules would be absurd in a
+help channel. A channel with no rules asks exactly what it asked before the
+feature existed. The rules become the model's answer options rather than part of
+the conversation it reads: option labels have to describe what they select, and
+keeping the text out of the state means a member cannot write a rule into it.
+
+Reports name the rule and the message. Where the model is sure a rule was broken
+but not sure which one, the report says so instead of picking. A message that
+merely *talks about* the rules — pointing out that someone else broke one — is
+vetoed by a separate question, because with the rules posted in the channel that
+is the most common thing that looks like a violation without being one.
+
+Measured 2026-09-20 against `jev-1.13.0` with a real channel ruleset. On twelve
+held-out cases written after the design was fixed: 12/12 correct on whether a
+rule was broken at all, 11/12 on which rule (the miss sat between two adjacent
+rules on a genuinely borderline phrase), and no false positives among the five
+clean replies. Nineteen earlier cases were used while iterating and are not
+independent evidence.
 
 `[p]watch show` is the diagnostic surface: per watched channel it prints how
 many messages are pending, when that channel was last actually judged, and the
