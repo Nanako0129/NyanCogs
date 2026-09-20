@@ -2499,10 +2499,53 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(0, cog._image_cache)
         self.assertIn(module.IMAGE_CACHE_SIZE + 4, cog._image_cache)
 
-    async def test_the_vision_endpoint_must_be_https(self) -> None:
-        # The image leaves Discord over this. Plain HTTP would put a member's
-        # screenshot on the wire in clear, so the command refuses rather than
-        # storing a setting that silently downgrades the transport.
+    def test_the_endpoint_rule_admits_a_lan_proxy_and_nothing_else(self) -> None:
+        # https anywhere, or http to a literal private address. A hostname is
+        # refused for http even when it would resolve inside those ranges: with
+        # no name there is no lookup, and with no lookup there is nothing for a
+        # later DNS answer to move.
+        for value in (
+            "https://openrouter.ai",
+            "http://192.168.123.208:8318",
+            "http://10.1.2.3", "http://172.16.0.1", "http://127.0.0.1:8318",
+            "http://[fd00::1]:8318", "http://[::1]",
+        ):
+            with self.subTest(allowed=value):
+                self.assertTrue(module.endpoint_is_allowed(value))
+        for value in (
+            "http://openrouter.ai",          # a name, not an address
+            "http://8.8.8.8",                # public
+            "http://172.32.0.1",             # one network past 172.16/12
+            "http://192.168.1.1@evil.com",   # userinfo, host is evil.com
+            "http://user:pw@192.168.1.1",    # credentials in the URL
+            # Credentials are refused on both schemes, not just the one the
+            # LAN rule made me think about. `[p]watch vision`'s display path is
+            # open to managers on purpose, so a stored password would be
+            # readable by someone who is not the owner who set it.
+            "https://user:pw@openrouter.ai",
+            "https://:pw@openrouter.ai",
+            "https://user@openrouter.ai",
+            # Empty userinfo carries no credential, so this one is not a leak.
+            # It is here because the rule is "no userinfo", and a truthiness
+            # test reads `username == ""` as absent and lets it through.
+            "https://@openrouter.ai",
+            "http://@192.168.1.1",
+            # `urlsplit` defers the port, so these parse until something reads
+            # it. Refused here rather than stored and failing at request time.
+            "http://192.168.1.2:not-a-port",
+            "https://openrouter.ai:70000",
+            "ftp://192.168.1.1", "http://", "https://", "",
+        ):
+            with self.subTest(refused=value):
+                self.assertFalse(module.endpoint_is_allowed(value))
+
+    async def test_the_command_enforces_the_endpoint_rule_and_the_length_bound(self) -> None:
+        # The image leaves Discord over this, so plain HTTP across the internet
+        # would put a member's screenshot on the wire in clear. HTTPS is
+        # required except for a literal private-network, ULA or loopback
+        # address, which is how a bot behind a geo-block reaches its provider
+        # through a proxy it owns. The command refuses rather than storing a
+        # setting that silently downgrades the transport.
         cog = object.__new__(MessageWatch)
         cog.config = MagicMock()
         cog.config.set_raw = AsyncMock()
@@ -2515,6 +2558,12 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
 
         await command(cog, ctx, "api_base", value="http://openrouter.ai")
         scope.set_raw.assert_not_awaited()
+        await command(cog, ctx, "api_base", value="http://8.8.8.8")
+        scope.set_raw.assert_not_awaited()
+        # A LAN proxy is the reason this is not simply an https check.
+        await command(cog, ctx, "api_base", value="http://192.168.123.208:8318")
+        scope.set_raw.assert_awaited_with("image_api_base", value="http://192.168.123.208:8318")
+        scope.set_raw.reset_mock()
         await command(cog, ctx, "api_base", value="x" * 201)
         scope.set_raw.assert_not_awaited()
 

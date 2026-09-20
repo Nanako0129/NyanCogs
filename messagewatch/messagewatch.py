@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import re
@@ -26,6 +27,7 @@ from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Iterable, Mapping, NamedTuple
+from urllib.parse import urlsplit
 
 import aiohttp
 import discord
@@ -349,7 +351,9 @@ DISCLOSURE_TEXT = (
     "the message text as part of the same judgement, so text that was only ever inside an "
     "image reaches both providers. An image can carry a face, a document, or a screenshot of "
     "someone else's private conversation, so this is a heavier export than text and is "
-    "decided one channel at a time.\n"
+    "decided one channel at a time. The vision endpoint is normally https, but the bot "
+    "owner may point it at a plain-HTTP address on a private network, in which case the "
+    "image bytes and the API key cross that network unencrypted.\n"
     "**What does not:** Discord user IDs, display names and avatars are never sent. Authors are "
     "replaced with labels such as u1 and u2, generated per request and never stored. Embeds and "
     "links are not fetched or resolved. Image attachments are fetched only where a manager has "
@@ -630,6 +634,65 @@ def build_state(
             f"第 {number} 條" for number in range(1, len(rules) + 1)
         ]
     return state
+
+
+LAN_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("::1/128"),
+)
+
+
+def endpoint_is_allowed(value: str) -> bool:
+    """Whether the vision endpoint may be stored.
+
+    `https://` to anywhere, or `http://` to a literal address inside
+    LAN_NETWORKS. An image leaves Discord over this, so plain HTTP means a
+    member's screenshot on the wire in clear -- acceptable on a LAN segment the
+    owner controls, which is the same trade ChannelSummary already makes and
+    discloses, and not acceptable across the internet.
+
+    A hostname is refused for `http://` even when it resolves inside those
+    ranges today. ChannelSummary handles hostnames by resolving them and
+    checking every record at request time, because it has to; this setting does
+    not, so the smaller rule is available: with no name there is no lookup, and
+    with no lookup there is nothing for a later DNS answer to move.
+    """
+    try:
+        parts = urlsplit(value)
+        # `urlsplit` defers the port: a bad one raises only when it is read.
+        # Reading it here means a malformed endpoint is refused at the command
+        # rather than stored, left looking configured, and failing at the first
+        # request where nothing surfaces the reason.
+        parts.port
+    except ValueError:
+        return False
+    # Before either scheme branch. Credentials in the URL would be readable by
+    # any manager through `[p]watch vision`'s display path, which is open on
+    # purpose so the people configuring a channel can see the endpoint.
+    #
+    # Presence, not truthiness: `urlsplit("https://@host")` gives `username`
+    # as the empty string, which `or` reads as absent. That form carries no
+    # credential, so it is not a leak -- but "no userinfo" is a rule one can
+    # state and test, and "no non-empty userinfo" is not the rule the comment
+    # above claims. An "@" inside the netloc is always the userinfo separator.
+    if "@" in parts.netloc:
+        return False
+    if parts.scheme == "https":
+        return bool(parts.hostname)
+    if parts.scheme != "http":
+        return False
+    host = parts.hostname or ""
+    # urlsplit strips the brackets from an IPv6 authority, so this parses both
+    # "http://10.0.0.1:80" and "http://[fd00::1]:80".
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(address in network for network in LAN_NETWORKS)
 
 
 def eligible_attachments(message: Any) -> list[dict[str, Any]]:
@@ -2061,10 +2124,13 @@ class MessageWatch(commands.Cog):
             return
         stored, _ = fields[key]
         value = value.strip()
-        if key == "api_base" and value and not value.startswith("https://"):
-            # The image leaves Discord over this, so plain HTTP would put a
-            # member's screenshot on the wire in clear.
-            await ctx.send("`api_base` 必須是 `https://` 開頭。")
+        if key == "api_base" and value and not endpoint_is_allowed(value):
+            await ctx.send(
+                "`api_base` 必須是 `https://`，或是 `http://` 加上區網的 IP"
+                "（RFC1918、IPv6 ULA 或 loopback），例如 `http://192.168.1.2:8318`。"
+                "\n`http://` 只接受字面 IP，不接受主機名——主機名要靠 DNS 解析，"
+                "而解析結果可以在設定之後改變。"
+            )
             return
         if len(value) > 200:
             await ctx.send("太長了，請控制在 200 字元內。")
