@@ -1244,10 +1244,13 @@ class TestActionAddressing(unittest.TestCase):
         # ceiling -- an earlier version of this test used 19 and reported a
         # worst case three characters short of the true one.
         snowflake = 2**64 - 1
-        widest = max(
-            (module.build_custom_id(action, "s", snowflake, snowflake, snowflake)
-             for action in module.ACTIONS),
-            key=len,
+        # Longest action name, not longest built id: everything else in the
+        # format is fixed width, so the two are the same thing, and taking the
+        # action first keeps the round-trip assertion below from depending on
+        # which of two equal-length names `max` happens to return.
+        widest_action = max(module.ACTIONS, key=len)
+        widest = module.build_custom_id(
+            widest_action, "s", snowflake, snowflake, snowflake
         )
         self.assertLessEqual(len(widest), module.CUSTOM_ID_LIMIT)
         self.assertEqual(len(widest), 72)
@@ -1256,7 +1259,8 @@ class TestActionAddressing(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.build_custom_id("x" * 120, "s", 1, 2, 3)
         self.assertEqual(
-            module.parse_custom_id(widest), ("mute", "s", snowflake, snowflake, snowflake)
+            module.parse_custom_id(widest),
+            (widest_action, "s", snowflake, snowflake, snowflake),
         )
 
     def test_a_custom_id_is_untrusted_input(self) -> None:
