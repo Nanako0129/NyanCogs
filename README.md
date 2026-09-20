@@ -125,7 +125,12 @@ MessageWatch reports likely scam messages and hostile exchanges to a moderator
 channel. It judges short rolling windows of recent messages with
 [TypeSafe Jev](https://docs.typesafe.ai/), a model that returns calibrated
 probabilities rather than text. It never deletes, edits, reacts to, or punishes
-anything: the entire output is one report a moderator reads and acts on.
+anything on its own. A report can carry buttons, and only a moderator holding
+the matching Discord permission can press one: marking a report right or wrong
+records a count, while deleting a message, timing a member out or adding a role
+happen only on a press and are recorded in the modlog under that moderator's
+name. Which buttons a channel's reports carry is set per channel and defaults to
+the two marks.
 
 ```text
 [p]cog install NyanCogs messagewatch
@@ -149,6 +154,29 @@ avatars are never sent; authors become labels such as `u1` generated per
 request and never stored. Attachments, embeds and links are
 not fetched or resolved. `[p]watch disable` stops a channel immediately and
 drops anything pending for it.
+
+Which buttons a report carries is per channel, and defaults to the two marks:
+
+```text
+[p]watch action set #一般討論 ok no del      # marks plus delete
+[p]watch action set #樹洞 ok no role         # marks plus a blacklist role
+[p]watch action role #樹洞 @樹洞黑名單
+[p]watch marks                               # what moderators have marked so far
+```
+
+`ok` and `no` act on nothing: they record whether a report was right, which is
+the only precision data this cog can ever accumulate — every threshold in it was
+set from synthetic cases and a hand-written test set. `[p]watch marks` prints
+those counts and says plainly that they measure precision, not recall: a case
+the cog missed never produced a report to mark.
+
+`del`, `mute` and `role` act, and only when a moderator holding the matching
+Discord permission presses them. The check is on the presser, not on who can see
+the moderator channel. Each action is recorded in Red's modlog under that
+moderator's name, and the report itself gains a line saying who did what.
+
+Buttons are addressed entirely through their own `custom_id`, so a report stays
+usable after a restart and the cog keeps no record of a pending one.
 
 A report quotes the channel it came from, so a channel can send its findings
 somewhere other than the default with `[p]watch route`. A venting channel's

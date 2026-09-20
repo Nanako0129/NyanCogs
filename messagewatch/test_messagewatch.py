@@ -30,7 +30,8 @@ CHANNEL_CLAUSE = "name of the channel"
 
 def window(*authors: int) -> list[dict[str, object]]:
     return [
-        {"author_id": author, "text": f"m{index}", "jump_url": f"https://d/{index}"}
+        {"author_id": author, "message_id": 900 + index, "text": f"m{index}",
+         "jump_url": f"https://d/{index}"}
         for index, author in enumerate(authors)
     ]
 
@@ -220,7 +221,10 @@ class TestReport(unittest.TestCase):
         self.assertIn("<@222>", rendered)
         self.assertIn("https://d/1", rendered)
         self.assertIn("<#5>", rendered)
-        self.assertIn("不會刪除、禁言或加反應", rendered)
+        # The footer no longer claims the cog cannot act -- it can, on a press.
+        # What it must still say is that nothing happens without one.
+        self.assertIn("只有你按才會發生", rendered)
+        self.assertNotIn("不會刪除", rendered)
 
         # No index: the report says where to look without pointing at anyone.
         # Linking one message here reads as an accusation of whoever wrote it.
@@ -1012,6 +1016,129 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(module.MAX_RULES), ctx.send.await_args.args[0])
 
 
+class TestActionAddressing(unittest.TestCase):
+    def test_a_custom_id_round_trips_and_fits_discord_limit(self) -> None:
+        # Discord rejects the whole message when a custom_id is too long, so
+        # the failure would be an alert that never arrives. discord.py does not
+        # check it, which was measured.
+        widest = module.build_custom_id("mute", "s", 10**19 - 1, 10**19 - 1, 10**19 - 1)
+        self.assertLessEqual(len(widest), module.CUSTOM_ID_LIMIT)
+        # Asserting the built length only restates what the function produced;
+        # it cannot fail when the guard is deleted. This drives the guard.
+        with self.assertRaises(ValueError):
+            module.build_custom_id("x" * 120, "s", 1, 2, 3)
+        self.assertEqual(
+            module.parse_custom_id(widest), ("mute", "s", 10**19 - 1, 10**19 - 1, 10**19 - 1)
+        )
+
+    def test_a_custom_id_is_untrusted_input(self) -> None:
+        # It names a message about to be deleted and a member about to be
+        # punished, and it arrives from Discord.
+        for bad in (
+            "", "nope:del:s:1:2:3", "mw:evict:s:1:2:3", "mw:del:s:1:2",
+            "mw:del:s:1:2:3:4", "mw:del:s:1:2:٣", "mw:del:s:1:2:-3",
+            "mw:del::1:2:3", "mw:del:s:1:2:" + "9" * 21, None, 7,
+        ):
+            with self.subTest(bad=str(bad)[:24]):
+                self.assertIsNone(module.parse_custom_id(bad))
+
+    def test_the_buttons_offered_are_the_ones_configured(self) -> None:
+        view = module.build_action_view(["ok", "no", "del"], "s", 5, 900, 42)
+        self.assertEqual([item.label for item in view.children], ["屬實", "誤判", "刪除訊息"])
+        self.assertIsNone(view.timeout)
+        # An action needing a target message is dropped when there is none,
+        # rather than offered and failing on the click.
+        partial = module.build_action_view(["ok", "del", "mute"], "s", 5, 0, 0)
+        self.assertEqual([item.label for item in partial.children], ["屬實"])
+        self.assertIsNone(module.build_action_view([], "s", 5, 900, 42))
+        self.assertIsNone(module.build_action_view(["nonsense"], "s", 5, 900, 42))
+
+    def test_the_mark_kind_names_the_judgement_that_was_marked(self) -> None:
+        # A mark is only useful for calibration if it says which judgement it
+        # was about.
+        self.assertEqual(module.reason_kind(["詐騙 0.97"]), "s")
+        self.assertEqual(module.reason_kind(["敵意 0.95", "火藥味 2.60/3"]), "h")
+        self.assertEqual(module.reason_kind(["違反第 2 條：下指導棋"]), "r")
+        self.assertEqual(module.reason_kind(["疑似違規，條文不確定，最接近第 6 條"]), "r")
+        self.assertEqual(module.reason_kind(["火藥味 2.60/3"]), "t")
+
+
+class TestActionPermissions(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def interaction(custom_id, *, perms=None, member=True):
+        guild = MagicMock()
+        clicker = MagicMock()
+        clicker.guild_permissions = SimpleNamespace(
+            **{"manage_messages": False, "moderate_members": False, "manage_roles": False,
+               **(perms or {})}
+        )
+        guild.get_member.return_value = clicker if member else None
+        interaction = MagicMock()
+        interaction.type = discord.InteractionType.component
+        interaction.data = {"custom_id": custom_id}
+        interaction.guild = guild
+        interaction.user = SimpleNamespace(id=7, mention="<@7>")
+        interaction.response.send_message = AsyncMock()
+        interaction.response.send_modal = AsyncMock()
+        interaction.message = None
+        return interaction, guild
+
+    @staticmethod
+    def cog():
+        cog = object.__new__(MessageWatch)
+        cog.bot = MagicMock()
+        cog.config = MagicMock()
+        return cog
+
+    async def test_permission_is_the_clickers_not_the_channels(self) -> None:
+        # Anyone who can read the moderator channel could otherwise act on a
+        # report just by pressing.
+        for action, needed in (("del", "manage_messages"), ("mute", "moderate_members"),
+                               ("role", "manage_roles")):
+            with self.subTest(action=action):
+                custom_id = module.build_custom_id(action, "s", 5, 900, 42)
+                interaction, _ = self.interaction(custom_id)
+                await MessageWatch.on_interaction(self.cog(), interaction)
+                sent = interaction.response.send_message.await_args
+                self.assertIn(needed, sent.args[0])
+                self.assertTrue(sent.kwargs["ephemeral"])
+                interaction.response.send_modal.assert_not_awaited()
+
+    async def test_a_mark_needs_no_permission_because_it_acts_on_nothing(self) -> None:
+        cog = self.cog()
+        scope = MagicMock()
+        scope.marks = MagicMock(return_value=ValueContext({}))
+        cog.config.guild.return_value = scope
+        cog._audit = AsyncMock()
+        interaction, _ = self.interaction(module.build_custom_id("ok", "s", 5, 900, 42))
+        await MessageWatch.on_interaction(cog, interaction)
+        self.assertIn("屬實", interaction.response.send_message.await_args.args[0])
+
+    async def test_an_unrelated_interaction_is_left_alone(self) -> None:
+        for data in ({"custom_id": "someone-elses-button"}, {}, None):
+            with self.subTest(data=str(data)[:24]):
+                interaction, _ = self.interaction("x")
+                interaction.data = data
+                await MessageWatch.on_interaction(self.cog(), interaction)
+                interaction.response.send_message.assert_not_awaited()
+
+        # And a non-component interaction, such as a slash command.
+        interaction, _ = self.interaction(module.build_custom_id("ok", "s", 5, 900, 42))
+        interaction.type = discord.InteractionType.application_command
+        await MessageWatch.on_interaction(self.cog(), interaction)
+        interaction.response.send_message.assert_not_awaited()
+
+    async def test_a_departed_member_stops_the_action(self) -> None:
+        custom_id = module.build_custom_id("mute", "s", 5, 900, 42)
+        interaction, guild = self.interaction(custom_id, perms={"moderate_members": True})
+        clicker = guild.get_member.return_value
+        # The clicker resolves; the member the button names does not.
+        guild.get_member.side_effect = lambda uid: clicker if uid == 7 else None
+        await MessageWatch.on_interaction(self.cog(), interaction)
+        self.assertIn("找不到這位成員", interaction.response.send_message.await_args.args[0])
+        interaction.response.send_modal.assert_not_awaited()
+
+
 class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
     async def test_watch_show_stays_inside_the_embed_field_limit(self) -> None:
         # The guild that needs this surface most is the one watching enough
@@ -1271,6 +1398,8 @@ class TestDataStatement(unittest.TestCase):
             "rules": "The configured rules",
             "purpose": "the purpose note",
             "report_channel": "the report-route channel ID set by [p]watch route",
+            "actions": "the list of report buttons",
+            "action_role": "the role ID the role button adds",
         }
         self.assertEqual(set(module.DEFAULT_CHANNEL), set(phrases))
         statement = self.statement()
@@ -1282,7 +1411,9 @@ class TestDataStatement(unittest.TestCase):
         statement = self.statement()
         for phrase in (
             "Discord user IDs, display names, and avatars are never sent",
-            "never deletes, edits, reacts to, or punishes anything",
+            "The bot never acts on its own",
+            "only a moderator holding the matching Discord permission can press one",
+            "recorded in the modlog under that moderator's name",
             "a guild manager enables it individually",
             "It does not store message content",
         ):
@@ -1292,7 +1423,8 @@ class TestDataStatement(unittest.TestCase):
     def test_the_disclosure_says_it_is_continuous_and_untriggered(self) -> None:
         for phrase in (
             "with nobody triggering it",
-            "never deletes, edits, reacts to, or punishes anything",
+            "The bot never acts on its own",
+            "only a moderator with the matching Discord permission can press one",
             "generated per request and never stored",
         ):
             with self.subTest(phrase=phrase):

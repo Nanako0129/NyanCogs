@@ -21,12 +21,13 @@ import logging
 import re
 import time
 from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Iterable, Mapping
 
 import aiohttp
 import discord
-from redbot.core import Config, checks, commands
+from redbot.core import Config, checks, commands, modlog
 from redbot.core.bot import Red
 from redbot.core.utils.views import SetApiView
 
@@ -88,6 +89,28 @@ MAX_PURPOSE_CHARS = 500
 # How much of a rule is echoed into the report's reason line.
 RULE_REASON_CHARS = 60
 
+# Buttons are addressed entirely through their own custom_id, so a report stays
+# usable after a restart with no view registration to keep in step. Discord caps
+# a custom_id at 100 characters: "mw" + action + kind + three snowflakes + five
+# separators is 71 at the widest, which CUSTOM_ID_LIMIT asserts at build time
+# rather than leaving to a rejected message nobody sees.
+ACTION_PREFIX = "mw"
+CUSTOM_ID_LIMIT = 100
+
+# label, style, the permission the clicking member needs, whether it acts on
+# Discord at all. The two marks act on nothing: they record what a moderator
+# judged, which is the only source of real precision data this cog can ever
+# have -- every threshold in it came from synthetic cases.
+ACTIONS: dict[str, tuple[str, str, str | None]] = {
+    "ok": ("屬實", "secondary", None),
+    "no": ("誤判", "secondary", None),
+    "del": ("刪除訊息", "danger", "manage_messages"),
+    "mute": ("禁言作者", "danger", "moderate_members"),
+    "role": ("加上身分組", "danger", "manage_roles"),
+}
+DEFAULT_ACTIONS = ["ok", "no"]
+MAX_TIMEOUT_MINUTES = 40_320  # Discord's own ceiling for a timeout: 28 days.
+
 DEFAULT_CHANNEL = {
     "rules": [],
     "purpose": "",
@@ -96,6 +119,12 @@ DEFAULT_CHANNEL = {
     # a venting channel's findings carry what someone wrote there, and fewer
     # people should see those than see a scam alert.
     "report_channel": 0,
+    # Which buttons a report from this channel carries. Marks only by default:
+    # every action beyond them changes what this cog does to members, so a
+    # manager turns each on for the channel it makes sense in. The ruleset that
+    # prompted the feature enforces with a role, not a delete.
+    "actions": list(DEFAULT_ACTIONS),
+    "action_role": 0,
 }
 
 # Measured 2026-09-20 against jev-1.13.0 with a real channel ruleset (the one
@@ -124,6 +153,11 @@ DEFAULT_GUILD = {
     "cooldown_seconds": 300,
     "rule_threshold": DEFAULT_RULE_THRESHOLD,
     "rule_confidence": DEFAULT_RULE_CONFIDENCE,
+    # Counts only, keyed by which judgement was marked: {"s": {"ok": n, "no": n}}.
+    # No message content, no author, no timestamp -- the data statement's "does
+    # not store message content" stays true, and this is still the only real
+    # precision data this cog can ever accumulate.
+    "marks": {},
 }
 
 SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
@@ -141,7 +175,7 @@ SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
 # exactly what it exists to re-ask about, and a guild that accepted version 1
 # never saw them. Bumping halts every guild until a manager accepts again,
 # which is why `[p]watch show` says so in its first field.
-DISCLOSURE_VERSION = 2
+DISCLOSURE_VERSION = 3
 DISCLOSURE_TEXT = (
     "**What leaves Discord:** in an enabled channel, the text of recent human messages is sent "
     "to TypeSafe continuously, together with the name of the channel, with nobody triggering "
@@ -154,8 +188,12 @@ DISCLOSURE_TEXT = (
     "embeds and links are not fetched or resolved.\n"
     "**Vendor:** TypeSafe states it does not train on customer input. Its retention terms and the "
     "accuracy of its judgements are unverified by this cog.\n"
-    "**What the bot does with a result:** posts a report in the configured moderator channel. It "
-    "never deletes, edits, reacts to, or punishes anything.\n"
+    "**What the bot does with a result:** posts a report in the configured moderator channel. "
+    "The bot never acts on its own. A report can carry buttons, and only a moderator with the "
+    "matching Discord permission can press one: marking the report right or wrong records a "
+    "count and nothing else, while deleting a message, timing a member out or adding a role "
+    "happen only when a person presses that button, and each is recorded in the modlog with "
+    "their name.\n"
     "**Scope:** a channel sends nothing until it is enabled individually, and disabling it stops "
     "the sending immediately."
 )
@@ -376,6 +414,58 @@ def build_state(
     return state
 
 
+def build_custom_id(action: str, kind: str, channel_id: int, message_id: int, author_id: int) -> str:
+    """Address one button entirely in its own id, so a restart changes nothing.
+
+    Everything the handler needs travels here rather than in memory or in
+    storage: the cog keeps no record of a pending report, and a button clicked
+    a week after the bot last restarted still works.
+    """
+    parts = (ACTION_PREFIX, action, kind, str(channel_id), str(message_id), str(author_id))
+    custom_id = ":".join(parts)
+    if len(custom_id) > CUSTOM_ID_LIMIT:
+        # Discord rejects the message rather than the button, so the failure
+        # would be an alert that never arrives. discord.py does not check this.
+        raise ValueError(f"custom_id over {CUSTOM_ID_LIMIT}: {len(custom_id)}")
+    return custom_id
+
+
+def parse_custom_id(custom_id: str) -> tuple[str, str, int, int, int] | None:
+    """The action a click refers to, or None when it is not one of ours.
+
+    Untrusted: a custom_id arrives from Discord and names a message this cog is
+    about to delete and a member it is about to punish, so every field is
+    validated rather than coerced.
+    """
+    if not isinstance(custom_id, str):
+        return None
+    parts = custom_id.split(":")
+    if len(parts) != 6 or parts[0] != ACTION_PREFIX:
+        return None
+    action, kind = parts[1], parts[2]
+    if action not in ACTIONS or not kind.isascii() or not kind.isalpha():
+        return None
+    ids = []
+    for raw in parts[3:]:
+        if not raw.isascii() or not raw.isdigit() or len(raw) > 20:
+            return None
+        ids.append(int(raw))
+    return (action, kind, *ids)  # type: ignore[return-value]
+
+
+def reason_kind(reasons: list[str]) -> str:
+    """One letter naming what this report is mostly about, for the mark counts.
+
+    The counts exist to build the precision data this cog has never had: every
+    threshold in it was set from synthetic cases and a hand-written test set.
+    A mark is only useful if it says which judgement was right or wrong.
+    """
+    for prefix, kind in (("詐騙", "s"), ("違反", "r"), ("疑似違規", "r"), ("敵意", "h")):
+        if any(reason.startswith(prefix) for reason in reasons):
+            return kind
+    return "t"
+
+
 def anonymise(window: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Replace author IDs with labels that mean nothing outside this request."""
     aliases: dict[int, str] = {}
@@ -393,6 +483,76 @@ def clean_text(raw: str) -> str:
     text = re.sub(r"<a?:\w+:\d+>", "[emoji]", text)
     text = " ".join(text.split())
     return text[:MAX_MESSAGE_CHARS]
+
+
+class TimeoutModal(discord.ui.Modal, title="禁言作者"):
+    """Duration and reason, typed by the moderator rather than defaulted."""
+
+    minutes = discord.ui.TextInput(
+        label="禁言幾分鐘", placeholder="例如 60", max_length=6, required=True
+    )
+    reason = discord.ui.TextInput(
+        label="理由（會記進 modlog）",
+        style=discord.TextStyle.paragraph,
+        max_length=400,
+        required=False,
+    )
+
+    def __init__(self, cog: "MessageWatch", member: discord.Member) -> None:
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.member = member
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = str(self.minutes.value).strip()
+        if not raw.isascii() or not raw.isdigit():
+            await interaction.response.send_message("分鐘數要是數字。", ephemeral=True)
+            return
+        try:
+            span = int(raw)
+        except ValueError:
+            await interaction.response.send_message("分鐘數要是數字。", ephemeral=True)
+            return
+        if not 1 <= span <= MAX_TIMEOUT_MINUTES:
+            await interaction.response.send_message(
+                f"分鐘數要介於 1 與 {MAX_TIMEOUT_MINUTES}（Discord 上限 28 天）。", ephemeral=True
+            )
+            return
+        await self.cog.apply_timeout(interaction, self.member, span, str(self.reason.value or ""))
+
+
+def build_action_view(
+    actions: Iterable[str],
+    kind: str,
+    channel_id: int,
+    message_id: int,
+    author_id: int,
+) -> discord.ui.View | None:
+    """The buttons this channel was configured to offer, or None for none.
+
+    `timeout=None` and no registration: the handler reads the custom_id, so a
+    report stays usable across restarts without the cog holding any record of
+    it. An action that needs a target message is dropped when there is none,
+    rather than offered and failing on the click.
+    """
+    styles = {"secondary": discord.ButtonStyle.secondary, "danger": discord.ButtonStyle.danger}
+    view = discord.ui.View(timeout=None)
+    added = 0
+    for action in actions:
+        if action not in ACTIONS:
+            continue
+        label, style, _ = ACTIONS[action]
+        if action not in ("ok", "no") and not message_id:
+            continue
+        view.add_item(
+            discord.ui.Button(
+                label=label,
+                style=styles[style],
+                custom_id=build_custom_id(action, kind, channel_id, message_id, author_id),
+            )
+        )
+        added += 1
+    return view if added else None
 
 
 class MessageWatch(commands.Cog):
@@ -680,7 +840,7 @@ class MessageWatch(commands.Cog):
                 inline=False,
             )
         embed.set_footer(
-            text=f"判斷依據 {len(window)} 則訊息。這是提示，不是裁決；本 Cog 不會刪除、禁言或加反應。"
+            text=f"判斷依據 {len(window)} 則訊息。這是提示，不是裁決；下面的動作只有你按才會發生。"
         )
         return embed
 
@@ -794,10 +954,20 @@ class MessageWatch(commands.Cog):
             index, reasons, rule_index = self.findings(answers, settings, len(window), rules)
             if not reasons:
                 return
+            pointed = index if index is not None else rule_index
+            flagged = window[pointed] if pointed is not None else None
+            view = build_action_view(
+                channel_settings["actions"],
+                reason_kind(reasons),
+                channel.id,
+                int(flagged["message_id"]) if flagged else 0,
+                int(flagged["author_id"]) if flagged else 0,
+            )
             try:
                 await report_channel.send(
                     embed=self.report_embed(channel, window, index, reasons, rule_index),
                     allowed_mentions=discord.AllowedMentions.none(),
+                    view=view,
                 )
             except discord.Forbidden:
                 # A permission problem does not fix itself in five minutes, and
@@ -818,6 +988,170 @@ class MessageWatch(commands.Cog):
             # must not silence the channel for the whole cooldown with nothing
             # sent.
             self._last_report[channel.id] = time.monotonic()
+
+    async def _audit(self, interaction: discord.Interaction, line: str) -> None:
+        """Append what was done to the report itself, where a moderator reads it."""
+        message = interaction.message
+        if message is None or not message.embeds:
+            return
+        embed = message.embeds[0]
+        embed.add_field(name="已處理", value=line, inline=False)
+        try:
+            await message.edit(embed=embed)
+        except discord.HTTPException as error:
+            log.warning("messagewatch: could not annotate report (%s)", type(error).__name__)
+
+    async def _case(
+        self, guild: discord.Guild, action_type: str, user: Any, moderator: Any, reason: str
+    ) -> None:
+        """Record the action in Red's modlog, and carry on if it cannot be."""
+        try:
+            await modlog.create_case(
+                self.bot,
+                guild,
+                datetime.now(timezone.utc),
+                action_type,
+                user,
+                moderator=moderator,
+                reason=reason or "MessageWatch",
+            )
+        except Exception as error:  # modlog raises several unrelated types
+            # A recorded action that failed to log is still a recorded action;
+            # losing the case must not undo it or break the interaction.
+            log.warning("messagewatch: modlog case failed (%s)", type(error).__name__)
+
+    async def apply_timeout(
+        self, interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str
+    ) -> None:
+        """Time a member out, from the modal that asked how long."""
+        try:
+            await member.timeout(timedelta(minutes=minutes), reason=reason or "MessageWatch")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "機器人沒有權限禁言這位成員（可能身分組順序不足）。", ephemeral=True
+            )
+            return
+        except discord.HTTPException as error:
+            log.warning("messagewatch: timeout failed (%s)", type(error).__name__)
+            await interaction.response.send_message("禁言失敗。", ephemeral=True)
+            return
+        await interaction.response.send_message(f"已禁言 {minutes} 分鐘。", ephemeral=True)
+        await self._case(member.guild, "timeout", member, interaction.user, reason)
+        await self._audit(
+            interaction, f"{interaction.user.mention} 禁言 {member.mention} {minutes} 分鐘"
+        )
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        """Handle a report button.
+
+        Read straight from the custom_id rather than from a registered view, so
+        a button works after a restart and the cog stores nothing about a
+        pending report. Everything in that id is untrusted input.
+        """
+        if interaction.type is not discord.InteractionType.component:
+            return
+        data = interaction.data if isinstance(interaction.data, Mapping) else {}
+        parsed = parse_custom_id(data.get("custom_id", ""))
+        if parsed is None:
+            return
+        action, kind, channel_id, message_id, author_id = parsed
+        guild = interaction.guild
+        if guild is None:
+            return
+
+        # The clicking member's own permissions, not the fact that they can see
+        # the moderator channel. Anyone who can read a report could otherwise
+        # act on it.
+        needed = ACTIONS[action][2]
+        if needed is not None:
+            member = guild.get_member(interaction.user.id)
+            if member is None or not getattr(member.guild_permissions, needed, False):
+                await interaction.response.send_message(
+                    f"這個動作需要 `{needed}` 權限。", ephemeral=True
+                )
+                return
+
+        if action in ("ok", "no"):
+            await self._record_mark(interaction, guild, kind, action)
+            return
+        if action == "del":
+            await self._delete_target(interaction, guild, channel_id, message_id)
+            return
+        target = guild.get_member(author_id)
+        if target is None:
+            await interaction.response.send_message("找不到這位成員，可能已離開。", ephemeral=True)
+            return
+        if action == "mute":
+            await interaction.response.send_modal(TimeoutModal(self, target))
+            return
+        if action == "role":
+            await self._add_role(interaction, guild, target)
+
+    async def _record_mark(
+        self, interaction: discord.Interaction, guild: discord.Guild, kind: str, action: str
+    ) -> None:
+        """Count one moderator judgement. Counts only -- no message content."""
+        async with self.config.guild(guild).marks() as marks:
+            bucket = marks.setdefault(kind, {"ok": 0, "no": 0})
+            bucket[action] = int(bucket.get(action, 0)) + 1
+            total = dict(bucket)
+        label = "屬實" if action == "ok" else "誤判"
+        await interaction.response.send_message(
+            f"已記錄為{label}。這類判斷目前 屬實 {total['ok']} / 誤判 {total['no']}。",
+            ephemeral=True,
+        )
+        await self._audit(interaction, f"{interaction.user.mention} 標記為{label}")
+
+    async def _delete_target(
+        self, interaction: discord.Interaction, guild: discord.Guild, channel_id: int, message_id: int
+    ) -> None:
+        channel = guild.get_channel_or_thread(channel_id)
+        if channel is None:
+            await interaction.response.send_message("找不到原頻道。", ephemeral=True)
+            return
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+        except discord.NotFound:
+            await interaction.response.send_message("訊息已經不存在了。", ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.response.send_message("機器人沒有刪除該訊息的權限。", ephemeral=True)
+            return
+        except discord.HTTPException as error:
+            log.warning("messagewatch: delete failed (%s)", type(error).__name__)
+            await interaction.response.send_message("刪除失敗。", ephemeral=True)
+            return
+        await interaction.response.send_message("已刪除該訊息。", ephemeral=True)
+        await self._case(guild, "delete", message.author, interaction.user, "MessageWatch")
+        await self._audit(interaction, f"{interaction.user.mention} 刪除了該訊息")
+
+    async def _add_role(
+        self, interaction: discord.Interaction, guild: discord.Guild, member: discord.Member
+    ) -> None:
+        channel_settings = await self.config.channel_from_id(interaction.channel_id).all()
+        role_id = int(channel_settings.get("action_role") or 0)
+        role = guild.get_role(role_id) if role_id else None
+        if role is None:
+            await interaction.response.send_message(
+                "這個頻道還沒設定要加的身分組（`[p]watch action role`）。", ephemeral=True
+            )
+            return
+        try:
+            await member.add_roles(role, reason="MessageWatch")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "機器人沒有權限給這個身分組（可能身分組順序不足）。", ephemeral=True
+            )
+            return
+        except discord.HTTPException as error:
+            log.warning("messagewatch: add_roles failed (%s)", type(error).__name__)
+            await interaction.response.send_message("加身分組失敗。", ephemeral=True)
+            return
+        await interaction.response.send_message(f"已加上 {role.name}。", ephemeral=True)
+        await self._case(guild, "messagewatch_role", member, interaction.user, f"加上 {role.name}")
+        await self._audit(interaction, f"{interaction.user.mention} 給 {member.mention} 加上 {role.name}")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -846,6 +1180,7 @@ class MessageWatch(commands.Cog):
             self._pending[channel.id].append(
                 {
                     "author_id": author.id,
+                    "message_id": getattr(message, "id", 0),
                     "text": text,
                     "jump_url": getattr(message, "jump_url", ""),
                 }
@@ -899,6 +1234,76 @@ class MessageWatch(commands.Cog):
             return
         await self.config.channel(channel).report_channel.set(destination.id)
         await ctx.send(f"{channel.mention} 的報告會送到 {destination.mention}。")
+
+    @watch_group.group(name="action", invoke_without_command=True)
+    async def watch_action(self, ctx: commands.Context) -> None:
+        """Choose which buttons a channel's reports carry."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @watch_action.command(name="set")
+    async def watch_action_set(
+        self, ctx: commands.Context, channel: discord.TextChannel, *, names: str = ""
+    ) -> None:
+        """Set this channel's buttons, e.g. `ok no del`. Empty clears to marks only."""
+        wanted = [name for name in names.split() if name]
+        unknown = [name for name in wanted if name not in ACTIONS]
+        if unknown:
+            await ctx.send(f"不認得：{', '.join(unknown)}。可用：{', '.join(ACTIONS)}")
+            return
+        chosen = wanted or list(DEFAULT_ACTIONS)
+        # Order is the button order, and duplicates would render twice.
+        seen: list[str] = []
+        for name in chosen:
+            if name not in seen:
+                seen.append(name)
+        await self.config.channel(channel).actions.set(seen)
+        await ctx.send(f"{channel.mention} 的報告按鈕：{', '.join(seen)}")
+
+    @watch_action.command(name="role")
+    async def watch_action_role(
+        self, ctx: commands.Context, channel: discord.TextChannel, role: discord.Role | None = None
+    ) -> None:
+        """Set the role the `role` button adds, or clear it with no role."""
+        if role is None:
+            await self.config.channel(channel).action_role.set(0)
+            await ctx.send(f"已清除 {channel.mention} 的身分組設定。")
+            return
+        if role >= ctx.guild.me.top_role:
+            # Saying so now beats a button that looks configured and fails on
+            # the click, which is the same silent no-op in a slower form.
+            await ctx.send(
+                f"`{role.name}` 的順序高於或等於機器人的最高身分組，機器人無法給它。"
+                "請把機器人的身分組移到它上面。"
+            )
+            return
+        await self.config.channel(channel).action_role.set(role.id)
+        await ctx.send(
+            f"{channel.mention} 的「加上身分組」會給 `{role.name}`。",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @watch_group.command(name="marks")
+    async def watch_marks(self, ctx: commands.Context) -> None:
+        """Show what moderators have marked, which is the only precision data."""
+        marks = await self.config.guild(ctx.guild).marks()
+        names = {"s": "詐騙", "h": "敵意", "t": "火藥味", "r": "違規"}
+        rows = []
+        for key, label in names.items():
+            bucket = marks.get(key) or {}
+            ok, no = int(bucket.get("ok", 0)), int(bucket.get("no", 0))
+            if ok or no:
+                rate = ok / (ok + no)
+                rows.append(f"{label}：屬實 `{ok}` ／ 誤判 `{no}` — 準確率 `{rate:.0%}`")
+        embed = discord.Embed(
+            title="MessageWatch 標記統計",
+            description="\n".join(rows) or "（還沒有任何標記）",
+            colour=discord.Colour.blurple(),
+        )
+        embed.set_footer(
+            text="這些數字是精確率，不是召回率。漏掉而沒有報告的案例不會出現在這裡。"
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @watch_group.command(name="disclosure")
     async def watch_disclosure(self, ctx: commands.Context, confirmation: str = "") -> None:
