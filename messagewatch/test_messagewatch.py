@@ -427,12 +427,18 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         await cog.on_message(self.message(content="", attachments=[shot]))
         self.assertEqual(held, [True])
 
-    async def test_the_ordinary_path_does_not_read_the_channel_settings(self) -> None:
-        # The channel read sits on the image-only branch so a message with text
-        # still costs one settings lookup, not two.
-        cog = self.cog(images=True)
-        await cog.on_message(self.message(content="hello"))
-        cog.config.channel.assert_not_called()
+    async def test_a_channel_that_does_not_read_images_queues_none_of_them(self) -> None:
+        # Not merely "they are not sent": they are never stored. An earlier
+        # version queued attachments unconditionally and left `flush` to decide,
+        # which meant turning image reading on sent pictures posted while it was
+        # off. Nothing stale can be released because nothing stale is kept.
+        shot = SimpleNamespace(content_type="image/png", filename="s.png", size=4000,
+                               width=800, height=600, id=991,
+                               url="https://cdn.discordapp.com/x.png")
+        cog = self.cog(images=False)
+        await cog.on_message(self.message(content="hello", attachments=[shot]))
+        self.assertEqual(len(cog._pending[5]), 1)
+        self.assertEqual(cog._pending[5][0]["images"], [])
 
     async def test_nothing_is_queued_without_an_accepted_disclosure(self) -> None:
         cog = self.cog(disclosure_version=0)
@@ -1927,6 +1933,7 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
         cog.config.guild.return_value = scope
         channel_scope = MagicMock()
         channel_scope.all = AsyncMock(return_value=dict(module.DEFAULT_CHANNEL))
+        channel_scope.images = AsyncMock(return_value=module.DEFAULT_CHANNEL["images"])
         cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
         cog._pending = pending()
@@ -2009,6 +2016,7 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         cog.config.guild.return_value = scope
         channel_scope = MagicMock()
         channel_scope.all = AsyncMock(return_value=dict(module.DEFAULT_CHANNEL))
+        channel_scope.images = AsyncMock(return_value=module.DEFAULT_CHANNEL["images"])
         cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
         cog._pending = pending()

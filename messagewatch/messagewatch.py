@@ -1867,14 +1867,11 @@ class MessageWatch(commands.Cog):
         if channel.id not in set(settings["watched_channels"]):
             return
         text = clean_text(getattr(message, "content", "") or "")
-        # Captured unconditionally: it is local computation over metadata
-        # Discord already sent, and nothing leaves here. `flush` decides
-        # whether the channel actually reads them.
-        images = eligible_attachments(message)
         # A bare screenshot is the commonest shape a scam takes here and it
-        # carries no text at all, so dropping it at this gate made the image
-        # feature unreachable for the case it was built for.
-        if not text and not images:
+        # carries no text at all, so dropping it on empty text alone made the
+        # image feature unreachable for the case it was built for.
+        attachments = eligible_attachments(message)
+        if not text and not attachments:
             return
         async with self._locks[channel.id]:
             # Re-read inside the lock. `[p]watch disable` leaves the watched set
@@ -1883,14 +1880,18 @@ class MessageWatch(commands.Cog):
             # the clear and leave a disabled channel holding message text.
             if channel.id not in set(await self.config.guild(guild).watched_channels()):
                 return
-            # An image-only message is worth queueing only where the channel
-            # actually reads images; anywhere else it is an empty message that
-            # pushes real ones out of the window. Inside the lock because
-            # `[p]watch images off` takes this same lock: read outside it, a
-            # disable landing in between would still leave this item queued.
-            # Only on this branch, so an ordinary message with text still costs
-            # one settings lookup rather than two.
-            if not text and not await self.config.channel(channel).images():
+            # One read, answering both questions: whether this channel's queue
+            # should hold image references at all, and whether an image-only
+            # message is worth queueing. An earlier version skipped this read
+            # for messages that had text, storing attachments unconditionally
+            # so the ordinary path stayed at one settings lookup. That saving
+            # produced three separate findings in a row, the last of which was
+            # that a channel could queue attachments while image reading was
+            # off and have them sent when someone turned it on. The queue now
+            # holds an image only where the channel reads images, and the
+            # window between the two no longer exists to be reasoned about.
+            images = attachments if await self.config.channel(channel).images() else []
+            if not text and not images:
                 return
             self._pending[channel.id].append(
                 {
@@ -1899,7 +1900,7 @@ class MessageWatch(commands.Cog):
                     "text": text,
                     "jump_url": getattr(message, "jump_url", ""),
                     "at": time.monotonic(),
-                    # Captured above because the queue holds dictionaries and
+                    # Captured here because the queue holds dictionaries and
                     # the Message with its attachments is gone by the time the
                     # window is judged.
                     "images": images,
