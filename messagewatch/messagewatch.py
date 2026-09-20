@@ -623,9 +623,13 @@ class MessageWatch(commands.Cog):
             )
             if rule_reason is not None:
                 reasons.append(rule_reason)
+                # Deliberately not filled in as `index`. A scam finding whose
+                # own pointer was unreadable leaves `index` None so the report
+                # shows a range; borrowing the rule's pointer there would put
+                # the rule-breaker's name under a 詐騙 reason. The rule keeps
+                # its own field, and a report with only a rule finding shows
+                # the range plus that field.
                 rule_index = found
-                if index is None:
-                    index = found
 
         return index, reasons, rule_index
 

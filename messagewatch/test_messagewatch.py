@@ -733,10 +733,13 @@ class TestRules(unittest.TestCase):
         self.assertIn("倒垃圾用", body)
 
     def test_a_violation_names_the_rule_and_the_message(self) -> None:
-        index, reasons, _ = MessageWatch.findings(
+        index, reasons, rule_index = MessageWatch.findings(
             self.answers(), self.settings(), 4, self.RULES
         )
-        self.assertEqual(index, 1)
+        # The rule carries its own pointer; `index` belongs to the scam finding
+        # and stays empty when there is none.
+        self.assertIsNone(index)
+        self.assertEqual(rule_index, 1)
         self.assertEqual(len(reasons), 1)
         self.assertTrue(reasons[0].startswith("違反第 2 條：下指導棋"))
 
@@ -755,10 +758,10 @@ class TestRules(unittest.TestCase):
         # One member breaking a rule while another points at a different
         # message must still be reported; a veto that fired on any commentary
         # anywhere would silence the violation.
-        index, reasons, _ = MessageWatch.findings(
+        _, reasons, rule_index = MessageWatch.findings(
             self.answers(meta="3", index="1"), self.settings(), 4, self.RULES
         )
-        self.assertEqual(index, 1)
+        self.assertEqual(rule_index, 1)
         self.assertTrue(reasons[0].startswith("違反第 2 條"))
 
     def test_an_unreadable_veto_is_treated_as_a_veto(self) -> None:
@@ -826,10 +829,10 @@ class TestRules(unittest.TestCase):
         # that threw away a true positive to hide an uncertainty the moderator
         # is better off seeing. Whether a violation happened at all is decided
         # by a separate calibrated probability.
-        index, reasons, _ = MessageWatch.findings(
+        _, reasons, rule_index = MessageWatch.findings(
             self.answers(violation=0.94, confidence=0.67), self.settings(), 4, self.RULES
         )
-        self.assertEqual(index, 1)
+        self.assertEqual(rule_index, 1)
         self.assertTrue(reasons[0].startswith("疑似違規，條文不確定，最接近第 2 條"))
 
         # An unreadable confidence is uncertainty too, not a reason to drop it.
@@ -839,6 +842,35 @@ class TestRules(unittest.TestCase):
                     self.answers(confidence=bad), self.settings(), 4, self.RULES
                 )
                 self.assertTrue(reasons and reasons[0].startswith("疑似違規"))
+
+    def test_a_rule_pointer_never_stands_in_for_a_missing_scam_pointer(self) -> None:
+        # A scam whose own pointer was unreadable leaves index None on purpose
+        # so the report shows a range. Borrowing the rule's pointer there puts
+        # the rule-breaker's name under a 詐騙 reason -- the same
+        # mis-attribution the scam option labels were rebuilt to stop.
+        answers = self.answers(index="2")
+        answers["any_scam"] = {"noul": 0.97}
+        answers["scam_index"] = {"choice": "99"}
+        index, reasons, rule_index = MessageWatch.findings(
+            answers, self.settings(), 4, self.RULES
+        )
+        self.assertIsNone(index)
+        self.assertEqual(rule_index, 2)
+        self.assertTrue(reasons[0].startswith("詐騙"))
+
+        # Rendered, that is a range for the scam and a named message for the
+        # rule, never one link serving both.
+        rendered = json.dumps(
+            MessageWatch.report_embed(
+                SimpleNamespace(id=5, mention="<#5>"),
+                anonymise(window(11, 22, 33, 44)),
+                index, reasons, rule_index,
+            ).to_dict(),
+            ensure_ascii=False,
+        )
+        self.assertIn("範圍", rendered)
+        self.assertIn("違規的訊息", rendered)
+        self.assertNotIn("指向的訊息", rendered)
 
     def test_a_rule_finding_joins_the_other_reasons(self) -> None:
         answers = self.answers()
