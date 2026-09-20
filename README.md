@@ -233,7 +233,6 @@ Which buttons a report carries is set per channel and defaults to the two marks.
 | `mute` | Times the author out | `moderate_members` |
 | `role` | Adds the configured role to the author | `manage_roles` |
 
-The permission check is on the presser, not on who can see the moderator channel.
 Each acting button is recorded in Red's modlog under that moderator's name, and
 the report itself gains a line saying who did what.
 
@@ -379,8 +378,6 @@ Install the cog with Red's Downloader:
 Replace `[p]` with the bot's command prefix.
 
 ### Permissions
-
-The bot needs the following permissions:
 
 | Location | Permissions |
 |---|---|
