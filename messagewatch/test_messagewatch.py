@@ -2539,10 +2539,13 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             with self.subTest(refused=value):
                 self.assertFalse(module.endpoint_is_allowed(value))
 
-    async def test_the_vision_endpoint_must_be_https(self) -> None:
-        # The image leaves Discord over this. Plain HTTP would put a member's
-        # screenshot on the wire in clear, so the command refuses rather than
-        # storing a setting that silently downgrades the transport.
+    async def test_the_command_enforces_the_endpoint_rule_and_the_length_bound(self) -> None:
+        # The image leaves Discord over this, so plain HTTP across the internet
+        # would put a member's screenshot on the wire in clear. HTTPS is
+        # required except for a literal private-network, ULA or loopback
+        # address, which is how a bot behind a geo-block reaches its provider
+        # through a proxy it owns. The command refuses rather than storing a
+        # setting that silently downgrades the transport.
         cog = object.__new__(MessageWatch)
         cog.config = MagicMock()
         cog.config.set_raw = AsyncMock()
