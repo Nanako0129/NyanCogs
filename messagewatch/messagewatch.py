@@ -226,6 +226,11 @@ DEFAULT_RULE_CONFIDENCE = 0.70
 # "estimate" rather than stating a cost as fact.
 DEFAULT_TOKEN_PRICE_PER_MILLION = 0.042
 
+DEFAULT_GLOBAL = {
+    "image_api_base": "",
+    "image_model": "",
+}
+
 DEFAULT_GUILD = {
     "report_channel": 0,
     "watched_channels": [],
@@ -246,8 +251,7 @@ DEFAULT_GUILD = {
     # No default model. Picking one without measuring which reads CJK
     # screenshots best would be a guess dressed as a default, and the cog
     # refuses to send images until both of these are set.
-    "image_model": "",
-    "image_api_base": "",
+
     # Aggregate counters only -- integers, never message text or an author --
     # so the data statement's "does not store message content" stays true for
     # this too. Accumulated in memory and flushed here periodically, not on
@@ -338,8 +342,10 @@ DISCLOSURE_TEXT = (
     "most, because what people write there is what they expect will not be repeated.\n"
     "**Images:** off unless a manager enables it for a channel. When it is on, image "
     "attachments in that channel are downloaded, re-encoded and sent to a separate vision "
-    "provider, which is asked only to transcribe the characters in them; that transcription "
-    "is shown in the report. An image can carry a face, a document, or a screenshot of "
+    "provider, which is asked only to transcribe the characters in them. That transcription "
+    "then travels twice: it is shown in the report, and it is also sent on to TypeSafe with "
+    "the message text as part of the same judgement, so text that was only ever inside an "
+    "image reaches both providers. An image can carry a face, a document, or a screenshot of "
     "someone else's private conversation, so this is a heavier export than text and is "
     "decided one channel at a time.\n"
     "**What does not:** Discord user IDs, display names and avatars are never sent. Authors are "
@@ -849,6 +855,13 @@ class MessageWatch(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=0x4E59414E4D57415401, force_registration=True)
         self.config.register_guild(**DEFAULT_GUILD)
+        # The vision endpoint and model are global, not per guild. The API key
+        # they spend belongs to the bot owner and is shared across every guild,
+        # so a guild administrator able to set the endpoint could direct that
+        # bearer token -- and the images -- to a host of their choosing. Storing
+        # the destination at the same scope as the credential removes the class
+        # rather than guarding it.
+        self.config.register_global(**DEFAULT_GLOBAL)
         # Rules are per channel, not per guild: a venting channel's rules would
         # be absurd in a help channel, and it is the channel's own posted rules
         # that members agreed to.
@@ -1060,9 +1073,7 @@ class MessageWatch(commands.Cog):
         key = tokens.get("api_key") if isinstance(tokens, Mapping) else None
         return key if isinstance(key, str) and key else None
 
-    async def _attach_image_text(
-        self, window: list[dict[str, Any]], settings: Mapping[str, Any]
-    ) -> None:
+    async def _attach_image_text(self, window: list[dict[str, Any]]) -> None:
         """Read this window's images, bounded, and hang the text on each item.
 
         Bounded per window rather than per message: one post of twenty
@@ -1075,11 +1086,11 @@ class MessageWatch(commands.Cog):
                 if budget <= 0:
                     return
                 budget -= 1
-                text = await self.image_text(attachment, settings)
+                text = await self.image_text(attachment)
                 if text:
                     item["image_text"] = (item.get("image_text", "") + " " + text).strip()
 
-    async def image_text(self, attachment: Mapping[str, Any], settings: Mapping[str, Any]) -> str | None:
+    async def image_text(self, attachment: Mapping[str, Any]) -> str | None:
         """The characters in one attachment, or None when they could not be read.
 
         Every failure returns None for the same reason `judge` does: a
@@ -1093,8 +1104,9 @@ class MessageWatch(commands.Cog):
             self._image_cache.move_to_end(key)
             return cached
 
-        model = str(settings["image_model"]).strip()
-        api_base = str(settings["image_api_base"]).strip()
+        vision = await self.config.all()
+        model = str(vision["image_model"]).strip()
+        api_base = str(vision["image_api_base"]).strip()
         token = await self.get_image_key()
         if not model or not api_base or not token:
             return None
@@ -1586,7 +1598,7 @@ class MessageWatch(commands.Cog):
 
             anonymise(window)
             if channel_settings["images"]:
-                await self._attach_image_text(window, settings)
+                await self._attach_image_text(window)
             answers = await self.judge(
                 window,
                 getattr(channel, "name", str(channel.id)),
@@ -2004,12 +2016,18 @@ class MessageWatch(commands.Cog):
         carries a range and is rejected outside it. These two are free strings,
         and squeezing them into a numeric validator would have meant a range
         check that means nothing.
+
+        Bot owner only, and stored globally. The API key these two spend is
+        bot-wide and the owner's; an administrator of any guild the bot has
+        joined who could set the endpoint would be able to send that bearer
+        token, and every image, to a host of their choosing. Reading is left
+        open to the administrators who have to configure a channel around it.
         """
         fields = {
             "api_base": ("image_api_base", "視覺模型的 API 根位址，例如 `https://openrouter.ai`"),
             "model": ("image_model", "視覺模型名稱。沒有預設值——哪一個讀中文截圖最準還沒量過。"),
         }
-        scope = self.config.guild(ctx.guild)
+        scope = self.config
         if key not in fields:
             settings = await scope.all()
             lines = [
@@ -2020,11 +2038,16 @@ class MessageWatch(commands.Cog):
                 embed=discord.Embed(
                     title="MessageWatch 視覺模型設定",
                     description="\n\n".join(lines)
-                    + "\n\n用 `[p]watch vision <api_base|model> <值>` 設定。"
+                    + "\n\n用 `[p]watch vision <api_base|model> <值>` 設定（僅 bot owner）。"
                     + "\nAPI key 由 bot owner 用 `[p]set api messagewatch_vision api_key <key>` 存。",
                     colour=discord.Colour.blurple(),
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        if not await self.bot.is_owner(ctx.author):
+            await ctx.send(
+                "只有 bot owner 能改視覺模型的端點與模型名稱——它們花的是 bot 全域的 API key。"
             )
             return
         stored, _ = fields[key]
@@ -2058,10 +2081,16 @@ class MessageWatch(commands.Cog):
             await ctx.send(f"{channel.mention} 的圖片判讀目前是 **{state}**。")
             return
         if wanted == "off":
-            await scope.images.set(False)
+            # Under the channel lock, because `flush` reads `images` and then
+            # awaits the download and the vision call while holding it. Without
+            # this an in-flight window sends an attachment after the command has
+            # already reported that image reading is off -- the same disable
+            # contract `[p]watch disable` holds.
+            async with self._locks[channel.id]:
+                await scope.images.set(False)
             await ctx.send(f"已關閉 {channel.mention} 的圖片判讀。")
             return
-        settings = await self.config.guild(ctx.guild).all()
+        settings = await self.config.all()
         await scope.images.set(True)
         await ctx.send(
             f"已開啟 {channel.mention} 的圖片判讀。該頻道的圖片附件會被下載、縮放後送往視覺模型抽取文字。"

@@ -188,21 +188,29 @@ A channel can have its image attachments read, off by default:
 
 ```text
 [p]set api messagewatch_vision api_key <key>     # bot owner
-[p]watch vision api_base https://openrouter.ai
-[p]watch vision model <a model with image input>
-[p]watch images #一般討論 on
+[p]watch vision api_base https://openrouter.ai   # bot owner
+[p]watch vision model <a model with image input> # bot owner
+[p]watch images #一般討論 on                      # guild manager
 ```
 
 Only the **characters in the image** are asked for, verbatim — not a description
 of it. A scam here is a screenshot with text in it, the text is the evidence,
 and a description is open-ended generation whose errors nobody can check against
 the picture. The transcription goes into the same scam judgement that already
-exists, so it needs no rule of its own, and it is shown in the report: the
-extraction is generated text with nothing calibrated behind it, so a moderator
-has to be able to check it rather than trust a verdict built on it.
+exists, so it needs no rule of its own. That means the transcription travels
+twice: it is shown in the report, and it is sent on to TypeSafe with the message
+text, so words that existed only inside an image reach both providers. It is
+shown because the extraction is generated text with nothing calibrated behind
+it, and a moderator has to be able to check it rather than trust a verdict built
+on it.
 
 `[p]watch vision` is separate from `[p]watch set` because the latter takes only
-numbers — every threshold the cog has — and these two are strings.
+numbers — every threshold the cog has — and these two are strings. Both are
+stored globally and only the bot owner can write them: the API key they spend is
+bot-wide and the owner's, so an administrator of any guild the bot has joined who
+could set the endpoint would be able to send that bearer token, and every image,
+to a host of their own. Reading them stays open to the managers who have to
+configure a channel around them.
 
 Attachments are downscaled and re-encoded before they are sent, which discards
 EXIF including GPS tags. Results are cached by attachment id, so the same image

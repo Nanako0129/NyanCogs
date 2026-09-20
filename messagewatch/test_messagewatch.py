@@ -2356,13 +2356,9 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         scope = MagicMock()
         scope.images = MagicMock()
         scope.images.set = AsyncMock()
-        guild_scope = MagicMock()
-        guild_scope.all = AsyncMock(
-            return_value={**DEFAULT_GUILD, "image_model": "", "image_api_base": ""}
-        )
         cog.config = MagicMock()
         cog.config.channel.return_value = scope
-        cog.config.guild.return_value = guild_scope
+        cog.config.all = AsyncMock(return_value={"image_model": "", "image_api_base": ""})
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
         channel = SimpleNamespace(id=5, mention="<#5>", name="c")
 
@@ -2407,11 +2403,13 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
         cog._extract_text = AsyncMock()
+        cog.config = MagicMock()
         for settings in ({"image_model": "", "image_api_base": "https://x"},
                          {"image_model": "m", "image_api_base": ""}):
             with self.subTest(settings=settings):
+                cog.config.all = AsyncMock(return_value=settings)
                 with patch("messagewatch.messagewatch.aiohttp.ClientSession") as session:
-                    got = await cog.image_text({"id": 1, "url": "https://x/y.png"}, settings)
+                    got = await cog.image_text({"id": 1, "url": "https://x/y.png"})
                 self.assertIsNone(got)
                 # Not merely "no model call" -- the image is not even fetched,
                 # so an unconfigured channel costs nothing and sends nothing.
@@ -2426,8 +2424,10 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
         cog._extract_text = AsyncMock()
-        got = await cog.image_text({"id": 991, "url": "https://x/y.png"},
-                                   {"image_model": "m", "image_api_base": "https://x"})
+        cog.config = MagicMock()
+        cog.config.all = AsyncMock(
+            return_value={"image_model": "m", "image_api_base": "https://x"})
+        got = await cog.image_text({"id": 991, "url": "https://x/y.png"})
         self.assertEqual(got, "已經讀過的文字")
         cog._extract_text.assert_not_awaited()
 
@@ -2439,7 +2439,9 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._reset_state()
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
-        settings = {"image_model": "m", "image_api_base": "https://x"}
+        cog.config = MagicMock()
+        cog.config.all = AsyncMock(
+            return_value={"image_model": "m", "image_api_base": "https://x"})
         response = MagicMock()
         response.status = 200
         response.content.read = AsyncMock(return_value=b"bytes")
@@ -2456,7 +2458,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                       return_value=("image/png", b"x")):
             for i in range(module.IMAGE_CACHE_SIZE + 5):
                 cog._extract_text = AsyncMock(return_value=str(i))
-                await cog.image_text({"id": i, "url": f"https://x/{i}.png"}, settings)
+                await cog.image_text({"id": i, "url": f"https://x/{i}.png"})
         self.assertEqual(len(cog._image_cache), module.IMAGE_CACHE_SIZE)
         self.assertNotIn(0, cog._image_cache)
         self.assertIn(module.IMAGE_CACHE_SIZE + 4, cog._image_cache)
@@ -2466,10 +2468,11 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         # screenshot on the wire in clear, so the command refuses rather than
         # storing a setting that silently downgrades the transport.
         cog = object.__new__(MessageWatch)
-        scope = MagicMock()
-        scope.set_raw = AsyncMock()
         cog.config = MagicMock()
-        cog.config.guild.return_value = scope
+        cog.config.set_raw = AsyncMock()
+        scope = cog.config
+        cog.bot = MagicMock()
+        cog.bot.is_owner = AsyncMock(return_value=True)
         ctx = MagicMock()
         ctx.send = AsyncMock()
         command = MessageWatch.watch_vision.callback
@@ -2488,6 +2491,58 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         # without touching every channel.
         await command(cog, ctx, "api_base", value="")
         scope.set_raw.assert_awaited_with("image_api_base", value="")
+
+    async def test_only_the_bot_owner_can_aim_the_vision_endpoint(self) -> None:
+        # The API key these two spend is bot-wide and the owner's. An
+        # administrator of any guild the bot has joined who could set the
+        # endpoint would be able to send that bearer token, and every image, to
+        # a host of their own -- so the setting lives at the same scope as the
+        # credential and only the owner writes it.
+        cog = object.__new__(MessageWatch)
+        cog.config = MagicMock()
+        cog.config.set_raw = AsyncMock()
+        cog.bot = MagicMock()
+        cog.bot.is_owner = AsyncMock(return_value=False)
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        for key, value in (("api_base", "https://evil.example"), ("model", "m")):
+            with self.subTest(key=key):
+                await MessageWatch.watch_vision.callback(cog, ctx, key, value=value)
+                cog.config.set_raw.assert_not_awaited()
+        # And the endpoint is not a guild setting at all any more, so there is
+        # no per-guild copy left for an administrator to reach.
+        self.assertNotIn("image_api_base", DEFAULT_GUILD)
+        self.assertNotIn("image_model", DEFAULT_GUILD)
+        self.assertIn("image_api_base", module.DEFAULT_GLOBAL)
+
+    async def test_turning_images_off_takes_the_channel_lock(self) -> None:
+        # `flush` reads `images` and then awaits a download and a vision call
+        # while holding this lock. Without taking it, an in-flight window sends
+        # an attachment after the command has reported image reading is off --
+        # the same disable contract `[p]watch disable` holds.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        scope = MagicMock()
+        scope.images = MagicMock()
+        held = []
+        async def record(_value):
+            held.append(cog._locks[5].locked())
+        scope.images.set = AsyncMock(side_effect=record)
+        cog.config = MagicMock()
+        cog.config.channel.return_value = scope
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+        await MessageWatch.watch_images.callback(cog, ctx, channel, "off")
+        self.assertEqual(held, [True])
+
+    def test_the_transcription_is_part_of_what_reaches_typesafe(self) -> None:
+        # It travels twice -- shown in the report, and sent on with the message
+        # text -- so words that existed only inside an image reach both
+        # providers. The disclosure says so because this is what happens.
+        items = anonymise(window(11, 22))
+        items[1]["image_text"] = "您的帳號異常 請至 http://fake/verify 驗證"
+        sent = json.dumps(module.build_state("c", items), ensure_ascii=False)
+        self.assertIn("http://fake/verify", sent)
 
     async def test_the_cache_is_dropped_on_unload_and_on_a_deletion_request(self) -> None:
         # It is the only member content this cog holds. Keyed by attachment id
