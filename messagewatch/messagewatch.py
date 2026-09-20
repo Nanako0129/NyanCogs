@@ -29,6 +29,7 @@ import discord
 from redbot.core import Config, checks, commands
 from redbot.core.bot import Red
 from redbot.core.utils.views import SetApiView
+from discord.ext import tasks
 
 TOKEN_SERVICE = "messagewatch_typesafe"
 API_URL = "https://api.typesafe.ai/v1/systemone"
@@ -61,6 +62,19 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 # because the current exchange is the one worth judging. Must stay above the
 # largest `window_size` (25) or a window could never fill.
 MAX_PENDING_MESSAGES = 64
+
+# A window that never fills is never judged, and a quiet channel is exactly
+# where that bites: a venting channel is a post, two replies and then silence,
+# which is the shape the rules feature exists for. Past this many seconds with
+# no new message, whatever is queued is judged even though it is short of
+# window_size. Below MIN_PARTIAL_WINDOW there is not enough of an exchange to
+# judge -- hostility is a property of an exchange, so one message alone cannot
+# carry it -- and those are left for the next message to extend.
+DEFAULT_IDLE_SECONDS = 600
+MIN_PARTIAL_WINDOW = 2
+# How often the sweep looks. It only reads in-memory state unless a channel is
+# actually due, so the interval is about how late a report can be, not cost.
+IDLE_SWEEP_SECONDS = 60
 
 # Discord's own cap on one embed field value.
 EMBED_FIELD_LIMIT = 1024
@@ -124,6 +138,7 @@ DEFAULT_GUILD = {
     "cooldown_seconds": 300,
     "rule_threshold": DEFAULT_RULE_THRESHOLD,
     "rule_confidence": DEFAULT_RULE_CONFIDENCE,
+    "idle_seconds": DEFAULT_IDLE_SECONDS,
 }
 
 SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
@@ -134,6 +149,9 @@ SETTING_RULES: dict[str, tuple[type, Any, Any]] = {
     "cooldown_seconds": (int, 0, 86_400),
     "rule_threshold": (float, 0.0, 1.0),
     "rule_confidence": (float, 0.0, 1.0),
+    # 0 disables the sweep, which restores the pre-sweep behaviour exactly:
+    # a channel that never fills a window is never judged.
+    "idle_seconds": (int, 0, 86_400),
 }
 
 # 2: a channel's rules and its purpose note began leaving Discord with every
@@ -420,6 +438,55 @@ class MessageWatch(commands.Cog):
         self._last_judged: dict[int, float] = {}
         self._last_error: dict[int, tuple[float, str]] = {}
 
+    async def cog_load(self) -> None:
+        """Start the idle sweep."""
+        self._sweep.start()
+
+    async def cog_unload(self) -> None:
+        """Stop the sweep, so an unloaded cog stops judging.
+
+        The cog had no unload path at all before this. It still cannot cancel a
+        `flush` already running inside a discord.py dispatch task -- it does not
+        own those -- so an unload can still be followed by one report from a
+        request that was already out. What it can stop is this loop, which is
+        the only work the cog itself starts.
+        """
+        self._sweep.cancel()
+
+    @tasks.loop(seconds=IDLE_SWEEP_SECONDS)
+    async def _sweep(self) -> None:
+        """Judge the channels that went quiet before filling a window.
+
+        Without this a channel that never reaches `window_size` is never judged
+        at all, which is the silent no-op this cog is most exposed to: a venting
+        channel is a post, two replies and then nothing.
+        """
+        for channel_id, queue in list(self._pending.items()):
+            if not queue:
+                continue
+            channel = self.bot.get_channel(channel_id)
+            guild = getattr(channel, "guild", None)
+            if channel is None or guild is None:
+                continue
+            idle = int((await self.config.guild(guild).idle_seconds()) or 0)
+            if not idle:
+                continue
+            newest = queue[-1].get("at")
+            if not isinstance(newest, (int, float)) or time.monotonic() - newest < idle:
+                continue
+            await self.flush(channel, partial=True)
+
+    @_sweep.before_loop
+    async def _before_sweep(self) -> None:
+        """Wait for the cache, or `bot.get_channel` answers None for everything."""
+        await self.bot.wait_until_red_ready()
+
+    @_sweep.error
+    async def _sweep_error(self, error: BaseException) -> None:
+        """A failed sweep must not end the loop silently for the whole process."""
+        log.exception("messagewatch: idle sweep failed", exc_info=error)
+        self._sweep.restart()
+
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
         """Drop any pending message this user wrote that has not been sent yet."""
         for queue in self._pending.values():
@@ -684,7 +751,9 @@ class MessageWatch(commands.Cog):
         )
         return embed
 
-    def _take_window(self, channel_id: int, window_size: int) -> list[dict[str, Any]] | None:
+    def _take_window(
+        self, channel_id: int, window_size: int, minimum: int | None = None
+    ) -> list[dict[str, Any]] | None:
         """Copy one full window and advance the queue by half of it.
 
         The windows overlap. Consuming the whole batch would mean an exchange
@@ -698,14 +767,22 @@ class MessageWatch(commands.Cog):
         Callers hold `self._locks[channel_id]`; nothing here awaits.
         """
         queue = self._pending[channel_id]
-        if len(queue) < window_size:
+        floor = window_size if minimum is None else minimum
+        if len(queue) < floor:
             return None
-        window = [dict(item) for item in islice(queue, window_size)]
-        for _ in range(window_size - window_size // 2):
+        take = min(len(queue), window_size)
+        window = [dict(item) for item in islice(queue, take)]
+        # A short window is the tail of a finished conversation, so it is
+        # consumed whole: there is no later message for an overlap to join it
+        # to, and leaving half behind would have the sweep judge it again.
+        stride = take if take < window_size else window_size - window_size // 2
+        for _ in range(stride):
             queue.popleft()
         return window
 
-    async def flush(self, channel: discord.TextChannel | discord.Thread) -> None:
+    async def flush(
+        self, channel: discord.TextChannel | discord.Thread, *, partial: bool = False
+    ) -> None:
         """Judge one full window for this channel and report if it crosses.
 
         Everything this cog does to one channel happens under that channel's
@@ -764,7 +841,11 @@ class MessageWatch(commands.Cog):
                 self._note(channel.id, "no_api_key")
                 return
 
-            window = self._take_window(channel.id, int(settings["window_size"]))
+            window = self._take_window(
+                channel.id,
+                int(settings["window_size"]),
+                MIN_PARTIAL_WINDOW if partial else None,
+            )
             if window is None:
                 return
 
@@ -848,6 +929,7 @@ class MessageWatch(commands.Cog):
                     "author_id": author.id,
                     "text": text,
                     "jump_url": getattr(message, "jump_url", ""),
+                    "at": time.monotonic(),
                 }
             )
             full = len(self._pending[channel.id]) >= int(settings["window_size"])
@@ -1120,7 +1202,14 @@ class MessageWatch(commands.Cog):
         )
         embed.add_field(
             name="視窗",
-            value=f"每 `{settings['window_size']}` 則判一次 · 冷卻 `{settings['cooldown_seconds']}` 秒",
+            value=(
+                f"每 `{settings['window_size']}` 則判一次 · 冷卻 `{settings['cooldown_seconds']}` 秒\n"
+                + (
+                    f"安靜 `{settings['idle_seconds']}` 秒後判斷手上的（不足一個視窗也判）"
+                    if int(settings["idle_seconds"])
+                    else "閒置判斷 `關閉`：湊不滿一個視窗的頻道不會被判斷"
+                )
+            ),
             inline=False,
         )
         await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())

@@ -28,9 +28,9 @@ from .messagewatch import (
 CHANNEL_CLAUSE = "name of the channel"
 
 
-def window(*authors: int) -> list[dict[str, object]]:
+def window(*authors: int, at: float = 0.0) -> list[dict[str, object]]:
     return [
-        {"author_id": author, "text": f"m{index}", "jump_url": f"https://d/{index}"}
+        {"author_id": author, "text": f"m{index}", "jump_url": f"https://d/{index}", "at": at}
         for index, author in enumerate(authors)
     ]
 
@@ -1010,6 +1010,113 @@ class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
         await MessageWatch.watch_rule_add.callback(cog, ctx, channel, text="再一條")
         self.assertEqual(len(full), module.MAX_RULES)
         self.assertIn(str(module.MAX_RULES), ctx.send.await_args.args[0])
+
+
+class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
+    """A window that never fills was never judged, which is the silent no-op
+    this cog is most exposed to: a venting channel is a post, two replies and
+    then nothing, and that is the shape the rules feature exists for."""
+
+    def cog(self, *, idle=600):
+        cog = object.__new__(MessageWatch)
+        cog.bot = MagicMock()
+        scope = MagicMock()
+        scope.idle_seconds = AsyncMock(return_value=idle)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        cog._pending = pending()
+        cog._locks = module.defaultdict(module.asyncio.Lock)
+        cog.flush = AsyncMock()
+        return cog
+
+    @staticmethod
+    def channel():
+        guild = MagicMock()
+        channel = SimpleNamespace(id=5, guild=guild, name="c")
+        return channel
+
+    async def test_a_quiet_channel_is_judged_short_of_a_full_window(self) -> None:
+        cog = self.cog()
+        cog._pending = pending()
+        cog._pending[5].extend(window(1, 2, 3, at=module.time.monotonic() - 900))
+        channel = self.channel()
+        cog.bot.get_channel.return_value = channel
+        cog.flush = AsyncMock()
+        await MessageWatch._sweep.coro(cog)
+        cog.flush.assert_awaited_once_with(channel, partial=True)
+
+    async def test_a_channel_that_just_spoke_is_left_alone(self) -> None:
+        cog = self.cog()
+        cog._pending = pending()
+        cog._pending[5].extend(window(1, 2, 3, at=module.time.monotonic()))
+        cog.bot.get_channel.return_value = self.channel()
+        cog.flush = AsyncMock()
+        await MessageWatch._sweep.coro(cog)
+        cog.flush.assert_not_awaited()
+
+    async def test_idle_zero_restores_the_old_behaviour_exactly(self) -> None:
+        cog = self.cog(idle=0)
+        cog._pending = pending()
+        cog._pending[5].extend(window(1, 2, 3, at=module.time.monotonic() - 100_000))
+        cog.bot.get_channel.return_value = self.channel()
+        cog.flush = AsyncMock()
+        await MessageWatch._sweep.coro(cog)
+        cog.flush.assert_not_awaited()
+
+    async def test_an_empty_or_unresolvable_channel_is_skipped(self) -> None:
+        cog = self.cog()
+        cog._pending = pending()
+        cog._pending[5].extend([])
+        cog._pending[6].extend(window(1, 2, at=module.time.monotonic() - 900))
+        cog.bot.get_channel.return_value = None   # left the guild, or not cached
+        cog.flush = AsyncMock()
+        await MessageWatch._sweep.coro(cog)
+        cog.flush.assert_not_awaited()
+
+    async def test_unloading_stops_the_sweep(self) -> None:
+        # The cog had no unload path at all before this, so an unloaded cog
+        # kept a loop running for the life of the process. Started and
+        # cancelled for real rather than asserting the call.
+        cog = self.cog()
+        cog.bot.wait_until_red_ready = AsyncMock()
+        cog.bot.get_channel.return_value = None
+        await cog.cog_load()
+        self.assertTrue(cog._sweep.is_running())
+        await cog.cog_unload()
+        for _ in range(6):
+            await module.asyncio.sleep(0)
+        self.assertFalse(cog._sweep.is_running())
+
+    def test_a_short_window_is_consumed_whole(self) -> None:
+        # There is no later message for an overlap to join a finished
+        # conversation to, and leaving half behind would have the next sweep
+        # judge the same tail again.
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._pending[5].extend(window(1, 2, 3))
+        taken = cog._take_window(5, 8, module.MIN_PARTIAL_WINDOW)
+        self.assertEqual(len(taken), 3)
+        self.assertEqual(len(cog._pending[5]), 0)
+
+    def test_a_full_window_still_overlaps(self) -> None:
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._pending[5].extend(window(1, 2, 3, 4))
+        taken = cog._take_window(5, 4, module.MIN_PARTIAL_WINDOW)
+        self.assertEqual(len(taken), 4)
+        self.assertEqual(len(cog._pending[5]), 2)
+
+    def test_one_message_is_not_an_exchange(self) -> None:
+        # Hostility is a property of an exchange, so a lone message cannot
+        # carry it; it waits for the next one instead.
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._pending[5].extend(window(1))
+        self.assertIsNone(cog._take_window(5, 8, module.MIN_PARTIAL_WINDOW))
+        self.assertEqual(len(cog._pending[5]), 1)
+        # And without the partial floor, nothing short of a full window moves.
+        cog._pending[5].extend(window(2, 3))
+        self.assertIsNone(cog._take_window(5, 8))
 
 
 class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):

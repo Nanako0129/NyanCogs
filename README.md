@@ -189,6 +189,13 @@ its permissions looks exactly like a quiet week, because every failure path in
 this cog returns silently. Failures are also logged to `red.nyancogs.messagewatch`
 with a reason and no message content.
 
+A channel that goes quiet before filling a window is judged anyway, after
+`idle_seconds` (600 by default) with no new message — short of a full window and
+down to two messages. Without that a quiet channel is never judged at all: a
+venting channel is a post, two replies and then silence, which is exactly the
+shape the rules are for. `[p]watch set idle_seconds 0` turns the sweep off and
+restores the old behaviour, where only a full window is ever judged.
+
 Hostility and heat are judged over a window rather than a message, because an
 argument is a property of an exchange. Consecutive windows overlap by half, so
 an exchange straddling a boundary is still judged together and every message is
