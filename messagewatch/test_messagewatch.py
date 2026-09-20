@@ -1087,6 +1087,48 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
             await module.asyncio.sleep(0)
         self.assertFalse(cog._sweep.is_running())
 
+    async def test_a_conversation_that_resumed_is_not_consumed_as_finished(self) -> None:
+        # The sweep measures idleness outside the lock and on_message appends
+        # under it. A message arriving in that gap would otherwise have the
+        # partial path eat a live conversation whole, without overlap.
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._locks = module.defaultdict(module.asyncio.Lock)
+        cog._last_report = {}
+        cog._last_judged = {}
+        cog._last_error = {}
+        cog.get_api_key = AsyncMock(return_value="k")
+        cog.judge = AsyncMock(return_value=None)
+        settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
+                    "report_channel": 77, "watched_channels": [5], "idle_seconds": 600}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        scope.watched_channels = AsyncMock(return_value=[5])
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        channel_scope = MagicMock()
+        channel_scope.all = AsyncMock(return_value=dict(module.DEFAULT_CHANNEL))
+        cog.config.channel.return_value = channel_scope
+
+        report = MagicMock(spec=discord.TextChannel)
+        report.send = AsyncMock()
+        guild = MagicMock()
+        guild.get_channel.return_value = report
+        channel = SimpleNamespace(id=5, guild=guild, name="c", mention="<#5>")
+
+        # Three old messages, and one that just arrived.
+        cog._pending[5].extend(window(1, 2, 3, at=module.time.monotonic() - 900))
+        cog._pending[5].extend(window(4, at=module.time.monotonic()))
+        await cog.flush(channel, partial=True)
+        cog.judge.assert_not_awaited()
+        self.assertEqual(len(cog._pending[5]), 4)
+
+        # Once it is quiet again, the same call judges it.
+        for item in cog._pending[5]:
+            item["at"] = module.time.monotonic() - 900
+        await cog.flush(channel, partial=True)
+        cog.judge.assert_awaited_once()
+
     def test_a_short_window_is_consumed_whole(self) -> None:
         # There is no later message for an overlap to join a finished
         # conversation to, and leaving half behind would have the next sweep
@@ -1185,6 +1227,39 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         for key in module.SETTING_RULES:
             with self.subTest(key=key):
                 self.assertIn(str(settings[key]), rendered)
+
+    async def test_watch_show_does_not_promise_more_than_the_sweep_delivers(self) -> None:
+        # The first wording said an incomplete window is judged after the idle
+        # period, which is not true of a one-message queue. This pins the text
+        # to the constant rather than to a sentence, so the claim cannot
+        # outlive the behaviour it describes.
+        cog = object.__new__(MessageWatch)
+        cog._pending = pending()
+        cog._last_judged = {}
+        cog._last_error = {}
+        settings = {**DEFAULT_GUILD, "report_channel": 77, "watched_channels": [5],
+                    "idle_seconds": 600}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+
+        await MessageWatch.watch_show.callback(cog, ctx)
+        window_field = next(
+            f.value for f in ctx.send.await_args.kwargs["embed"].fields if f.name == "視窗"
+        )
+        self.assertIn(str(module.MIN_PARTIAL_WINDOW), window_field)
+
+        # With the sweep off it says so instead of describing a minimum.
+        settings["idle_seconds"] = 0
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_show.callback(cog, ctx)
+        off = next(
+            f.value for f in ctx.send.await_args.kwargs["embed"].fields if f.name == "視窗"
+        )
+        self.assertIn("關閉", off)
 
     async def test_watch_show_reports_the_last_problem_per_channel(self) -> None:
         cog = object.__new__(MessageWatch)

@@ -190,8 +190,9 @@ this cog returns silently. Failures are also logged to `red.nyancogs.messagewatc
 with a reason and no message content.
 
 A channel that goes quiet before filling a window is judged anyway, after
-`idle_seconds` (600 by default) with no new message — short of a full window and
-down to two messages. Without that a quiet channel is never judged at all: a
+`idle_seconds` (600 by default) with no new message — short of a full window,
+down to two messages. One message alone is not judged and waits for a second:
+hostility is a property of an exchange. Without that a quiet channel is never judged at all: a
 venting channel is a post, two replies and then silence, which is exactly the
 shape the rules are for. `[p]watch set idle_seconds 0` turns the sweep off and
 restores the old behaviour, where only a full window is ever judged.

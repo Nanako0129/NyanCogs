@@ -751,6 +751,18 @@ class MessageWatch(commands.Cog):
         )
         return embed
 
+    def _still_idle(self, channel_id: int, idle: int) -> bool:
+        """Whether this channel is still quiet. Callers hold its lock."""
+        if not idle:
+            return False
+        queue = self._pending[channel_id]
+        if not queue:
+            return False
+        newest = queue[-1].get("at")
+        if not isinstance(newest, (int, float)):
+            return False
+        return time.monotonic() - newest >= idle
+
     def _take_window(
         self, channel_id: int, window_size: int, minimum: int | None = None
     ) -> list[dict[str, Any]] | None:
@@ -841,6 +853,14 @@ class MessageWatch(commands.Cog):
                 self._note(channel.id, "no_api_key")
                 return
 
+            if partial and not self._still_idle(channel.id, int(settings["idle_seconds"] or 0)):
+                # The sweep measured idleness outside this lock and `on_message`
+                # appends under it, so a conversation that resumed in that gap
+                # would otherwise be consumed whole as though it had finished --
+                # and consumed without overlap, since that is what a finished
+                # conversation gets. Rechecking here makes the measurement and
+                # the take atomic.
+                return
             window = self._take_window(
                 channel.id,
                 int(settings["window_size"]),
@@ -1205,7 +1225,8 @@ class MessageWatch(commands.Cog):
             value=(
                 f"每 `{settings['window_size']}` 則判一次 · 冷卻 `{settings['cooldown_seconds']}` 秒\n"
                 + (
-                    f"安靜 `{settings['idle_seconds']}` 秒後判斷手上的（不足一個視窗也判）"
+                    f"安靜 `{settings['idle_seconds']}` 秒後判斷手上的"
+                    f"（不足一個視窗也判，但至少要 {MIN_PARTIAL_WINDOW} 則）"
                     if int(settings["idle_seconds"])
                     else "閒置判斷 `關閉`：湊不滿一個視窗的頻道不會被判斷"
                 )
