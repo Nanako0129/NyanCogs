@@ -236,6 +236,10 @@ DEFAULT_GLOBAL = {
 }
 
 DEFAULT_GUILD = {
+    # Rules every watched channel is judged against, in front of whatever that
+    # channel adds. A server's posted rules apply in all of them, and typing
+    # the same eight into eight channels is how a ruleset drifts apart.
+    "server_rules": [],
     "report_channel": 0,
     "watched_channels": [],
     "disclosure_version": 0,
@@ -389,7 +393,8 @@ DISCLOSURE_TEXT = (
     "to TypeSafe continuously, together with the name of the channel, with nobody triggering "
     "it. This is unlike an on-demand command: enabling a channel is a standing export of what "
     "people say in it. Where rules are configured for a channel, those rules and its purpose "
-    "note go with every request too.\n"    "**Consider the channel:** a venting or confession channel is where this export costs the "
+    "note go with every request too. Rules set server-wide apply in every watched channel and "
+    "go with every request from all of them.\n"    "**Consider the channel:** a venting or confession channel is where this export costs the "
     "most, because what people write there is what they expect will not be repeated.\n"
     "**Images:** off unless a manager enables it for a channel. When it is on, image "
     "attachments in that channel are downloaded, re-encoded and sent to a separate vision "
@@ -463,6 +468,29 @@ QUESTIONS: dict[str, dict[str, Any]] = {
 # them look exactly like a quiet week with nothing to report. The log is where
 # the difference is recorded; `[p]watch show` carries the short version.
 log = logging.getLogger("red.nyancogs.messagewatch")
+
+
+def effective_rules(
+    channel_settings: Mapping[str, Any], settings: Mapping[str, Any]
+) -> list[str]:
+    """The server's rules, then this channel's, capped at MAX_RULES.
+
+    Additive rather than either/or: a venting channel's own rules are extra
+    demands on top of the server's, not a replacement for them, which is what
+    a member reading both posted sets would assume.
+
+    Server first because the order is the order of the model's options, and a
+    stable prefix keeps a channel's own rules at predictable numbers in
+    `[p]watch rule list` as the server set grows.
+
+    The cap truncates the channel's rules rather than the server's. Losing a
+    rule silently is bad either way; the commands refuse to add past the cap,
+    so this only fires when a server rule was added after a channel was
+    already full.
+    """
+    combined = [str(rule) for rule in settings.get("server_rules") or ()]
+    combined += [str(rule) for rule in channel_settings.get("rules") or ()]
+    return combined[:MAX_RULES]
 
 
 def effective_rule_threshold(channel_settings: Mapping[str, Any], settings: Mapping[str, Any]) -> float:
@@ -1732,7 +1760,7 @@ class MessageWatch(commands.Cog):
                 self._pending.pop(channel.id, None)
                 return
             channel_settings = await self.config.channel(channel).all()
-            rules = list(channel_settings["rules"])
+            rules = effective_rules(channel_settings, settings)
             report_id = int(channel_settings["report_channel"]) or int(settings["report_channel"])
             if not report_id:
                 self._note(channel.id, "no_report_channel")
@@ -2405,6 +2433,74 @@ class MessageWatch(commands.Cog):
         if ctx.invoked_subcommand is None:
             await ctx.send_help()
 
+    @watch_group.group(name="serverrule", invoke_without_command=True)
+    async def watch_serverrule(self, ctx: commands.Context) -> None:
+        """Rules every watched channel is judged against.
+
+        A separate group rather than an optional channel argument on
+        `[p]watch rule`: the rule text is free-form, so a first word that
+        looks like a channel mention would silently change which set it
+        landed in, and the two sets are not interchangeable.
+        """
+        await ctx.send_help()
+
+    @watch_serverrule.command(name="add")
+    async def watch_serverrule_add(self, ctx: commands.Context, *, text: str) -> None:
+        """Add one rule that applies in every watched channel."""
+        text = " ".join(text.split())
+        if not text:
+            await ctx.send("規則內容不能是空的。")
+            return
+        if len(text) > MAX_RULE_CHARS:
+            await ctx.send(f"單條規則請控制在 {MAX_RULE_CHARS} 字以內（目前 {len(text)} 字）。")
+            return
+        async with self.config.guild(ctx.guild).server_rules() as rules:
+            if len(rules) >= MAX_RULES:
+                await ctx.send(f"最多 {MAX_RULES} 條伺服器規則，請先刪除不需要的。")
+                return
+            rules.append(text)
+            number = len(rules)
+        await ctx.send(
+            f"伺服器規則第 {number} 條：{text}\n"
+            f"套用於所有被監看的頻道，排在各頻道自己的規則前面。",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @watch_serverrule.command(name="list")
+    async def watch_serverrule_list(self, ctx: commands.Context) -> None:
+        """Show the server-wide rules."""
+        rules = list(await self.config.guild(ctx.guild).server_rules())
+        body = (
+            "\n".join(f"{number}. {rule}" for number, rule in enumerate(rules, start=1))
+            or "尚未設定。加了之後，每個被監看的頻道都會用它判斷。"
+        )
+        await ctx.send(
+            embed=discord.Embed(
+                title="伺服器規則", description=body[:EMBED_FIELD_LIMIT],
+                colour=discord.Colour.blurple(),
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @watch_serverrule.command(name="remove")
+    async def watch_serverrule_remove(self, ctx: commands.Context, number: int) -> None:
+        """Remove one server rule by the number `[p]watch serverrule list` shows."""
+        async with self.config.guild(ctx.guild).server_rules() as rules:
+            if not 1 <= number <= len(rules):
+                await ctx.send(f"沒有第 {number} 條。用 `[p]watch serverrule list` 看編號。")
+                return
+            removed = rules.pop(number - 1)
+        await ctx.send(
+            f"已刪除伺服器規則第 {number} 條：{removed}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @watch_serverrule.command(name="clear")
+    async def watch_serverrule_clear(self, ctx: commands.Context) -> None:
+        """Drop every server rule. Channel rules are untouched."""
+        await self.config.guild(ctx.guild).server_rules.set([])
+        await ctx.send("已清除所有伺服器規則。各頻道自己的規則不受影響。")
+
     @watch_rule.command(name="add")
     async def watch_rule_add(
         self, ctx: commands.Context, channel: discord.TextChannel, *, text: str
@@ -2434,16 +2530,34 @@ class MessageWatch(commands.Cog):
     async def watch_rule_list(
         self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
-        """Show a channel's rules, exactly as the model is given them."""
+        """Show a channel's rules, exactly as the model is given them.
+
+        Server rules included and marked, in the order the model receives
+        them. Listing only the channel's own would print numbers that do not
+        match the ones a report cites, which is the number a moderator
+        actually looks up.
+        """
         settings = await self.config.channel(channel).all()
         guild_settings = await self.config.guild(ctx.guild).all()
-        rules = list(settings["rules"])
-        lines = [f"{number}. {rule}" for number, rule in enumerate(rules, start=1)]
+        server_count = len(guild_settings.get("server_rules") or ())
+        rules = effective_rules(settings, guild_settings)
+        lines = [
+            f"{number}. {rule}" + ("　`伺服器`" if number <= server_count else "")
+            for number, rule in enumerate(rules, start=1)
+        ]
         embed = discord.Embed(
             title=f"#{channel.name} 的判斷規則",
             description="\n".join(lines) or "（尚未設定，這個頻道只做詐騙與敵意判斷）",
             colour=discord.Colour.blurple(),
         )
+        dropped = server_count + len(settings["rules"]) - len(rules)
+        if dropped:
+            embed.add_field(
+                name="⚠️ 超出上限",
+                value=f"共 {server_count + len(settings['rules'])} 條，超過 {MAX_RULES} 條上限，"
+                      f"這個頻道最後 {dropped} 條不會被送出。",
+                inline=False,
+            )
         if settings["purpose"]:
             embed.add_field(name="頻道用途", value=settings["purpose"], inline=False)
         channel_threshold = float(settings["rule_threshold"])
