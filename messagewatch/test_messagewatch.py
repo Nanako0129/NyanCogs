@@ -1046,16 +1046,144 @@ class TestRules(unittest.TestCase):
         self.assertTrue(reasons[1].startswith("違反第 2 條"))
 
 
+class TestServerRules(unittest.IsolatedAsyncioTestCase):
+    """Rules every watched channel is judged against, in front of its own."""
+
+    def test_the_length_cap_fits_the_rule_it_was_raised_for(self) -> None:
+        # 200 was the cap until the gender-identity rule was written out in
+        # full. That rule moved a real case from 0.17 to 0.94 precisely because
+        # it names the phrasings it covers and says why each counts, and it is
+        # 218 characters. A cap that excludes the one rule measured hardest on
+        # this cog is the wrong cap, not a rule that needs trimming.
+        measured = (
+            "性別認同相關的問題言論，包含四種：(一)否定或嘲弄他人的性別認同；"
+            "(二)散布恐跨或貶低多元性別的言論；(三)被提醒後仍刻意以錯誤性別稱呼他人；"
+            "(四)把性別表達當成優劣在排序或評價——包括用「男生女相」「女性化的男生」這類說法，"
+            "把一個人的外貌歸回出生指派性別去評價，等於預設「你本質是男的，只是看起來像女的」；"
+            "也包括把性別表達預設成只有陽剛或陰柔兩種選項的假二分法。"
+            "第(四)種即使語氣友善、即使是提問句、即使沒有針對在場的特定人，仍然算。"
+        )
+        self.assertGreater(len(measured), 200)
+        self.assertLessEqual(len(measured), module.MAX_RULE_CHARS)
+        # And the payload stays far inside its own bound at the new length.
+        self.assertLess(module.MAX_RULES * module.MAX_RULE_CHARS * 4, module.MAX_REQUEST_BYTES)
+
+    def test_server_rules_come_first_and_channel_rules_follow(self) -> None:
+        # The order is the order of the model's options, and a stable prefix
+        # keeps a channel's own rules at predictable numbers as the server set
+        # grows.
+        combined = module.effective_rules(
+            {"rules": ["樹洞 A", "樹洞 B"]},
+            {"server_rules": ["伺服器 1", "伺服器 2"]},
+        )
+        self.assertEqual(combined, ["伺服器 1", "伺服器 2", "樹洞 A", "樹洞 B"])
+
+    def test_either_set_alone_still_works(self) -> None:
+        self.assertEqual(
+            module.effective_rules({"rules": ["只有頻道"]}, {"server_rules": []}),
+            ["只有頻道"],
+        )
+        self.assertEqual(
+            module.effective_rules({"rules": []}, {"server_rules": ["只有伺服器"]}),
+            ["只有伺服器"],
+        )
+        # A channel with neither asks exactly what it asked before the feature
+        # existed, which is the path every unconfigured channel takes.
+        self.assertEqual(module.effective_rules({}, {}), [])
+
+    def test_the_combined_set_is_capped_and_drops_the_channel_end(self) -> None:
+        # Both commands refuse to add past MAX_RULES, so this only fires when a
+        # server rule is added after a channel is already full. Truncating the
+        # channel end keeps every server rule in force, which is the set a
+        # member reading the posted rules expects to apply everywhere.
+        combined = module.effective_rules(
+            {"rules": [f"頻道 {n}" for n in range(module.MAX_RULES)]},
+            {"server_rules": ["伺服器 1", "伺服器 2"]},
+        )
+        self.assertEqual(len(combined), module.MAX_RULES)
+        self.assertEqual(combined[:2], ["伺服器 1", "伺服器 2"])
+        self.assertEqual(combined[2], "頻道 0")
+
+    async def test_a_judged_window_is_given_the_combined_set(self) -> None:
+        # Driven through `flush`, not by calling `effective_rules` again: the
+        # point of the feature is that the model receives both sets, and the
+        # call site is what this replaces.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
+                    "report_channel": 77, "watched_channels": [5], "window_size": 3,
+                    "cooldown_seconds": 0, "server_rules": ["伺服器 1", "伺服器 2"]}
+        scope = MagicMock()
+        scope.all = AsyncMock(return_value=settings)
+        scope.watched_channels = AsyncMock(return_value=[5])
+        cog.config = MagicMock()
+        cog.config.guild.return_value = scope
+        channel_scope = MagicMock()
+        channel_scope.all = AsyncMock(
+            return_value={**module.DEFAULT_CHANNEL, "rules": ["樹洞 A"]})
+        channel_scope.images = AsyncMock(return_value=False)
+        cog.config.channel.return_value = channel_scope
+        cog.get_api_key = AsyncMock(return_value="k")
+        seen = []
+
+        async def judge(window, name, key, purpose="", rules=None):
+            seen.append(list(rules or ()))
+            return {"any_scam": {"noul": 0.01}, "is_hostile": {"noul": 0.01},
+                    "heat": {"score": 0.1}}, 0
+        cog.judge = AsyncMock(side_effect=judge)
+        report = MagicMock(spec=discord.TextChannel)
+        report.send = AsyncMock()
+        guild = MagicMock()
+        guild.id = 1
+        guild.get_channel.return_value = report
+        cog._pending[5].extend(window(1, 2, 3))
+        await cog.flush(SimpleNamespace(id=5, guild=guild, name="c", mention="<#5>"))
+        self.assertEqual(seen, [["伺服器 1", "伺服器 2", "樹洞 A"]])
+
+
 class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def cog(rules):
+    def cog(rules, server_rules=()):
         cog = object.__new__(MessageWatch)
         cog._reset_state()
         scope = MagicMock()
         scope.rules = MagicMock(return_value=ValueContext(rules))
         cog.config = MagicMock()
         cog.config.channel.return_value = scope
+        guild_scope = MagicMock()
+        guild_scope.server_rules = AsyncMock(return_value=list(server_rules))
+        cog.config.guild.return_value = guild_scope
         return cog
+
+    async def test_remove_counts_from_the_numbers_the_list_shows(self) -> None:
+        # `[p]watch rule list` numbers the combined set, server rules first,
+        # so a displayed number is not an index into this channel's own list.
+        # Before the offset, deleting displayed 1 with one server rule
+        # configured removed the channel's first rule -- the wrong one, with a
+        # success message naming the right one.
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+
+        cog = self.cog(["頻道 A", "頻道 B"], server_rules=["伺服器 1"])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 2)
+        self.assertIn("頻道 A", ctx.send.await_args.args[0])
+
+        # A server number is refused here rather than silently hitting the
+        # channel list, and says where to delete it and what that costs.
+        cog = self.cog(["頻道 A"], server_rules=["伺服器 1"])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 1)
+        message = ctx.send.await_args.args[0]
+        self.assertIn("serverrule remove 1", message)
+        self.assertIn("所有", message)
+
+        # Past the end names both halves rather than a count that looks wrong.
+        cog = self.cog(["頻道 A"], server_rules=["伺服器 1"])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 3)
+        message = ctx.send.await_args.args[0]
+        self.assertIn("共 2 條", message)
 
     async def test_echoed_rule_text_cannot_ping_the_guild(self) -> None:
         # A rule is moderator-written text echoed back verbatim, so a rule

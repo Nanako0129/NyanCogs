@@ -309,10 +309,19 @@ configure a channel around them.
 A channel can also be judged against its own posted rules:
 
 ```text
+[p]watch serverrule add 廣告或拉人：張貼推廣連結、招募或帶風向的邀約
 [p]watch rule purpose #樹洞 這裡是倒垃圾的地方，發文的人要的是被聽見，不是被指導
 [p]watch rule add #樹洞 下指導棋：告訴發文的人應該怎麼做、給建議或行動方案
 [p]watch rule list #樹洞
 ```
+
+`[p]watch serverrule` sets rules that apply in **every** watched channel;
+`[p]watch rule` adds ones only that channel is judged against. They are
+additive — the server's set goes in front of the channel's, which is the order
+a member reading both posted sets would assume, and a stable prefix keeps a
+channel's own rules at predictable numbers as the server set grows. `[p]watch
+rule list` shows the combined set with the inherited ones marked, because those
+are the numbers a report cites.
 
 Rules are per channel, because a venting channel's rules would be absurd in a
 help channel. A channel with no rules asks exactly what it asked before the
