@@ -264,7 +264,9 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
         if items:
             items[0]["text"] = text
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            return await (cog or self.cog()).judge(items, "c", "k")
+            answers, tokens = await (cog or self.cog()).judge(items, "c", "k")
+        self.last_tokens = tokens
+        return answers
 
     async def test_a_good_answer_is_returned(self) -> None:
         body = json.dumps({"answers": {"any_scam": {"noul": 0.9}}}).encode()
@@ -307,28 +309,27 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
             "messagewatch.messagewatch.aiohttp.ClientSession",
             side_effect=module.aiohttp.ClientError("boom"),
         ):
-            self.assertIsNone(
-                await self.cog().judge([], "c", "k")
-            )
+            self.assertEqual(await self.cog().judge([], "c", "k"), (None, 0))
 
-    async def test_judge_surfaces_input_tokens_without_widening_the_none_contract(self) -> None:
-        # judge() used to throw usage.input_tokens away entirely. A caller
-        # needs it to accumulate spend, but every failure path must still
-        # return None -- the token count travels on `self`, not in the
-        # return value, so it cannot change that contract.
+    async def test_judge_returns_its_token_count_beside_the_answers(self) -> None:
+        # The count used to be left on `self` to keep the return type narrow.
+        # `flush` holds a per-channel lock, so two channels judging at once both
+        # wrote that field and whichever read second recorded the other's
+        # tokens -- against the wrong window, and across guilds against the
+        # wrong bill. It travels in the return value now.
         cog = self.cog()
         body = json.dumps(
             {"answers": {"any_scam": {"noul": 0.9}}, "usage": {"input_tokens": 512}}
         ).encode()
         answers = await self.request_with(200, body, cog=cog)
         self.assertEqual(answers, {"any_scam": {"noul": 0.9}})
-        self.assertEqual(cog._last_input_tokens, 512)
+        self.assertEqual(self.last_tokens, 512)
+        self.assertFalse(hasattr(cog, "_last_input_tokens"))
 
-        # A later failure on the same cog must not leave the previous call's
-        # count readable -- a caller reading it after a None would silently
-        # attribute someone else's tokens to a judgement that never happened.
+        # A later failure returns 0 beside its None rather than the previous
+        # call's count, which is what made the old field on `self` dangerous.
         self.assertIsNone(await self.request_with(500, b"{}", cog=cog))
-        self.assertIsNone(cog._last_input_tokens)
+        self.assertEqual(self.last_tokens, 0)
 
     async def test_an_untrusted_token_count_is_bounded_like_every_other_provider_field(self) -> None:
         for value in (True, False, -5, "512", None, float("nan"), 10**400):
@@ -342,7 +343,9 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
             {"answers": {"any_scam": {"noul": 0.9}}, "usage": {"input_tokens": "not a number"}}
         ).encode()
         await self.request_with(200, body, cog=cog)
-        self.assertIsNone(cog._last_input_tokens)
+        # An unreadable count is 0 rather than a guess: the spend estimate says
+        # "at least this much" instead of inventing tokens nobody measured.
+        self.assertEqual(self.last_tokens, 0)
 
 
 class TestGating(unittest.IsolatedAsyncioTestCase):
@@ -528,7 +531,7 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         )
         cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
-        cog.judge = AsyncMock(return_value=answers)
+        cog.judge = AsyncMock(return_value=(answers, 0))
         cog._pending = pending()
         cog._last_report = {}
         cog._locks = module.defaultdict(module.asyncio.Lock)
@@ -592,7 +595,7 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         channel, report = self.channel()
         observed = []
         cog.judge = AsyncMock(
-            side_effect=lambda *a, **k: observed.append(cog._locks[5].locked()) or self.SCAM
+            side_effect=lambda *a, **k: (observed.append(cog._locks[5].locked()), (self.SCAM, 0))[1]
         )
         await cog.flush(channel)
         self.assertEqual(observed, [True])
@@ -706,7 +709,7 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
 
         async def blocked(*args, **kwargs):
             await gate.wait()
-            return self.QUIET
+            return self.QUIET, 0
 
         cog.judge = AsyncMock(side_effect=blocked)
         first = module.asyncio.create_task(cog.flush(channel))
@@ -1570,7 +1573,7 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         cog._last_judged = {}
         cog._last_error = {}
         cog.get_api_key = AsyncMock(return_value="k")
-        cog.judge = AsyncMock(return_value=None)
+        cog.judge = AsyncMock(return_value=(None, 0))
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "report_channel": 77, "watched_channels": [5], "idle_seconds": 600}
         scope = MagicMock()
@@ -1614,10 +1617,10 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         cog._last_judged = {}
         cog._last_error = {}
         cog.get_api_key = AsyncMock(return_value="k")
-        cog.judge = AsyncMock(return_value={"any_scam": {"noul": 0.97},
-                                            "scam_index": {"choice": "1"},
-                                            "is_hostile": {"noul": 0.01},
-                                            "heat": {"score": 0.2}})
+        cog.judge = AsyncMock(return_value=({"any_scam": {"noul": 0.97},
+                                             "scam_index": {"choice": "1"},
+                                             "is_hostile": {"noul": 0.01},
+                                             "heat": {"score": 0.2}}, 0))
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "report_channel": 77, "watched_channels": [5], "idle_seconds": 600}
         scope = MagicMock()
@@ -1970,10 +1973,10 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
 
     async def test_messages_flow_through_to_one_report(self) -> None:
         cog = self.cog()
-        cog.judge = AsyncMock(return_value={"any_scam": {"noul": 0.97},
-                                            "scam_index": {"choice": "1"},
-                                            "is_hostile": {"noul": 0.01},
-                                            "heat": {"score": 0.2}})
+        cog.judge = AsyncMock(return_value=({"any_scam": {"noul": 0.97},
+                                             "scam_index": {"choice": "1"},
+                                             "is_hostile": {"noul": 0.01},
+                                             "heat": {"score": 0.2}}, 0))
         report = None
         for index in range(4):
             message, report = self.message(index)
@@ -1997,7 +2000,7 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
             peak = max(peak, depth)
             await module.asyncio.sleep(0)
             depth -= 1
-            return {"any_scam": {"noul": 0.01}, "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}
+            return {"any_scam": {"noul": 0.01}, "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}, 0
 
         cog.judge = AsyncMock(side_effect=judging)
         messages = [self.message(index)[0] for index in range(8)]
@@ -2055,18 +2058,15 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         cog, scope = self.cog()
         channel, report = self.channel()
 
-        # `judge` is mocked in every flush test, including this one, so the
-        # attribute it normally sets on success has to be set here too.
+        # `judge` returns (answers, input_tokens); the mocks return the pair.
         async def first(*args, **kwargs):
-            cog._last_input_tokens = 500
-            return self.QUIET
+            return self.QUIET, 500
         cog.judge = AsyncMock(side_effect=first)
         cog._pending[5].extend(window(1, 2, 3))
         await cog.flush(channel)
 
         async def second(*args, **kwargs):
-            cog._last_input_tokens = 300
-            return self.SCAM
+            return self.SCAM, 300
         cog.judge = AsyncMock(side_effect=second)
         cog._pending[5].extend(window(4, 5, 6))
         await cog.flush(channel)
@@ -2097,12 +2097,63 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         # A third judgement after the flush starts counting fresh from zero,
         # not from the total the flush already moved into Config.
         async def third(*args, **kwargs):
-            cog._last_input_tokens = 250
-            return self.QUIET
+            return self.QUIET, 250
         cog.judge = AsyncMock(side_effect=third)
         cog._pending[5].extend(window(7, 8, 9))
         await cog.flush(channel)
         self.assertEqual(cog._usage_delta[1]["input_tokens"], 250)
+
+    async def test_two_channels_judging_at_once_each_record_their_own_tokens(self) -> None:
+        # `flush` locks per channel, so two channels reach `judge` together.
+        # The count used to be stashed on the cog between the await and the
+        # read, and whichever flush read second recorded the other's tokens.
+        # Interleaved deliberately here: the first call parks until the second
+        # has been and gone, which is the order that made the old code wrong.
+        cog, _ = self.cog()
+        scope = cog.config.guild.return_value
+        scope.watched_channels = AsyncMock(return_value=[5, 6])
+        scope.all = AsyncMock(return_value={
+            **DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
+            "report_channel": 77, "watched_channels": [5, 6], "window_size": 3,
+            "cooldown_seconds": 0,
+        })
+        first_in_flight = module.asyncio.Event()
+        second_done = module.asyncio.Event()
+
+        async def judge(window, channel_name, *a, **k):
+            if channel_name == "five":
+                first_in_flight.set()
+                await second_done.wait()
+                return self.QUIET, 500
+            await first_in_flight.wait()
+            try:
+                return self.QUIET, 300
+            finally:
+                second_done.set()
+        cog.judge = AsyncMock(side_effect=judge)
+
+        def channel_in(guild_id, channel_id, name):
+            report = MagicMock(spec=discord.TextChannel)
+            report.send = AsyncMock()
+            guild = MagicMock()
+            guild.id = guild_id
+            guild.get_channel.return_value = report
+            return SimpleNamespace(id=channel_id, guild=guild, name=name,
+                                   mention=f"<#{channel_id}>")
+        five = channel_in(1, 5, "five")
+        six = channel_in(2, 6, "six")
+        cog._pending[5].extend(window(1, 2, 3))
+        cog._pending[6].extend(window(4, 5, 6))
+        # Bounded: if the interleaving ever stops working, this fails rather
+        # than hanging the suite, and a hang is not a failure anything reports.
+        await module.asyncio.wait_for(
+            module.asyncio.gather(cog.flush(five), cog.flush(six)), timeout=5
+        )
+
+        # Each guild is billed for its own request, not for whichever finished
+        # last. Under the old field both read 300.
+        self.assertEqual(cog._usage_delta[1]["input_tokens"], 500)
+        self.assertEqual(cog._usage_delta[2]["input_tokens"], 300)
 
     async def test_nothing_is_written_to_config_per_judgement(self) -> None:
         # The write belongs to the sweep (`_flush_usage`), not to flush() --
@@ -2112,8 +2163,7 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         channel, _ = self.channel()
 
         async def fake_judge(*args, **kwargs):
-            cog._last_input_tokens = 42
-            return self.QUIET
+            return self.QUIET, 42
         cog.judge = AsyncMock(side_effect=fake_judge)
 
         cog._pending[5].extend(window(1, 2, 3))
@@ -2157,9 +2207,9 @@ class TestUsageEdges(unittest.IsolatedAsyncioTestCase):
         cog._reset_state()
         cog.bot = MagicMock()
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            answers = await cog.judge([], "c", "k")
+            answers, tokens = await cog.judge([], "c", "k")
         self.assertEqual(answers, {"any_scam": {"noul": 0.5}})
-        self.assertIsNone(cog._last_input_tokens)
+        self.assertEqual(tokens, 0)
 
     async def test_a_flush_keeps_what_arrived_during_its_awaits(self) -> None:
         # Red's context manager awaits on entry and on exit, and `flush` or

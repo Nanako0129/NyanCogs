@@ -959,11 +959,6 @@ class MessageWatch(commands.Cog):
         # judged, and why nothing happened the last time something did not.
         self._last_judged: dict[int, float] = {}
         self._last_error: dict[int, tuple[float, str]] = {}
-        # The input token count from the most recent `judge()` call, read by
-        # `flush` right after awaiting it. Reset to None at the top of every
-        # call, so a failure never leaves a stale count behind for the caller
-        # to silently attribute to a judgement that did not happen.
-        self._last_input_tokens: int | None = None
         # Attachment id -> extracted text. Ordered so the oldest goes first
         # when it is full; the same meme reposted is paid for once.
         self._image_cache: OrderedDict[int, str] = OrderedDict()
@@ -1275,20 +1270,21 @@ class MessageWatch(commands.Cog):
         key: str,
         purpose: str = "",
         rules: list[str] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, int]:
         """One bounded request, or None when the service could not answer.
 
         Every failure path returns None rather than raising. A moderation aid
         that breaks the message handler is worse than one that misses a window,
         so the caller carries on and the channel keeps working.
 
-        The input token count for this request is left on `self` rather than
-        widening the return type, which would ripple through every existing
-        caller and test that unpacks a plain answers mapping or None. Reset
-        first, so a caller reading it after this returns None sees None rather
-        than a stale count from a previous, unrelated success.
+        Returns the answers and the input token count together. An earlier
+        version left the count on `self` to keep the return type narrow, but
+        `flush` holds a per-channel lock, so two channels judging at once both
+        wrote that field and whichever read second recorded the other's tokens
+        -- against the wrong window, and where the two channels are in
+        different guilds, against the wrong guild's bill.
         """
-        self._last_input_tokens = None
+        tokens = 0
         payload = json.dumps(
             {
                 "state": build_state(channel_name, window, purpose, rules),
@@ -1299,7 +1295,7 @@ class MessageWatch(commands.Cog):
         ).encode()
         if len(payload) > MAX_REQUEST_BYTES:
             log.warning("messagewatch: request over %d bytes, window dropped", MAX_REQUEST_BYTES)
-            return None
+            return None, tokens
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
             async with aiohttp.ClientSession(
@@ -1316,18 +1312,18 @@ class MessageWatch(commands.Cog):
                 ) as response:
                     if response.status != 200:
                         log.warning("messagewatch: provider returned HTTP %d", response.status)
-                        return None
+                        return None, tokens
                     raw = await response.content.read(MAX_RESPONSE_BYTES + 1)
                     if len(raw) > MAX_RESPONSE_BYTES:
                         log.warning("messagewatch: provider response over %d bytes", MAX_RESPONSE_BYTES)
-                        return None
+                        return None, tokens
         except asyncio.TimeoutError:
             log.warning("messagewatch: provider timed out after %.0fs", REQUEST_TIMEOUT_SECONDS)
-            return None
+            return None, tokens
         except aiohttp.ClientError as error:
             # The class only; the message can carry the URL and its query.
             log.warning("messagewatch: provider transport failure (%s)", type(error).__name__)
-            return None
+            return None, tokens
         try:
             decoded = json.loads(raw)
         except (ValueError, RecursionError):
@@ -1337,15 +1333,15 @@ class MessageWatch(commands.Cog):
             # so it would escape this function's promise to return None on every
             # failure and break the message handler instead.
             log.warning("messagewatch: provider response was not usable JSON")
-            return None
+            return None, tokens
         answers = decoded.get("answers") if isinstance(decoded, Mapping) else None
         if not isinstance(answers, Mapping):
             log.warning("messagewatch: provider response carried no answers mapping")
-            return None
+            return None, tokens
         usage = decoded.get("usage") if isinstance(decoded, Mapping) else None
         if isinstance(usage, Mapping):
-            self._last_input_tokens = _bounded_token_count(usage.get("input_tokens"))
-        return answers
+            tokens = _bounded_token_count(usage.get("input_tokens")) or 0
+        return answers, tokens
 
     @staticmethod
     def _rule_finding(
@@ -1664,7 +1660,7 @@ class MessageWatch(commands.Cog):
             anonymise(window)
             if channel_settings["images"]:
                 await self._attach_image_text(window)
-            answers = await self.judge(
+            answers, judge_tokens = await self.judge(
                 window,
                 getattr(channel, "name", str(channel.id)),
                 key,
@@ -1681,7 +1677,7 @@ class MessageWatch(commands.Cog):
             # skips __init__.
             delta = self._usage_delta[guild.id]
             delta["windows_judged"] += 1
-            delta["input_tokens"] += getattr(self, "_last_input_tokens", None) or 0
+            delta["input_tokens"] += judge_tokens
 
             # findings() reads settings["rule_threshold"] and keeps that one
             # signature; the per-channel override is folded in here, in the
