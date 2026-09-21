@@ -266,6 +266,15 @@ DEFAULT_GUILD = {
         "windows_judged": 0,
         "reports_sent": 0,
         "input_tokens": 0,
+        # The vision provider is billed separately and bills for output as
+        # well, so its tokens cannot be folded into `input_tokens` above.
+        # `image_cache_hits` is what makes `images_read` interpretable: a
+        # reposted image is a hit, and hits cost nothing.
+        "images_read": 0,
+        "image_cache_hits": 0,
+        "vision_input_tokens": 0,
+        "vision_output_tokens": 0,
+        "vision_nanodollars": 0,
         "started_at": 0,
     },
     "price_per_million_input_tokens": DEFAULT_TOKEN_PRICE_PER_MILLION,
@@ -274,6 +283,27 @@ DEFAULT_GUILD = {
     "dashboard_channel": 0,
     "dashboard_message": 0,
 }
+
+class VisionUsage(NamedTuple):
+    """What one window's image reading cost, for the dashboard.
+
+    Output tokens are counted because the vision provider bills for them.
+    TypeSafe does not -- Jev's output is free -- which is why the guild-level
+    spend estimate is input-only and this one cannot be.
+    """
+
+    images_read: int = 0
+    cache_hits: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    # Nanodollars, because the provider reports its own figure and one image
+    # costs around 7e-5 dollars: an integer counter keeps the usage dict
+    # homogeneous and takes float accumulation out of the question entirely.
+    nanodollars: int = 0
+
+    def __add__(self, other: "VisionUsage") -> "VisionUsage":
+        return VisionUsage(*(a + b for a, b in zip(self, other)))
+
 
 class Setting(NamedTuple):
     """One tunable, with what it means alongside what it accepts.
@@ -646,6 +676,46 @@ LAN_NETWORKS = (
 )
 
 
+def _reported_nanodollars(usage: Mapping[str, Any]) -> int:
+    """What the provider says this call cost, in nanodollars, or 0.
+
+    Taken from the response rather than computed from a price table. A table
+    has to be maintained by hand and is wrong the moment the vendor moves, and
+    it was already wrong here: OpenRouter routes `gemma-4-31b-it` across
+    fourteen providers at prices from $0.090 to $0.750 per million input
+    tokens, so the number to enter depends on where a given request landed.
+
+    Two fields, because they mean different things. `cost` is what OpenRouter
+    charged the account, and it is 0 under BYOK, where the upstream provider
+    bills directly -- measured on 2026-09-21 against Friendli, `cost: 0` with
+    `cost_details.upstream_inference_cost: 6.94e-05`. Reading `cost` alone
+    would report every BYOK call as free.
+    """
+    byok = usage.get("is_byok") is True
+    details = usage.get("cost_details")
+    raw: Any = None
+    if byok and isinstance(details, Mapping):
+        raw = details.get("upstream_inference_cost")
+    elif not byok:
+        raw = usage.get("cost")
+    # A numeric type, not something float() happens to parse. `_bounded_token_count`
+    # rejects "512" for the same reason: a provider sending a string is
+    # sending something this code did not agree to read. bool is an int in
+    # Python, and True would price a call at one nanodollar.
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return 0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    # Provider output, so bounded like every other field that arrives from
+    # one. `not 0.0 <= value` rather than `value < 0.0`: NaN fails the first
+    # and passes the second.
+    if not 0.0 <= value <= 1_000.0:
+        return 0
+    return round(value * 1_000_000_000)
+
+
 def endpoint_is_allowed(value: str) -> bool:
     """Whether the vision endpoint may be stored.
 
@@ -959,11 +1029,6 @@ class MessageWatch(commands.Cog):
         # judged, and why nothing happened the last time something did not.
         self._last_judged: dict[int, float] = {}
         self._last_error: dict[int, tuple[float, str]] = {}
-        # The input token count from the most recent `judge()` call, read by
-        # `flush` right after awaiting it. Reset to None at the top of every
-        # call, so a failure never leaves a stale count behind for the caller
-        # to silently attribute to a judgement that did not happen.
-        self._last_input_tokens: int | None = None
         # Attachment id -> extracted text. Ordered so the oldest goes first
         # when it is full; the same meme reposted is paid for once.
         self._image_cache: OrderedDict[int, str] = OrderedDict()
@@ -972,7 +1037,12 @@ class MessageWatch(commands.Cog):
         # write every few messages, so these ride on the 60-second sweep
         # instead. See `_flush_usage`.
         self._usage_delta: defaultdict[int, dict[str, int]] = defaultdict(
-            lambda: {"messages_queued": 0, "windows_judged": 0, "reports_sent": 0, "input_tokens": 0}
+            lambda: {
+                "messages_queued": 0, "windows_judged": 0, "reports_sent": 0,
+                "input_tokens": 0, "images_read": 0, "image_cache_hits": 0,
+                "vision_input_tokens": 0, "vision_output_tokens": 0,
+                "vision_nanodollars": 0,
+            }
         )
         # Per-guild dashboard state. `_dashboard_error` stops the sweep from
         # retrying a channel that is gone or forbidden every minute forever;
@@ -1138,7 +1208,7 @@ class MessageWatch(commands.Cog):
         key = tokens.get("api_key") if isinstance(tokens, Mapping) else None
         return key if isinstance(key, str) and key else None
 
-    async def _attach_image_text(self, window: list[dict[str, Any]]) -> None:
+    async def _attach_image_text(self, window: list[dict[str, Any]]) -> VisionUsage:
         """Read this window's images, bounded, and hang the text on each item.
 
         Bounded per window rather than per message: one post of twenty
@@ -1146,16 +1216,19 @@ class MessageWatch(commands.Cog):
         judgement.
         """
         budget = MAX_IMAGES_PER_WINDOW
+        total = VisionUsage()
         for item in window:
             for attachment in item.get("images") or ():
                 if budget <= 0:
-                    return
+                    return total
                 budget -= 1
-                text = await self.image_text(attachment)
+                text, used = await self.image_text(attachment)
+                total = total + used
                 if text:
                     item["image_text"] = (item.get("image_text", "") + " " + text).strip()
+        return total
 
-    async def image_text(self, attachment: Mapping[str, Any]) -> str | None:
+    async def image_text(self, attachment: Mapping[str, Any]) -> tuple[str | None, VisionUsage]:
         """The characters in one attachment, or None when they could not be read.
 
         Every failure returns None for the same reason `judge` does: a
@@ -1167,14 +1240,16 @@ class MessageWatch(commands.Cog):
         cached = self._image_cache.get(key)
         if cached is not None:
             self._image_cache.move_to_end(key)
-            return cached
+            # A hit costs nothing, and counting it is what makes "images read"
+            # interpretable: the same meme reposted ten times is one call.
+            return cached, VisionUsage(cache_hits=1)
 
         vision = await self.config.all()
         model = str(vision["image_model"]).strip()
         api_base = str(vision["image_api_base"]).strip()
         token = await self.get_image_key()
         if not model or not api_base or not token:
-            return None
+            return None, VisionUsage()
 
         timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT_SECONDS)
         try:
@@ -1184,34 +1259,38 @@ class MessageWatch(commands.Cog):
                 async with session.get(attachment["url"], allow_redirects=False) as response:
                     if response.status != 200:
                         log.warning("messagewatch: attachment fetch returned %d", response.status)
-                        return None
+                        return None, VisionUsage()
                     raw = await response.content.read(MAX_IMAGE_BYTES + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: attachment fetch failed (%s)", type(error).__name__)
-            return None
+            return None, VisionUsage()
         if len(raw) > MAX_IMAGE_BYTES:
-            return None
+            return None, VisionUsage()
 
         # Decoding and resizing are CPU-bound and would stall every other
         # channel's ingestion if they ran on the event loop.
         transcoded = await asyncio.to_thread(transcode_image, raw)
         if transcoded is None:
-            return None
+            return None, VisionUsage()
         content_type, encoded = transcoded
         data_uri = f"data:{content_type};base64,{base64.b64encode(encoded).decode('ascii')}"
 
-        text = await self._extract_text(api_base, token, model, data_uri)
+        text, tokens_in, tokens_out, nanos = await self._extract_text(
+            api_base, token, model, data_uri
+        )
+        used = VisionUsage(images_read=1, input_tokens=tokens_in,
+                           output_tokens=tokens_out, nanodollars=nanos)
         if text is None:
-            return None
+            return None, used
         text = " ".join(text.split())[:IMAGE_TEXT_CHARS]
         self._image_cache[key] = text
         while len(self._image_cache) > IMAGE_CACHE_SIZE:
             self._image_cache.popitem(last=False)
-        return text
+        return text, used
 
     async def _extract_text(
         self, api_base: str, token: str, model: str, data_uri: str
-    ) -> str | None:
+    ) -> tuple[str | None, int, int, int]:
         """Ask the vision model for the characters, and nothing else.
 
         Verbatim extraction rather than description: a scam image is a
@@ -1240,18 +1319,18 @@ class MessageWatch(commands.Cog):
                 ) as response:
                     if response.status != 200:
                         log.warning("messagewatch: image model returned %d", response.status)
-                        return None
+                        return None, 0, 0, 0
                     body = await response.content.read(MAX_RESPONSE_BYTES + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: image model unreachable (%s)", type(error).__name__)
-            return None
+            return None, 0, 0, 0
         if len(body) > MAX_RESPONSE_BYTES:
-            return None
+            return None, 0, 0, 0
         try:
             decoded = json.loads(body)
         except (ValueError, RecursionError):
             log.warning("messagewatch: image model response was not usable JSON")
-            return None
+            return None, 0, 0, 0
         parts: list[str] = []
         for item in (decoded.get("output") or []) if isinstance(decoded, Mapping) else []:
             for chunk in (item.get("content") or []) if isinstance(item, Mapping) else []:
@@ -1259,8 +1338,17 @@ class MessageWatch(commands.Cog):
                     value = chunk.get("text")
                     if isinstance(value, str):
                         parts.append(value)
+        usage = decoded.get("usage") if isinstance(decoded, Mapping) else None
+        tokens_in = tokens_out = nanos = 0
+        if isinstance(usage, Mapping):
+            tokens_in = _bounded_token_count(usage.get("input_tokens")) or 0
+            tokens_out = _bounded_token_count(usage.get("output_tokens")) or 0
+            nanos = _reported_nanodollars(usage)
         joined = "\n".join(parts).strip()
-        return joined or None
+        # Reported even when the text is unusable: the provider billed for the
+        # call either way, and a cost surface that hides the failures
+        # understates exactly the spend worth noticing.
+        return (joined or None), tokens_in, tokens_out, nanos
 
     async def get_image_key(self) -> str | None:
         """The vision provider's key, from Red's shared token storage."""
@@ -1275,20 +1363,21 @@ class MessageWatch(commands.Cog):
         key: str,
         purpose: str = "",
         rules: list[str] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, int]:
         """One bounded request, or None when the service could not answer.
 
         Every failure path returns None rather than raising. A moderation aid
         that breaks the message handler is worse than one that misses a window,
         so the caller carries on and the channel keeps working.
 
-        The input token count for this request is left on `self` rather than
-        widening the return type, which would ripple through every existing
-        caller and test that unpacks a plain answers mapping or None. Reset
-        first, so a caller reading it after this returns None sees None rather
-        than a stale count from a previous, unrelated success.
+        Returns the answers and the input token count together. An earlier
+        version left the count on `self` to keep the return type narrow, but
+        `flush` holds a per-channel lock, so two channels judging at once both
+        wrote that field and whichever read second recorded the other's tokens
+        -- against the wrong window, and where the two channels are in
+        different guilds, against the wrong guild's bill.
         """
-        self._last_input_tokens = None
+        tokens = 0
         payload = json.dumps(
             {
                 "state": build_state(channel_name, window, purpose, rules),
@@ -1299,7 +1388,7 @@ class MessageWatch(commands.Cog):
         ).encode()
         if len(payload) > MAX_REQUEST_BYTES:
             log.warning("messagewatch: request over %d bytes, window dropped", MAX_REQUEST_BYTES)
-            return None
+            return None, tokens
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
             async with aiohttp.ClientSession(
@@ -1316,18 +1405,18 @@ class MessageWatch(commands.Cog):
                 ) as response:
                     if response.status != 200:
                         log.warning("messagewatch: provider returned HTTP %d", response.status)
-                        return None
+                        return None, tokens
                     raw = await response.content.read(MAX_RESPONSE_BYTES + 1)
                     if len(raw) > MAX_RESPONSE_BYTES:
                         log.warning("messagewatch: provider response over %d bytes", MAX_RESPONSE_BYTES)
-                        return None
+                        return None, tokens
         except asyncio.TimeoutError:
             log.warning("messagewatch: provider timed out after %.0fs", REQUEST_TIMEOUT_SECONDS)
-            return None
+            return None, tokens
         except aiohttp.ClientError as error:
             # The class only; the message can carry the URL and its query.
             log.warning("messagewatch: provider transport failure (%s)", type(error).__name__)
-            return None
+            return None, tokens
         try:
             decoded = json.loads(raw)
         except (ValueError, RecursionError):
@@ -1337,15 +1426,15 @@ class MessageWatch(commands.Cog):
             # so it would escape this function's promise to return None on every
             # failure and break the message handler instead.
             log.warning("messagewatch: provider response was not usable JSON")
-            return None
+            return None, tokens
         answers = decoded.get("answers") if isinstance(decoded, Mapping) else None
         if not isinstance(answers, Mapping):
             log.warning("messagewatch: provider response carried no answers mapping")
-            return None
+            return None, tokens
         usage = decoded.get("usage") if isinstance(decoded, Mapping) else None
         if isinstance(usage, Mapping):
-            self._last_input_tokens = _bounded_token_count(usage.get("input_tokens"))
-        return answers
+            tokens = _bounded_token_count(usage.get("input_tokens")) or 0
+        return answers, tokens
 
     @staticmethod
     def _rule_finding(
@@ -1662,26 +1751,36 @@ class MessageWatch(commands.Cog):
                 return
 
             anonymise(window)
+            vision_used = VisionUsage()
             if channel_settings["images"]:
-                await self._attach_image_text(window)
-            answers = await self.judge(
+                vision_used = await self._attach_image_text(window)
+            answers, judge_tokens = await self.judge(
                 window,
                 getattr(channel, "name", str(channel.id)),
                 key,
                 str(channel_settings["purpose"]),
                 rules,
             )
+            # In memory only -- see `_flush_usage` for why this is not a
+            # Config write.
+            delta = self._usage_delta[guild.id]
+            # The vision calls already happened, above `judge`, so this spend
+            # is real whether or not the judgement lands. Recorded before the
+            # early return, or a provider failure would hide money that was
+            # already paid -- the same shape of gap this surface exists to
+            # close.
+            delta["images_read"] += vision_used.images_read
+            delta["image_cache_hits"] += vision_used.cache_hits
+            delta["vision_input_tokens"] += vision_used.input_tokens
+            delta["vision_output_tokens"] += vision_used.output_tokens
+            delta["vision_nanodollars"] += vision_used.nanodollars
             if answers is None:
                 self._note(channel.id, "provider_unavailable")
                 return
             self._last_judged[channel.id] = time.time()
             self._last_error.pop(channel.id, None)
-            # In memory only -- see `_flush_usage` for why this is not a
-            # Config write. hasattr: several tests build a partial cog that
-            # skips __init__.
-            delta = self._usage_delta[guild.id]
             delta["windows_judged"] += 1
-            delta["input_tokens"] += getattr(self, "_last_input_tokens", None) or 0
+            delta["input_tokens"] += judge_tokens
 
             # findings() reads settings["rule_threshold"] and keeps that one
             # signature; the per-channel override is folded in here, in the
@@ -2572,6 +2671,17 @@ class MessageWatch(commands.Cog):
         spend = tokens / 1_000_000 * price
         rate = f"{reports / windows:.0%}" if windows else "N/A"
 
+        # The vision provider is a second bill: a different endpoint, a
+        # different price, and output tokens that are not free the way Jev's
+        # are. Folding it into the figure above would have made one number that
+        # is wrong for both.
+        images = int(usage.get("images_read", 0))
+        hits = int(usage.get("image_cache_hits", 0))
+        v_in = int(usage.get("vision_input_tokens", 0))
+        v_out = int(usage.get("vision_output_tokens", 0))
+        v_nanos = int(usage.get("vision_nanodollars", 0))
+        v_spend = v_nanos / 1_000_000_000
+
         healthy = not any(item in self._last_error for item in watched)
         colour = discord.Colour.blurple() if healthy else discord.Colour.orange()
 
@@ -2585,9 +2695,30 @@ class MessageWatch(commands.Cog):
             name="用量",
             value=(
                 f"排入佇列 `{messages}` 則 · 判斷 `{windows}` 次視窗 · 送出報告 `{reports}` 則"
-                f"（報告率 `{rate}`）\n"
-                f"input tokens `{tokens:,}` · 估計花費 `${spend:.4f}` 美元（估計值，見下方註記）"
+                f"（報告率 `{rate}`）"
             ),
+            inline=False,
+        )
+        lines = [
+            f"**TypeSafe**　input `{tokens:,}` · `${spend:.4f}`"
+        ]
+        if images or hits:
+            read = f"讀圖 `{images}` 張"
+            if hits:
+                read += f"（另有 `{hits}` 張命中快取，不計費）"
+            if v_nanos:
+                cost = f"`${v_spend:.4f}`（供應商回報值）"
+            else:
+                # Saying "$0.0000" here would be a measurement nobody took.
+                cost = "供應商未回報成本"
+            lines.append(
+                f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}"
+            )
+            if v_nanos:
+                lines.append(f"**合計**　`${spend + v_spend:.4f}` 美元")
+        embed.add_field(
+            name="花費（估計值，見下方註記）",
+            value="\n".join(lines),
             inline=False,
         )
         embed.add_field(

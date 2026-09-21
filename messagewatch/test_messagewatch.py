@@ -264,7 +264,9 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
         if items:
             items[0]["text"] = text
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            return await (cog or self.cog()).judge(items, "c", "k")
+            answers, tokens = await (cog or self.cog()).judge(items, "c", "k")
+        self.last_tokens = tokens
+        return answers
 
     async def test_a_good_answer_is_returned(self) -> None:
         body = json.dumps({"answers": {"any_scam": {"noul": 0.9}}}).encode()
@@ -307,28 +309,27 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
             "messagewatch.messagewatch.aiohttp.ClientSession",
             side_effect=module.aiohttp.ClientError("boom"),
         ):
-            self.assertIsNone(
-                await self.cog().judge([], "c", "k")
-            )
+            self.assertEqual(await self.cog().judge([], "c", "k"), (None, 0))
 
-    async def test_judge_surfaces_input_tokens_without_widening_the_none_contract(self) -> None:
-        # judge() used to throw usage.input_tokens away entirely. A caller
-        # needs it to accumulate spend, but every failure path must still
-        # return None -- the token count travels on `self`, not in the
-        # return value, so it cannot change that contract.
+    async def test_judge_returns_its_token_count_beside_the_answers(self) -> None:
+        # The count used to be left on `self` to keep the return type narrow.
+        # `flush` holds a per-channel lock, so two channels judging at once both
+        # wrote that field and whichever read second recorded the other's
+        # tokens -- against the wrong window, and across guilds against the
+        # wrong bill. It travels in the return value now.
         cog = self.cog()
         body = json.dumps(
             {"answers": {"any_scam": {"noul": 0.9}}, "usage": {"input_tokens": 512}}
         ).encode()
         answers = await self.request_with(200, body, cog=cog)
         self.assertEqual(answers, {"any_scam": {"noul": 0.9}})
-        self.assertEqual(cog._last_input_tokens, 512)
+        self.assertEqual(self.last_tokens, 512)
+        self.assertFalse(hasattr(cog, "_last_input_tokens"))
 
-        # A later failure on the same cog must not leave the previous call's
-        # count readable -- a caller reading it after a None would silently
-        # attribute someone else's tokens to a judgement that never happened.
+        # A later failure returns 0 beside its None rather than the previous
+        # call's count, which is what made the old field on `self` dangerous.
         self.assertIsNone(await self.request_with(500, b"{}", cog=cog))
-        self.assertIsNone(cog._last_input_tokens)
+        self.assertEqual(self.last_tokens, 0)
 
     async def test_an_untrusted_token_count_is_bounded_like_every_other_provider_field(self) -> None:
         for value in (True, False, -5, "512", None, float("nan"), 10**400):
@@ -342,7 +343,9 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
             {"answers": {"any_scam": {"noul": 0.9}}, "usage": {"input_tokens": "not a number"}}
         ).encode()
         await self.request_with(200, body, cog=cog)
-        self.assertIsNone(cog._last_input_tokens)
+        # An unreadable count is 0 rather than a guess: the spend estimate says
+        # "at least this much" instead of inventing tokens nobody measured.
+        self.assertEqual(self.last_tokens, 0)
 
 
 class TestGating(unittest.IsolatedAsyncioTestCase):
@@ -528,7 +531,7 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         )
         cog.config.channel.return_value = channel_scope
         cog.get_api_key = AsyncMock(return_value="k")
-        cog.judge = AsyncMock(return_value=answers)
+        cog.judge = AsyncMock(return_value=(answers, 0))
         cog._pending = pending()
         cog._last_report = {}
         cog._locks = module.defaultdict(module.asyncio.Lock)
@@ -592,7 +595,7 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         channel, report = self.channel()
         observed = []
         cog.judge = AsyncMock(
-            side_effect=lambda *a, **k: observed.append(cog._locks[5].locked()) or self.SCAM
+            side_effect=lambda *a, **k: (observed.append(cog._locks[5].locked()), (self.SCAM, 0))[1]
         )
         await cog.flush(channel)
         self.assertEqual(observed, [True])
@@ -706,7 +709,7 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
 
         async def blocked(*args, **kwargs):
             await gate.wait()
-            return self.QUIET
+            return self.QUIET, 0
 
         cog.judge = AsyncMock(side_effect=blocked)
         first = module.asyncio.create_task(cog.flush(channel))
@@ -1570,7 +1573,7 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         cog._last_judged = {}
         cog._last_error = {}
         cog.get_api_key = AsyncMock(return_value="k")
-        cog.judge = AsyncMock(return_value=None)
+        cog.judge = AsyncMock(return_value=(None, 0))
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "report_channel": 77, "watched_channels": [5], "idle_seconds": 600}
         scope = MagicMock()
@@ -1614,10 +1617,10 @@ class TestIdleSweep(unittest.IsolatedAsyncioTestCase):
         cog._last_judged = {}
         cog._last_error = {}
         cog.get_api_key = AsyncMock(return_value="k")
-        cog.judge = AsyncMock(return_value={"any_scam": {"noul": 0.97},
-                                            "scam_index": {"choice": "1"},
-                                            "is_hostile": {"noul": 0.01},
-                                            "heat": {"score": 0.2}})
+        cog.judge = AsyncMock(return_value=({"any_scam": {"noul": 0.97},
+                                             "scam_index": {"choice": "1"},
+                                             "is_hostile": {"noul": 0.01},
+                                             "heat": {"score": 0.2}}, 0))
         settings = {**DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
                     "report_channel": 77, "watched_channels": [5], "idle_seconds": 600}
         scope = MagicMock()
@@ -1970,10 +1973,10 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
 
     async def test_messages_flow_through_to_one_report(self) -> None:
         cog = self.cog()
-        cog.judge = AsyncMock(return_value={"any_scam": {"noul": 0.97},
-                                            "scam_index": {"choice": "1"},
-                                            "is_hostile": {"noul": 0.01},
-                                            "heat": {"score": 0.2}})
+        cog.judge = AsyncMock(return_value=({"any_scam": {"noul": 0.97},
+                                             "scam_index": {"choice": "1"},
+                                             "is_hostile": {"noul": 0.01},
+                                             "heat": {"score": 0.2}}, 0))
         report = None
         for index in range(4):
             message, report = self.message(index)
@@ -1997,7 +2000,7 @@ class TestEndToEnd(unittest.IsolatedAsyncioTestCase):
             peak = max(peak, depth)
             await module.asyncio.sleep(0)
             depth -= 1
-            return {"any_scam": {"noul": 0.01}, "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}
+            return {"any_scam": {"noul": 0.01}, "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}, 0
 
         cog.judge = AsyncMock(side_effect=judging)
         messages = [self.message(index)[0] for index in range(8)]
@@ -2038,7 +2041,12 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         cog._last_judged = {}
         cog._last_error = {}
         cog._usage_delta = module.defaultdict(
-            lambda: {"messages_queued": 0, "windows_judged": 0, "reports_sent": 0, "input_tokens": 0}
+            lambda: {
+                "messages_queued": 0, "windows_judged": 0, "reports_sent": 0,
+                "input_tokens": 0, "images_read": 0, "image_cache_hits": 0,
+                "vision_input_tokens": 0, "vision_output_tokens": 0,
+                "vision_nanodollars": 0,
+            }
         )
         return cog, scope
 
@@ -2055,18 +2063,15 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         cog, scope = self.cog()
         channel, report = self.channel()
 
-        # `judge` is mocked in every flush test, including this one, so the
-        # attribute it normally sets on success has to be set here too.
+        # `judge` returns (answers, input_tokens); the mocks return the pair.
         async def first(*args, **kwargs):
-            cog._last_input_tokens = 500
-            return self.QUIET
+            return self.QUIET, 500
         cog.judge = AsyncMock(side_effect=first)
         cog._pending[5].extend(window(1, 2, 3))
         await cog.flush(channel)
 
         async def second(*args, **kwargs):
-            cog._last_input_tokens = 300
-            return self.SCAM
+            return self.SCAM, 300
         cog.judge = AsyncMock(side_effect=second)
         cog._pending[5].extend(window(4, 5, 6))
         await cog.flush(channel)
@@ -2089,20 +2094,152 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["input_tokens"], 800)
         self.assertEqual(stored["reports_sent"], 1)
         self.assertGreater(stored["started_at"], 0)
-        self.assertEqual(
-            cog._usage_delta[1],
-            {"messages_queued": 0, "windows_judged": 0, "reports_sent": 0, "input_tokens": 0},
-        )
+        # Every counter back to zero, named rather than compared against a
+        # literal: a new counter that the flush forgets to subtract would pass
+        # a subset comparison and fail this one.
+        self.assertEqual(set(cog._usage_delta[1]), set(module.DEFAULT_GUILD["usage"]) - {"started_at"})
+        self.assertEqual(sorted(set(cog._usage_delta[1].values())), [0])
 
         # A third judgement after the flush starts counting fresh from zero,
         # not from the total the flush already moved into Config.
         async def third(*args, **kwargs):
-            cog._last_input_tokens = 250
-            return self.QUIET
+            return self.QUIET, 250
         cog.judge = AsyncMock(side_effect=third)
         cog._pending[5].extend(window(7, 8, 9))
         await cog.flush(channel)
         self.assertEqual(cog._usage_delta[1]["input_tokens"], 250)
+
+    async def test_two_channels_judging_at_once_each_record_their_own_tokens(self) -> None:
+        # `flush` locks per channel, so two channels reach `judge` together.
+        # The count used to be stashed on the cog between the await and the
+        # read, and whichever flush read second recorded the other's tokens.
+        # Interleaved deliberately here: the first call parks until the second
+        # has been and gone, which is the order that made the old code wrong.
+        cog, _ = self.cog()
+        scope = cog.config.guild.return_value
+        scope.watched_channels = AsyncMock(return_value=[5, 6])
+        scope.all = AsyncMock(return_value={
+            **DEFAULT_GUILD, "disclosure_version": DISCLOSURE_VERSION,
+            "report_channel": 77, "watched_channels": [5, 6], "window_size": 3,
+            "cooldown_seconds": 0,
+        })
+        first_in_flight = module.asyncio.Event()
+        second_done = module.asyncio.Event()
+
+        async def judge(window, channel_name, *a, **k):
+            if channel_name == "five":
+                first_in_flight.set()
+                await second_done.wait()
+                return self.QUIET, 500
+            await first_in_flight.wait()
+            try:
+                return self.QUIET, 300
+            finally:
+                second_done.set()
+        cog.judge = AsyncMock(side_effect=judge)
+
+        def channel_in(guild_id, channel_id, name):
+            report = MagicMock(spec=discord.TextChannel)
+            report.send = AsyncMock()
+            guild = MagicMock()
+            guild.id = guild_id
+            guild.get_channel.return_value = report
+            return SimpleNamespace(id=channel_id, guild=guild, name=name,
+                                   mention=f"<#{channel_id}>")
+        five = channel_in(1, 5, "five")
+        six = channel_in(2, 6, "six")
+        cog._pending[5].extend(window(1, 2, 3))
+        cog._pending[6].extend(window(4, 5, 6))
+        # Bounded: if the interleaving ever stops working, this fails rather
+        # than hanging the suite, and a hang is not a failure anything reports.
+        await module.asyncio.wait_for(
+            module.asyncio.gather(cog.flush(five), cog.flush(six)), timeout=5
+        )
+
+        # Each guild is billed for its own request, not for whichever finished
+        # last. Under the old field both read 300.
+        self.assertEqual(cog._usage_delta[1]["input_tokens"], 500)
+        self.assertEqual(cog._usage_delta[2]["input_tokens"], 300)
+
+    async def test_a_channel_with_images_off_never_reaches_the_vision_provider(self) -> None:
+        # Replaces a test that asserted the call site by searching the source
+        # text for the `if channel_settings["images"]:` line. That guard broke
+        # the moment the line was reformatted, which is what a text scan does
+        # instead of failing when the behaviour changes. This drives a flush.
+        cog, _ = self.cog()
+        channel, _report = self.channel()
+        cog.judge = AsyncMock(side_effect=lambda *a, **k: (self.QUIET, 0))
+        cog.image_text = AsyncMock()
+        self.assertFalse(module.DEFAULT_CHANNEL["images"])
+        cog._pending[5].extend(window(1, 2, 3))
+        for item in cog._pending[5]:
+            item["images"] = [{"id": 1, "url": "https://cdn.discordapp.com/x.png"}]
+        await cog.flush(channel)
+        cog.image_text.assert_not_awaited()
+        self.assertEqual(cog._usage_delta[1]["images_read"], 0)
+        self.assertEqual(cog._usage_delta[1]["vision_input_tokens"], 0)
+
+    async def test_image_reading_is_counted_and_billed_separately(self) -> None:
+        # The vision provider is a second bill: a different endpoint, a
+        # different price, and output tokens it charges for. Folding it into
+        # the TypeSafe figure would produce one number wrong for both.
+        cog, _ = self.cog()
+        channel, _report = self.channel()
+        cog.config.channel.return_value.images = AsyncMock(return_value=True)
+        cog.config.channel.return_value.all = AsyncMock(
+            return_value={**module.DEFAULT_CHANNEL, "images": True}
+        )
+        cog.judge = AsyncMock(side_effect=lambda *a, **k: (self.QUIET, 100))
+        calls = []
+
+        async def image_text(attachment):
+            calls.append(attachment["id"])
+            # Second and third are the same image: one call, two cache hits.
+            if len(calls) == 1:
+                return "抄到的字", module.VisionUsage(
+                    images_read=1, input_tokens=316, output_tokens=41, nanodollars=69_400)
+            return "抄到的字", module.VisionUsage(cache_hits=1)
+        cog.image_text = AsyncMock(side_effect=image_text)
+
+        cog._pending[5].extend(window(1, 2, 3))
+        for n, item in enumerate(cog._pending[5]):
+            item["images"] = [{"id": 991, "url": f"https://cdn.discordapp.com/{n}.png"}]
+        await cog.flush(channel)
+
+        delta = cog._usage_delta[1]
+        self.assertEqual(delta["images_read"], 1)
+        self.assertEqual(delta["image_cache_hits"], 2)
+        self.assertEqual(delta["vision_input_tokens"], 316)
+        self.assertEqual(delta["vision_output_tokens"], 41)
+        self.assertEqual(delta["vision_nanodollars"], 69_400)
+        # TypeSafe's own count is untouched by any of it.
+        self.assertEqual(delta["input_tokens"], 100)
+
+    async def test_vision_spend_survives_a_failed_judgement(self) -> None:
+        # The images were read before `judge` ran, so that money is gone
+        # whether or not the judgement lands. Recording it after the early
+        # return would have hidden spend that had already happened, which is
+        # the gap this whole surface exists to close.
+        cog, _ = self.cog()
+        channel, _report = self.channel()
+        cog.config.channel.return_value.images = AsyncMock(return_value=True)
+        cog.config.channel.return_value.all = AsyncMock(
+            return_value={**module.DEFAULT_CHANNEL, "images": True})
+        cog.judge = AsyncMock(side_effect=lambda *a, **k: (None, 0))
+        cog.image_text = AsyncMock(return_value=("字", module.VisionUsage(
+            images_read=1, input_tokens=316, output_tokens=41, nanodollars=69_400)))
+        cog._pending[5].extend(window(1, 2, 3))
+        for item in cog._pending[5]:
+            item["images"] = [{"id": 991, "url": "https://cdn.discordapp.com/x.png"}]
+        await cog.flush(channel)
+
+        delta = cog._usage_delta[1]
+        self.assertEqual(delta["vision_input_tokens"], 316 * 3)
+        self.assertEqual(delta["vision_nanodollars"], 69_400 * 3)
+        self.assertEqual(delta["images_read"], 3)
+        # The judgement did not happen, so nothing on that side is counted.
+        self.assertEqual(delta["windows_judged"], 0)
+        self.assertEqual(delta["input_tokens"], 0)
 
     async def test_nothing_is_written_to_config_per_judgement(self) -> None:
         # The write belongs to the sweep (`_flush_usage`), not to flush() --
@@ -2112,8 +2249,7 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         channel, _ = self.channel()
 
         async def fake_judge(*args, **kwargs):
-            cog._last_input_tokens = 42
-            return self.QUIET
+            return self.QUIET, 42
         cog.judge = AsyncMock(side_effect=fake_judge)
 
         cog._pending[5].extend(window(1, 2, 3))
@@ -2157,9 +2293,9 @@ class TestUsageEdges(unittest.IsolatedAsyncioTestCase):
         cog._reset_state()
         cog.bot = MagicMock()
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            answers = await cog.judge([], "c", "k")
+            answers, tokens = await cog.judge([], "c", "k")
         self.assertEqual(answers, {"any_scam": {"noul": 0.5}})
-        self.assertIsNone(cog._last_input_tokens)
+        self.assertEqual(tokens, 0)
 
     async def test_a_flush_keeps_what_arrived_during_its_awaits(self) -> None:
         # Red's context manager awaits on entry and on exit, and `flush` or
@@ -2221,6 +2357,9 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
         }
         cog.config = MagicMock()
         cog.config.all_guilds = AsyncMock(return_value={1: settings})
+        # The dashboard reads the global scope too, for the vision model's
+        # prices: a second provider with a second bill.
+        cog.config.all = AsyncMock(return_value=dict(module.DEFAULT_GLOBAL))
         guild_scope = MagicMock()
         guild_scope.all = AsyncMock(return_value=settings)
         guild_scope.dashboard_message.set = AsyncMock()
@@ -2289,6 +2428,47 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
         channel.send.reset_mock()
         await cog._update_dashboards()
         channel.send.assert_not_called()
+
+    async def test_the_dashboard_separates_the_two_bills(self) -> None:
+        # One total would be wrong for both: TypeSafe is estimated from a
+        # per-guild price because Jev reports none, and the vision figure is
+        # whatever the provider said it charged.
+        cog, guild, _channel, guild_scope = self.cog()
+        guild_scope.all = AsyncMock(return_value={
+            **DEFAULT_GUILD, "watched_channels": [5],
+            "price_per_million_input_tokens": 0.042,
+            "usage": {**DEFAULT_GUILD["usage"], "input_tokens": 1_500_000,
+                      "images_read": 100, "image_cache_hits": 40,
+                      "vision_input_tokens": 31_600, "vision_output_tokens": 4_100,
+                      "vision_nanodollars": 4_200_000},
+        })
+        rendered = json.dumps(
+            (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False
+        )
+        # 1.5M x 0.042 = 0.063 estimated; 4_200_000 nanodollars = 0.0042 reported.
+        self.assertIn("$0.0630", rendered)
+        self.assertIn("$0.0042", rendered)
+        self.assertIn("$0.0672", rendered)
+        self.assertIn("100", rendered)
+        self.assertIn("40", rendered)
+
+    async def test_a_provider_that_reports_no_cost_says_so_instead_of_zero(self) -> None:
+        # "$0.0000" would be a measurement nobody took, indistinguishable from
+        # a provider that charged nothing. The tokens are still shown, because
+        # those were counted, and the combined total is withheld with the line.
+        cog, guild, _channel, guild_scope = self.cog()
+        guild_scope.all = AsyncMock(return_value={
+            **DEFAULT_GUILD, "watched_channels": [5],
+            "usage": {**DEFAULT_GUILD["usage"], "images_read": 7,
+                      "vision_input_tokens": 2_200, "vision_output_tokens": 300,
+                      "vision_nanodollars": 0},
+        })
+        rendered = json.dumps(
+            (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False
+        )
+        self.assertIn("2,200", rendered)
+        self.assertIn("供應商未回報成本", rendered)
+        self.assertNotIn("合計", rendered)
 
     async def test_the_estimate_is_labelled_an_estimate_and_the_marks_line_says_precision_not_recall(
         self,
@@ -2419,17 +2599,6 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             cog, ctx, SimpleNamespace(id=5, mention="<#5>", name="c"), "off")
         scope.images.set.assert_awaited_once_with(False)
 
-    async def test_nothing_is_sent_when_the_channel_has_images_off(self) -> None:
-        # The default, and the state every channel starts in.
-        cog = object.__new__(MessageWatch)
-        cog._reset_state()
-        cog.image_text = AsyncMock()
-        window = [{"images": [{"id": 1, "url": "https://x/y.png"}]}]
-        self.assertFalse(module.DEFAULT_CHANNEL["images"])
-        # _attach_image_text is only reached when the channel opted in; this
-        # asserts the call site's gate, not the method.
-        source = (pathlib.Path(__file__).parent / "messagewatch.py").read_text(encoding="utf-8")
-        self.assertIn('if channel_settings["images"]:\n                await self._attach_image_text(', source)
 
     async def test_no_model_or_key_means_no_request(self) -> None:
         # Refusing rather than guessing a default: no model has been measured
@@ -2438,19 +2607,155 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._reset_state()
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
-        cog._extract_text = AsyncMock()
+        cog._extract_text = AsyncMock(return_value=(None, 0, 0, 0))
         cog.config = MagicMock()
         for settings in ({"image_model": "", "image_api_base": "https://x"},
                          {"image_model": "m", "image_api_base": ""}):
             with self.subTest(settings=settings):
                 cog.config.all = AsyncMock(return_value=settings)
                 with patch("messagewatch.messagewatch.aiohttp.ClientSession") as session:
-                    got = await cog.image_text({"id": 1, "url": "https://x/y.png"})
+                    got, _used = await cog.image_text({"id": 1, "url": "https://x/y.png"})
                 self.assertIsNone(got)
                 # Not merely "no model call" -- the image is not even fetched,
                 # so an unconfigured channel costs nothing and sends nothing.
                 session.assert_not_called()
                 cog._extract_text.assert_not_awaited()
+
+    async def test_the_vision_usage_comes_back_with_the_text(self) -> None:
+        # Driven through `_extract_text` rather than a mocked `image_text`:
+        # the output count is parsed there, and a test that stubs the layer
+        # above never touches it. Output tokens matter because the vision
+        # provider bills for them, unlike Jev.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        body = json.dumps({
+            "output": [{"content": [{"type": "output_text", "text": "抄到的字"}]}],
+            "usage": {"input_tokens": 316, "output_tokens": 41,
+                      "is_byok": True,
+                      "cost": 0, "cost_details": {"upstream_inference_cost": 6.94e-05}},
+        }).encode()
+        response = MagicMock()
+        response.status = 200
+        response.content.read = AsyncMock(return_value=body)
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=response)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post.return_value = ctx
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=session)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+        with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
+            text, tin, tout, nanos = await cog._extract_text("https://x", "k", "m", "data:,")
+        self.assertEqual((text, tin, tout, nanos), ("抄到的字", 316, 41, 69_400))
+
+    def test_the_reported_cost_reads_byok_from_the_right_field(self) -> None:
+        # Measured against the live relay on 2026-09-21. Under BYOK the
+        # upstream provider bills directly, so OpenRouter reports `cost: 0`
+        # and the real figure sits in `cost_details.upstream_inference_cost`.
+        # Reading `cost` alone would record every call on this deployment --
+        # which is BYOK through Friendli -- as free.
+        byok = {"is_byok": True, "cost": 0,
+                "cost_details": {"upstream_inference_cost": 6.94e-05}}
+        self.assertEqual(module._reported_nanodollars(byok), 69_400)
+
+        metered = {"is_byok": False, "cost": 0.000337,
+                   "cost_details": {"upstream_inference_cost": 0.000337}}
+        self.assertEqual(module._reported_nanodollars(metered), 337_000)
+
+        # Provider output, bounded like every other field that arrives from
+        # one. NaN passes `value < 0.0` and fails `not 0.0 <= value`.
+        for bad in (
+            {}, {"is_byok": False}, {"is_byok": False, "cost": None},
+            {"is_byok": False, "cost": "0.1"}, {"is_byok": False, "cost": -1},
+            {"is_byok": False, "cost": float("nan")},
+            {"is_byok": False, "cost": float("inf")},
+            {"is_byok": False, "cost": 10**400},
+            {"is_byok": False, "cost": True},
+            {"is_byok": True, "cost": 0},
+            {"is_byok": True, "cost": 0, "cost_details": {}},
+            {"is_byok": True, "cost": 0.5, "cost_details": None},
+        ):
+            with self.subTest(usage=str(bad)[:44]):
+                self.assertEqual(module._reported_nanodollars(bad), 0)
+
+    async def test_a_cache_miss_reports_one_image_read_with_its_tokens(self) -> None:
+        # The other half of the pair above: a miss is the call that was paid
+        # for, so it is the one that carries images_read.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
+        cog.config = MagicMock()
+        cog.config.all = AsyncMock(
+            return_value={"image_model": "m", "image_api_base": "https://x"})
+        cog._extract_text = AsyncMock(return_value=("抄到的字", 316, 41, 69_400))
+        response = MagicMock()
+        response.status = 200
+        response.content.read = AsyncMock(return_value=b"bytes")
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=response)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get.return_value = ctx
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=session)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+        with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx), \
+                patch("messagewatch.messagewatch.transcode_image",
+                      return_value=("image/png", b"x")):
+            got, used = await cog.image_text({"id": 7, "url": "https://x/7.png"})
+        self.assertEqual(got, "抄到的字")
+        self.assertEqual(
+            used, module.VisionUsage(images_read=1, input_tokens=316, output_tokens=41, nanodollars=69_400)
+        )
+
+    async def test_an_unreadable_image_returns_a_pair_and_still_reports_its_cost(self) -> None:
+        # This path shipped returning three values against a two-value
+        # signature: `flush` would have raised ValueError on any empty or
+        # failed vision response and lost the whole judgement. 148 tests passed
+        # over it, because none of them drove a failing `_extract_text`.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
+        cog.config = MagicMock()
+        cog.config.all = AsyncMock(
+            return_value={"image_model": "m", "image_api_base": "https://x"})
+        # The provider billed for the call and returned nothing usable.
+        cog._extract_text = AsyncMock(return_value=(None, 316, 0, 40_600))
+        response = MagicMock()
+        response.status = 200
+        response.content.read = AsyncMock(return_value=b"bytes")
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=response)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get.return_value = ctx
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=session)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+        with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx), \
+                patch("messagewatch.messagewatch.transcode_image",
+                      return_value=("image/png", b"x")):
+            got, used = await cog.image_text({"id": 7, "url": "https://x/7.png"})
+        self.assertIsNone(got)
+        self.assertEqual(used, module.VisionUsage(images_read=1, input_tokens=316, nanodollars=40_600))
+
+    async def test_a_cache_hit_is_counted_and_costs_nothing(self) -> None:
+        # "images read" is not interpretable without it: the same meme
+        # reposted ten times is one paid call and nine hits.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog._image_cache[991] = "已經讀過的文字"
+        cog.bot = MagicMock()
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
+        cog._extract_text = AsyncMock()
+        got, used = await cog.image_text({"id": 991, "url": "https://x/y.png"})
+        self.assertEqual(got, "已經讀過的文字")
+        self.assertEqual(used, module.VisionUsage(cache_hits=1))
+        self.assertEqual((used.images_read, used.input_tokens, used.output_tokens), (0, 0, 0))
+        cog._extract_text.assert_not_awaited()
 
     async def test_a_cached_attachment_is_not_fetched_twice(self) -> None:
         # The same meme reposted ten times is paid for once.
@@ -2459,11 +2764,11 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._image_cache[991] = "已經讀過的文字"
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
-        cog._extract_text = AsyncMock()
+        cog._extract_text = AsyncMock(return_value=(None, 0, 0, 0))
         cog.config = MagicMock()
         cog.config.all = AsyncMock(
             return_value={"image_model": "m", "image_api_base": "https://x"})
-        got = await cog.image_text({"id": 991, "url": "https://x/y.png"})
+        got, used = await cog.image_text({"id": 991, "url": "https://x/y.png"})
         self.assertEqual(got, "已經讀過的文字")
         cog._extract_text.assert_not_awaited()
 
@@ -2493,7 +2798,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                 patch("messagewatch.messagewatch.transcode_image",
                       return_value=("image/png", b"x")):
             for i in range(module.IMAGE_CACHE_SIZE + 5):
-                cog._extract_text = AsyncMock(return_value=str(i))
+                cog._extract_text = AsyncMock(return_value=(str(i), 0, 0, 0))
                 await cog.image_text({"id": i, "url": f"https://x/{i}.png"})
         self.assertEqual(len(cog._image_cache), module.IMAGE_CACHE_SIZE)
         self.assertNotIn(0, cog._image_cache)

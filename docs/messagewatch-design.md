@@ -142,7 +142,26 @@ A hostname is refused for `http://` even when it would resolve inside those rang
 
 ## 11. Cost visibility
 
-Resource utilization—including input token tallies and total evaluated windows—accumulates in process memory. Counters are written to disk every 60 seconds during the idle sweep and flushed once more during `cog_unload`. An ungraceful restart loses at most the final 60-second window. Operators can pin an auto-updating status embed in any channel via `[p]watch dashboard`.
+Resource utilization accumulates in process memory. Counters are written to disk every 60 seconds during the idle sweep and flushed once more during `cog_unload`. An ungraceful restart loses at most the final 60-second window. Operators can pin an auto-updating status embed in any channel via `[p]watch dashboard`.
+
+**Two providers, two bills.** The dashboard reports them on separate lines, with a combined total below, and never collapses the two into a single figure — a lone number built from one price would be wrong for both:
+
+| | Figure | Source |
+|---|---|---|
+| TypeSafe | Estimated from input tokens — Jev's output is free and its API reports no cost | `price_per_million_input_tokens`, per guild |
+| Vision provider | What the provider says it charged | The response's own `usage` block |
+
+The vision figure is read from the response rather than computed from a price table. A table has to be maintained by hand and is wrong the moment the vendor moves — and it was already wrong in a way nobody would have noticed: OpenRouter routes `gemma-4-31b-it` across fourteen providers at $0.090 to $0.750 per million input tokens, so the correct number to enter depends on where a given request landed.
+
+Two fields, because they mean different things. `cost` is what OpenRouter charged the account, and it is **0 under BYOK**, where the upstream provider bills directly; the real figure is then in `cost_details.upstream_inference_cost`. Measured on 2026-09-21 against Friendli: `cost: 0` with `upstream_inference_cost: 6.94e-05`, which matches Friendli's published $0.140/$0.400 per million exactly for the 290 input and 72 output tokens of that call. Reading `cost` alone would report every call on a BYOK deployment as free.
+
+The value is stored in nanodollars as an integer, which keeps the usage counters homogeneous and takes float accumulation out of the question.
+
+Where the provider reports no cost the dashboard says so rather than printing `$0.0000` — a zero there is indistinguishable from a call that was free, and it would be a measurement nobody took — and the combined total is withheld with it. The token counts are still shown, because those were counted.
+
+Vision usage is recorded before the early return that a failed judgement takes. The images were read before `judge` ran, so that money is gone whether or not the judgement lands, and recording it afterwards would hide spend that had already happened.
+
+Cache hits are reported beside images read. Without them "images read" is not interpretable: the same image reposted ten times is one paid call and nine hits.
 
 ## 12. What is not solved here
 
