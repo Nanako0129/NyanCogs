@@ -300,9 +300,26 @@ class VisionUsage(NamedTuple):
     # costs around 7e-5 dollars: an integer counter keeps the usage dict
     # homogeneous and takes float accumulation out of the question entirely.
     nanodollars: int = 0
+    # Why the last image in this window could not be read, for `[p]watch show`.
+    # The five failure exits below logged and returned None, so a channel whose
+    # vision endpoint was refusing every request looked exactly like a channel
+    # where nobody had posted a picture -- the failure shape this cog is built
+    # to avoid, in the one feature added without wiring it up.
+    failure: str = ""
 
     def __add__(self, other: "VisionUsage") -> "VisionUsage":
-        return VisionUsage(*(a + b for a, b in zip(self, other)))
+        """Accumulate a window's images: counts add, the reason does not.
+
+        The five numeric fields sum. `failure` takes the later non-empty one,
+        so a window where the third image failed reports that reason and a
+        window where the third failed and the fourth succeeded still does --
+        one image having worked says nothing about the one that did not, and
+        the surface this feeds shows a single line per channel.
+        """
+        return VisionUsage(
+            *(a + b for a, b in zip(self[:5], other[:5])),
+            failure=other.failure or self.failure,
+        )
 
 
 class Setting(NamedTuple):
@@ -1249,7 +1266,11 @@ class MessageWatch(commands.Cog):
         api_base = str(vision["image_api_base"]).strip()
         token = await self.get_image_key()
         if not model or not api_base or not token:
-            return None, VisionUsage()
+            # The likeliest reason nothing is being read, and previously the
+            # quietest: a manager turns a channel on, sees a success message,
+            # and the endpoint the owner has to set was never set.
+            missing = ("model" if not model else "api_base" if not api_base else "key")
+            return None, VisionUsage(failure=f"vision_no_{missing}")
 
         timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT_SECONDS)
         try:
@@ -1259,27 +1280,28 @@ class MessageWatch(commands.Cog):
                 async with session.get(attachment["url"], allow_redirects=False) as response:
                     if response.status != 200:
                         log.warning("messagewatch: attachment fetch returned %d", response.status)
-                        return None, VisionUsage()
+                        return None, VisionUsage(failure=f"image_fetch_http_{response.status}")
                     raw = await response.content.read(MAX_IMAGE_BYTES + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: attachment fetch failed (%s)", type(error).__name__)
-            return None, VisionUsage()
+            return None, VisionUsage(failure=f"image_fetch_{type(error).__name__}")
         if len(raw) > MAX_IMAGE_BYTES:
-            return None, VisionUsage()
+            return None, VisionUsage(failure="image_too_large")
 
         # Decoding and resizing are CPU-bound and would stall every other
         # channel's ingestion if they ran on the event loop.
         transcoded = await asyncio.to_thread(transcode_image, raw)
         if transcoded is None:
-            return None, VisionUsage()
+            return None, VisionUsage(failure="image_unreadable")
         content_type, encoded = transcoded
         data_uri = f"data:{content_type};base64,{base64.b64encode(encoded).decode('ascii')}"
 
-        text, tokens_in, tokens_out, nanos = await self._extract_text(
+        text, tokens_in, tokens_out, nanos, failure = await self._extract_text(
             api_base, token, model, data_uri
         )
         used = VisionUsage(images_read=1, input_tokens=tokens_in,
-                           output_tokens=tokens_out, nanodollars=nanos)
+                           output_tokens=tokens_out, nanodollars=nanos,
+                           failure=failure)
         if text is None:
             return None, used
         text = " ".join(text.split())[:IMAGE_TEXT_CHARS]
@@ -1290,7 +1312,7 @@ class MessageWatch(commands.Cog):
 
     async def _extract_text(
         self, api_base: str, token: str, model: str, data_uri: str
-    ) -> tuple[str | None, int, int, int]:
+    ) -> tuple[str | None, int, int, int, str]:
         """Ask the vision model for the characters, and nothing else.
 
         Verbatim extraction rather than description: a scam image is a
@@ -1319,18 +1341,18 @@ class MessageWatch(commands.Cog):
                 ) as response:
                     if response.status != 200:
                         log.warning("messagewatch: image model returned %d", response.status)
-                        return None, 0, 0, 0
+                        return None, 0, 0, 0, f"vision_http_{response.status}"
                     body = await response.content.read(MAX_RESPONSE_BYTES + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: image model unreachable (%s)", type(error).__name__)
-            return None, 0, 0, 0
+            return None, 0, 0, 0, f"vision_{type(error).__name__}"
         if len(body) > MAX_RESPONSE_BYTES:
-            return None, 0, 0, 0
+            return None, 0, 0, 0, "vision_response_too_large"
         try:
             decoded = json.loads(body)
         except (ValueError, RecursionError):
             log.warning("messagewatch: image model response was not usable JSON")
-            return None, 0, 0, 0
+            return None, 0, 0, 0, "vision_bad_json"
         parts: list[str] = []
         for item in (decoded.get("output") or []) if isinstance(decoded, Mapping) else []:
             for chunk in (item.get("content") or []) if isinstance(item, Mapping) else []:
@@ -1348,7 +1370,7 @@ class MessageWatch(commands.Cog):
         # Reported even when the text is unusable: the provider billed for the
         # call either way, and a cost surface that hides the failures
         # understates exactly the spend worth noticing.
-        return (joined or None), tokens_in, tokens_out, nanos
+        return (joined or None), tokens_in, tokens_out, nanos, ("" if joined else "vision_empty_text")
 
     async def get_image_key(self) -> str | None:
         """The vision provider's key, from Red's shared token storage."""
@@ -1779,6 +1801,15 @@ class MessageWatch(commands.Cog):
                 return
             self._last_judged[channel.id] = time.time()
             self._last_error.pop(channel.id, None)
+            if vision_used.failure:
+                # After the pop, not before it. An image failure is a partial
+                # one -- the window was judged on its text and the picture was
+                # not read -- so a successful judgement must not clear it, and
+                # recording it earlier meant the pop below the judge call wiped
+                # it every time. Without this the five image failure exits are
+                # invisible: they log, the report still goes out, and nothing a
+                # moderator can see says an image was skipped.
+                self._note(channel.id, vision_used.failure)
             delta["windows_judged"] += 1
             delta["input_tokens"] += judge_tokens
 
