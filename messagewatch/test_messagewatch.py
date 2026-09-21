@@ -56,6 +56,34 @@ class ValueContext:
         return False
 
 
+def streamed(body: bytes) -> MagicMock:
+    """A response body the cog reads the way it reads a real one.
+
+    `read_bounded` iterates `content.iter_chunked`, because
+    `StreamReader.read(n)` returns whatever arrived first rather than n bytes
+    -- the defect that made every image over one read come back truncated.
+    A mock that only answers `read` would let that defect back in unnoticed.
+    """
+
+    async def chunks(size: int):
+        for start in range(0, max(len(body), 1), size):
+            piece = body[start:start + size]
+            if piece or not body:
+                yield piece
+
+    async def read(n: int = -1) -> bytes:
+        # What a real StreamReader does: return what arrived, up to n bytes,
+        # never waiting for n. Modelling it faithfully is the point -- a mock
+        # that returned the whole body let `read(limit + 1)` pass a test while
+        # production received a third of a PNG.
+        return body[:module.READ_CHUNK] if n < 0 else body[:min(n, module.READ_CHUNK)]
+
+    content = MagicMock()
+    content.iter_chunked = chunks
+    content.read = read
+    return content
+
+
 class TestOutboundPayload(unittest.TestCase):
     def test_authors_become_per_request_labels_and_ids_never_leave(self) -> None:
         items = anonymise(window(111111111111111111, 222222222222222222, 111111111111111111))
@@ -251,7 +279,7 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
     async def request_with(self, status: int, body: bytes, text: str = "", cog: MessageWatch | None = None):
         response = MagicMock()
         response.status = status
-        response.content.read = AsyncMock(return_value=body)
+        response.content = streamed(body)
         response_ctx = MagicMock()
         response_ctx.__aenter__ = AsyncMock(return_value=response)
         response_ctx.__aexit__ = AsyncMock(return_value=False)
@@ -2466,9 +2494,7 @@ class TestUsageEdges(unittest.IsolatedAsyncioTestCase):
         # The guard is only worth having if the failure stays inside judge.
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(
-            return_value=b'{"answers": {"any_scam": {"noul": 0.5}}, "usage": {"input_tokens": Infinity}}'
-        )
+        response.content = streamed(b'{"answers": {"any_scam": {"noul": 0.5}}, "usage": {"input_tokens": Infinity}}')
         response_ctx = MagicMock()
         response_ctx.__aenter__ = AsyncMock(return_value=response)
         response_ctx.__aexit__ = AsyncMock(return_value=False)
@@ -2895,6 +2921,26 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                 session.assert_not_called()
                 cog._extract_text.assert_not_awaited()
 
+    async def test_a_body_larger_than_one_read_arrives_whole(self) -> None:
+        # The defect that made this feature do nothing. `StreamReader.read(n)`
+        # returns whatever arrived first, at most n bytes, so `read(limit + 1)`
+        # handed back the first chunk and dropped the rest. Measured against
+        # production on 2026-09-21: a 124,759-byte PNG came back as 38,349
+        # bytes under HTTP 200, PIL called it truncated, and the cog reported
+        # the image unreadable -- every image over one read, silently.
+        body = bytes(range(256)) * 900  # 230,400 bytes, several chunks
+        response = MagicMock()
+        response.status = 200
+        response.content = streamed(body)
+        got = await module.read_bounded(response, len(body))
+        self.assertEqual(len(got), len(body))
+        self.assertEqual(got, body)
+
+        # A mock answering only `read` would pass a test written against
+        # `read`, which is how the original survived: assert the stream is
+        # what gets consumed.
+        self.assertIsNone(await module.read_bounded(response, len(body) - 1))
+
     async def test_the_vision_usage_comes_back_with_the_text(self) -> None:
         # Driven through `_extract_text` rather than a mocked `image_text`:
         # the output count is parsed there, and a test that stubs the layer
@@ -2910,7 +2956,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         }).encode()
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(return_value=body)
+        response.content = streamed(body)
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -2966,7 +3012,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._extract_text = AsyncMock(return_value=("抄到的字", 316, 41, 69_400, ""))
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(return_value=b"bytes")
+        response.content = streamed(b"bytes")
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -3000,7 +3046,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._extract_text = AsyncMock(return_value=(None, 316, 0, 40_600, "vision_empty_text"))
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(return_value=b"bytes")
+        response.content = streamed(b"bytes")
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -3045,7 +3091,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
         response = MagicMock()
         response.status = 404
-        response.content.read = AsyncMock(return_value=b"")
+        response.content = streamed(b"")
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -3059,7 +3105,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(used.failure, "image_fetch_http_404")
 
         response.status = 200
-        response.content.read = AsyncMock(return_value=b"not an image")
+        response.content = streamed(b"not an image")
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
             _text, used = await cog.image_text({"id": 3, "url": "https://x/y.png"})
         self.assertEqual(used.failure, "image_unreadable")
@@ -3107,7 +3153,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             return_value={"image_model": "m", "image_api_base": "https://x"})
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(return_value=b"bytes")
+        response.content = streamed(b"bytes")
         response_ctx = MagicMock()
         response_ctx.__aenter__ = AsyncMock(return_value=response)
         response_ctx.__aexit__ = AsyncMock(return_value=False)

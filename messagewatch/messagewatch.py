@@ -989,6 +989,36 @@ def reason_kind(reasons: list[str]) -> str:
     return "t"
 
 
+READ_CHUNK = 65_536
+
+
+async def read_bounded(response: Any, limit: int) -> bytes | None:
+    """The whole response body, or None when it exceeds `limit`.
+
+    `StreamReader.read(n)` returns as soon as any data is available -- at most
+    n bytes, not n bytes -- so `read(limit + 1)` handed back whatever the first
+    chunk happened to hold and silently dropped the rest.
+
+    Measured against the production host on 2026-09-21: a 124,759-byte PNG
+    came back as 38,349 bytes under HTTP 200 with a correct content-length,
+    PIL called it truncated, and the cog reported the image as unreadable.
+    Every image bigger than one read was refused that way for as long as the
+    feature existed, which is why a correctly configured channel read nothing
+    and no surface could say why.
+
+    The same call was used for both JSON responses. Those are usually small
+    enough to arrive in one chunk, so they mostly worked -- a failure mode
+    that shows up only on the larger answers is worse than one that always
+    shows.
+    """
+    buf = bytearray()
+    async for chunk in response.content.iter_chunked(READ_CHUNK):
+        buf.extend(chunk)
+        if len(buf) > limit:
+            return None
+    return bytes(buf)
+
+
 def anonymise(window: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Replace author IDs with labels that mean nothing outside this request."""
     aliases: dict[int, str] = {}
@@ -1359,11 +1389,11 @@ class MessageWatch(commands.Cog):
                     if response.status != 200:
                         log.warning("messagewatch: attachment fetch returned %d", response.status)
                         return None, VisionUsage(failure=f"image_fetch_http_{response.status}")
-                    raw = await response.content.read(MAX_IMAGE_BYTES + 1)
+                    raw = await read_bounded(response, MAX_IMAGE_BYTES)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: attachment fetch failed (%s)", type(error).__name__)
             return None, VisionUsage(failure=f"image_fetch_{type(error).__name__}")
-        if len(raw) > MAX_IMAGE_BYTES:
+        if raw is None:
             return None, VisionUsage(failure="image_too_large")
 
         # Decoding and resizing are CPU-bound and would stall every other
@@ -1420,11 +1450,11 @@ class MessageWatch(commands.Cog):
                     if response.status != 200:
                         log.warning("messagewatch: image model returned %d", response.status)
                         return None, 0, 0, 0, f"vision_http_{response.status}"
-                    body = await response.content.read(MAX_RESPONSE_BYTES + 1)
+                    body = await read_bounded(response, MAX_RESPONSE_BYTES)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: image model unreachable (%s)", type(error).__name__)
             return None, 0, 0, 0, f"vision_{type(error).__name__}"
-        if len(body) > MAX_RESPONSE_BYTES:
+        if body is None:
             return None, 0, 0, 0, "vision_response_too_large"
         try:
             decoded = json.loads(body)
@@ -1506,8 +1536,8 @@ class MessageWatch(commands.Cog):
                     if response.status != 200:
                         log.warning("messagewatch: provider returned HTTP %d", response.status)
                         return None, tokens
-                    raw = await response.content.read(MAX_RESPONSE_BYTES + 1)
-                    if len(raw) > MAX_RESPONSE_BYTES:
+                    raw = await read_bounded(response, MAX_RESPONSE_BYTES)
+                    if raw is None:
                         log.warning("messagewatch: provider response over %d bytes", MAX_RESPONSE_BYTES)
                         return None, tokens
         except asyncio.TimeoutError:
