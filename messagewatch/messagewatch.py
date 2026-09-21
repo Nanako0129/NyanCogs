@@ -1241,7 +1241,7 @@ class MessageWatch(commands.Cog):
         )
         used = VisionUsage(images_read=1, input_tokens=tokens_in, output_tokens=tokens_out)
         if text is None:
-            return None, used, VisionUsage()
+            return None, used
         text = " ".join(text.split())[:IMAGE_TEXT_CHARS]
         self._image_cache[key] = text
         while len(self._image_cache) > IMAGE_CACHE_SIZE:
@@ -1720,21 +1720,25 @@ class MessageWatch(commands.Cog):
                 str(channel_settings["purpose"]),
                 rules,
             )
+            # In memory only -- see `_flush_usage` for why this is not a
+            # Config write.
+            delta = self._usage_delta[guild.id]
+            # The vision calls already happened, above `judge`, so this spend
+            # is real whether or not the judgement lands. Recorded before the
+            # early return, or a provider failure would hide money that was
+            # already paid -- the same shape of gap this surface exists to
+            # close.
+            delta["images_read"] += vision_used.images_read
+            delta["image_cache_hits"] += vision_used.cache_hits
+            delta["vision_input_tokens"] += vision_used.input_tokens
+            delta["vision_output_tokens"] += vision_used.output_tokens
             if answers is None:
                 self._note(channel.id, "provider_unavailable")
                 return
             self._last_judged[channel.id] = time.time()
             self._last_error.pop(channel.id, None)
-            # In memory only -- see `_flush_usage` for why this is not a
-            # Config write. hasattr: several tests build a partial cog that
-            # skips __init__.
-            delta = self._usage_delta[guild.id]
             delta["windows_judged"] += 1
             delta["input_tokens"] += judge_tokens
-            delta["images_read"] += vision_used.images_read
-            delta["image_cache_hits"] += vision_used.cache_hits
-            delta["vision_input_tokens"] += vision_used.input_tokens
-            delta["vision_output_tokens"] += vision_used.output_tokens
 
             # findings() reads settings["rule_threshold"] and keeps that one
             # signature; the per-channel override is folded in here, in the
@@ -2684,15 +2688,17 @@ class MessageWatch(commands.Cog):
             read = f"讀圖 `{images}` 張"
             if hits:
                 read += f"（另有 `{hits}` 張命中快取，不計費）"
-            if v_price_in or v_price_out:
+            if v_price_in and v_price_out:
                 cost = f"`${v_spend:.4f}`"
             else:
                 # Saying "$0.0000" here would be a measurement nobody took.
-                cost = "單價未設定，無法估計（`[p]watch vision price_in|price_out`）"
+                # One price without the other reads the missing half as free,
+                # which understates in exactly the direction nobody checks.
+                cost = "單價未設定完整，無法估計（需要 `[p]watch vision price_in` 與 `price_out` 兩者）"
             lines.append(
                 f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}"
             )
-            if v_price_in or v_price_out:
+            if v_price_in and v_price_out:
                 lines.append(f"**合計**　`${spend + v_spend:.4f}` 美元")
         embed.add_field(
             name="花費（估計值，見下方註記）",

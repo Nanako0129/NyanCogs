@@ -144,7 +144,7 @@ A hostname is refused for `http://` even when it would resolve inside those rang
 
 Resource utilization accumulates in process memory. Counters are written to disk every 60 seconds during the idle sweep and flushed once more during `cog_unload`. An ungraceful restart loses at most the final 60-second window. Operators can pin an auto-updating status embed in any channel via `[p]watch dashboard`.
 
-**Two providers, two bills.** The dashboard reports them on separate lines and never as one figure, because a single number would be wrong for both:
+**Two providers, two bills.** The dashboard reports them on separate lines, with a combined total below, and never collapses the two into a single figure — a lone number built from one price would be wrong for both:
 
 | | Billed on | Priced by |
 |---|---|---|
@@ -153,7 +153,9 @@ Resource utilization accumulates in process memory. Counters are written to disk
 
 The vision prices sit beside the endpoint and the model rather than beside the guild's TypeSafe price, because a price belongs to the model it prices and the model is global. The existing per-guild setting stays where it is: moving a setting that guilds have already configured would change their dashboards without anyone asking.
 
-Both default to `0.0`, and the dashboard says the price is unset rather than printing `$0.0000` — a zero there is indistinguishable from a model that cost nothing, and it would be a measurement nobody took. The token counts are still shown, because those were counted.
+Both default to `0.0`, and **both** are required before any vision figure is shown: one price without the other reads the missing half as free, which understates in the direction nobody checks. Where either is unset the dashboard says so rather than printing `$0.0000` — a zero there is indistinguishable from a model that cost nothing, and it would be a measurement nobody took — and the combined total is withheld with it. The token counts are still shown, because those were counted.
+
+Vision usage is recorded before the early return that a failed judgement takes. The images were read before `judge` ran, so that money is gone whether or not the judgement lands, and recording it afterwards would hide spend that had already happened.
 
 Cache hits are reported beside images read. Without them "images read" is not interpretable: the same image reposted ten times is one paid call and nine hits.
 
