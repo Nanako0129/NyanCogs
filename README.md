@@ -284,6 +284,7 @@ extraction is generated text with nothing calibrated behind it.
 | Before sending | Downscaled and re-encoded, which discards EXIF including GPS tags |
 | Cache | By attachment id, at most 256 entries in memory; never on disk; dropped on reload and on a data deletion request |
 | Default model | None — see below |
+| Pricing for the dashboard | `[p]watch vision price_in` and `price_out`, per million tokens; both default to `0.0` |
 | Endpoint scheme | `https://` anywhere, or `http://` to a literal RFC1918 / IPv6 ULA / loopback address |
 
 There is no default model. Picking one without measuring which reads CJK

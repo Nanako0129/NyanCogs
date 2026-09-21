@@ -233,6 +233,13 @@ DEFAULT_TOKEN_PRICE_PER_MILLION = 0.042
 DEFAULT_GLOBAL = {
     "image_api_base": "",
     "image_model": "",
+    # Beside the endpoint and the model rather than beside the guild's TypeSafe
+    # price, because a price belongs to the model it prices and the model is
+    # global. The guild-level `price_per_million_input_tokens` stays where it
+    # is: moving a setting that guilds have already configured would change
+    # their dashboards without anyone asking for it.
+    "vision_price_per_million_input_tokens": 0.0,
+    "vision_price_per_million_output_tokens": 0.0,
 }
 
 DEFAULT_GUILD = {
@@ -266,6 +273,14 @@ DEFAULT_GUILD = {
         "windows_judged": 0,
         "reports_sent": 0,
         "input_tokens": 0,
+        # The vision provider is billed separately and bills for output as
+        # well, so its tokens cannot be folded into `input_tokens` above.
+        # `image_cache_hits` is what makes `images_read` interpretable: a
+        # reposted image is a hit, and hits cost nothing.
+        "images_read": 0,
+        "image_cache_hits": 0,
+        "vision_input_tokens": 0,
+        "vision_output_tokens": 0,
         "started_at": 0,
     },
     "price_per_million_input_tokens": DEFAULT_TOKEN_PRICE_PER_MILLION,
@@ -274,6 +289,23 @@ DEFAULT_GUILD = {
     "dashboard_channel": 0,
     "dashboard_message": 0,
 }
+
+class VisionUsage(NamedTuple):
+    """What one window's image reading cost, for the dashboard.
+
+    Output tokens are counted because the vision provider bills for them.
+    TypeSafe does not -- Jev's output is free -- which is why the guild-level
+    spend estimate is input-only and this one cannot be.
+    """
+
+    images_read: int = 0
+    cache_hits: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def __add__(self, other: "VisionUsage") -> "VisionUsage":
+        return VisionUsage(*(a + b for a, b in zip(self, other)))
+
 
 class Setting(NamedTuple):
     """One tunable, with what it means alongside what it accepts.
@@ -967,7 +999,11 @@ class MessageWatch(commands.Cog):
         # write every few messages, so these ride on the 60-second sweep
         # instead. See `_flush_usage`.
         self._usage_delta: defaultdict[int, dict[str, int]] = defaultdict(
-            lambda: {"messages_queued": 0, "windows_judged": 0, "reports_sent": 0, "input_tokens": 0}
+            lambda: {
+                "messages_queued": 0, "windows_judged": 0, "reports_sent": 0,
+                "input_tokens": 0, "images_read": 0, "image_cache_hits": 0,
+                "vision_input_tokens": 0, "vision_output_tokens": 0,
+            }
         )
         # Per-guild dashboard state. `_dashboard_error` stops the sweep from
         # retrying a channel that is gone or forbidden every minute forever;
@@ -1133,7 +1169,7 @@ class MessageWatch(commands.Cog):
         key = tokens.get("api_key") if isinstance(tokens, Mapping) else None
         return key if isinstance(key, str) and key else None
 
-    async def _attach_image_text(self, window: list[dict[str, Any]]) -> None:
+    async def _attach_image_text(self, window: list[dict[str, Any]]) -> VisionUsage:
         """Read this window's images, bounded, and hang the text on each item.
 
         Bounded per window rather than per message: one post of twenty
@@ -1141,16 +1177,19 @@ class MessageWatch(commands.Cog):
         judgement.
         """
         budget = MAX_IMAGES_PER_WINDOW
+        total = VisionUsage()
         for item in window:
             for attachment in item.get("images") or ():
                 if budget <= 0:
-                    return
+                    return total
                 budget -= 1
-                text = await self.image_text(attachment)
+                text, used = await self.image_text(attachment)
+                total = total + used
                 if text:
                     item["image_text"] = (item.get("image_text", "") + " " + text).strip()
+        return total
 
-    async def image_text(self, attachment: Mapping[str, Any]) -> str | None:
+    async def image_text(self, attachment: Mapping[str, Any]) -> tuple[str | None, VisionUsage]:
         """The characters in one attachment, or None when they could not be read.
 
         Every failure returns None for the same reason `judge` does: a
@@ -1162,14 +1201,16 @@ class MessageWatch(commands.Cog):
         cached = self._image_cache.get(key)
         if cached is not None:
             self._image_cache.move_to_end(key)
-            return cached
+            # A hit costs nothing, and counting it is what makes "images read"
+            # interpretable: the same meme reposted ten times is one call.
+            return cached, VisionUsage(cache_hits=1)
 
         vision = await self.config.all()
         model = str(vision["image_model"]).strip()
         api_base = str(vision["image_api_base"]).strip()
         token = await self.get_image_key()
         if not model or not api_base or not token:
-            return None
+            return None, VisionUsage()
 
         timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT_SECONDS)
         try:
@@ -1179,34 +1220,37 @@ class MessageWatch(commands.Cog):
                 async with session.get(attachment["url"], allow_redirects=False) as response:
                     if response.status != 200:
                         log.warning("messagewatch: attachment fetch returned %d", response.status)
-                        return None
+                        return None, VisionUsage()
                     raw = await response.content.read(MAX_IMAGE_BYTES + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: attachment fetch failed (%s)", type(error).__name__)
-            return None
+            return None, VisionUsage()
         if len(raw) > MAX_IMAGE_BYTES:
-            return None
+            return None, VisionUsage()
 
         # Decoding and resizing are CPU-bound and would stall every other
         # channel's ingestion if they ran on the event loop.
         transcoded = await asyncio.to_thread(transcode_image, raw)
         if transcoded is None:
-            return None
+            return None, VisionUsage()
         content_type, encoded = transcoded
         data_uri = f"data:{content_type};base64,{base64.b64encode(encoded).decode('ascii')}"
 
-        text = await self._extract_text(api_base, token, model, data_uri)
+        text, tokens_in, tokens_out = await self._extract_text(
+            api_base, token, model, data_uri
+        )
+        used = VisionUsage(images_read=1, input_tokens=tokens_in, output_tokens=tokens_out)
         if text is None:
-            return None
+            return None, used, VisionUsage()
         text = " ".join(text.split())[:IMAGE_TEXT_CHARS]
         self._image_cache[key] = text
         while len(self._image_cache) > IMAGE_CACHE_SIZE:
             self._image_cache.popitem(last=False)
-        return text
+        return text, used
 
     async def _extract_text(
         self, api_base: str, token: str, model: str, data_uri: str
-    ) -> str | None:
+    ) -> tuple[str | None, int, int]:
         """Ask the vision model for the characters, and nothing else.
 
         Verbatim extraction rather than description: a scam image is a
@@ -1235,18 +1279,18 @@ class MessageWatch(commands.Cog):
                 ) as response:
                     if response.status != 200:
                         log.warning("messagewatch: image model returned %d", response.status)
-                        return None
+                        return None, 0, 0
                     body = await response.content.read(MAX_RESPONSE_BYTES + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: image model unreachable (%s)", type(error).__name__)
-            return None
+            return None, 0, 0
         if len(body) > MAX_RESPONSE_BYTES:
-            return None
+            return None, 0, 0
         try:
             decoded = json.loads(body)
         except (ValueError, RecursionError):
             log.warning("messagewatch: image model response was not usable JSON")
-            return None
+            return None, 0, 0
         parts: list[str] = []
         for item in (decoded.get("output") or []) if isinstance(decoded, Mapping) else []:
             for chunk in (item.get("content") or []) if isinstance(item, Mapping) else []:
@@ -1254,8 +1298,16 @@ class MessageWatch(commands.Cog):
                     value = chunk.get("text")
                     if isinstance(value, str):
                         parts.append(value)
+        usage = decoded.get("usage") if isinstance(decoded, Mapping) else None
+        tokens_in = tokens_out = 0
+        if isinstance(usage, Mapping):
+            tokens_in = _bounded_token_count(usage.get("input_tokens")) or 0
+            tokens_out = _bounded_token_count(usage.get("output_tokens")) or 0
         joined = "\n".join(parts).strip()
-        return joined or None
+        # The tokens are reported even when the text is unusable: the provider
+        # billed for the call either way, and a cost surface that hides the
+        # failures understates exactly the spend worth noticing.
+        return (joined or None), tokens_in, tokens_out
 
     async def get_image_key(self) -> str | None:
         """The vision provider's key, from Red's shared token storage."""
@@ -1658,8 +1710,9 @@ class MessageWatch(commands.Cog):
                 return
 
             anonymise(window)
+            vision_used = VisionUsage()
             if channel_settings["images"]:
-                await self._attach_image_text(window)
+                vision_used = await self._attach_image_text(window)
             answers, judge_tokens = await self.judge(
                 window,
                 getattr(channel, "name", str(channel.id)),
@@ -1678,6 +1731,10 @@ class MessageWatch(commands.Cog):
             delta = self._usage_delta[guild.id]
             delta["windows_judged"] += 1
             delta["input_tokens"] += judge_tokens
+            delta["images_read"] += vision_used.images_read
+            delta["image_cache_hits"] += vision_used.cache_hits
+            delta["vision_input_tokens"] += vision_used.input_tokens
+            delta["vision_output_tokens"] += vision_used.output_tokens
 
             # findings() reads settings["rule_threshold"] and keeps that one
             # signature; the per-channel override is folded in here, in the
@@ -2094,6 +2151,15 @@ class MessageWatch(commands.Cog):
         fields = {
             "api_base": ("image_api_base", "視覺模型的 API 根位址，例如 `https://openrouter.ai`"),
             "model": ("image_model", "視覺模型名稱。沒有預設值——哪一個讀中文截圖最準還沒量過。"),
+            "price_in": (
+                "vision_price_per_million_input_tokens",
+                "視覺模型的 input 單價（每百萬 token 美元）。只用來估計儀表板上的花費。",
+            ),
+            "price_out": (
+                "vision_price_per_million_output_tokens",
+                "視覺模型的 output 單價（每百萬 token 美元）。Jev 的 output 免費，"
+                "視覺模型不是，所以這一項不能省略。",
+            ),
         }
         scope = self.config
         if key not in fields:
@@ -2120,6 +2186,19 @@ class MessageWatch(commands.Cog):
             return
         stored, _ = fields[key]
         value = value.strip()
+        if key in ("price_in", "price_out"):
+            try:
+                price = float(value) if value else 0.0
+            except (TypeError, ValueError, OverflowError):
+                price = None
+            # `not 0.0 <= price <= 1000.0` rather than the two comparisons
+            # written out: NaN fails both of those and would be stored.
+            if price is None or not 0.0 <= price <= 1000.0:
+                await ctx.send("單價要是 0 到 1000 之間的數字（每百萬 token 美元）。")
+                return
+            await scope.set_raw(stored, value=price)
+            await ctx.send(f"`{key}` 設為 `{price}`。")
+            return
         if key == "api_base" and value and not endpoint_is_allowed(value):
             await ctx.send(
                 "`api_base` 必須是 `https://`，或是 `http://` 加上區網的 IP"
@@ -2568,6 +2647,19 @@ class MessageWatch(commands.Cog):
         spend = tokens / 1_000_000 * price
         rate = f"{reports / windows:.0%}" if windows else "N/A"
 
+        # The vision provider is a second bill: a different endpoint, a
+        # different price, and output tokens that are not free the way Jev's
+        # are. Folding it into the figure above would have made one number that
+        # is wrong for both.
+        vision = await self.config.all()
+        images = int(usage.get("images_read", 0))
+        hits = int(usage.get("image_cache_hits", 0))
+        v_in = int(usage.get("vision_input_tokens", 0))
+        v_out = int(usage.get("vision_output_tokens", 0))
+        v_price_in = float(vision.get("vision_price_per_million_input_tokens", 0.0))
+        v_price_out = float(vision.get("vision_price_per_million_output_tokens", 0.0))
+        v_spend = v_in / 1_000_000 * v_price_in + v_out / 1_000_000 * v_price_out
+
         healthy = not any(item in self._last_error for item in watched)
         colour = discord.Colour.blurple() if healthy else discord.Colour.orange()
 
@@ -2581,9 +2673,30 @@ class MessageWatch(commands.Cog):
             name="用量",
             value=(
                 f"排入佇列 `{messages}` 則 · 判斷 `{windows}` 次視窗 · 送出報告 `{reports}` 則"
-                f"（報告率 `{rate}`）\n"
-                f"input tokens `{tokens:,}` · 估計花費 `${spend:.4f}` 美元（估計值，見下方註記）"
+                f"（報告率 `{rate}`）"
             ),
+            inline=False,
+        )
+        lines = [
+            f"**TypeSafe**　input `{tokens:,}` · `${spend:.4f}`"
+        ]
+        if images or hits:
+            read = f"讀圖 `{images}` 張"
+            if hits:
+                read += f"（另有 `{hits}` 張命中快取，不計費）"
+            if v_price_in or v_price_out:
+                cost = f"`${v_spend:.4f}`"
+            else:
+                # Saying "$0.0000" here would be a measurement nobody took.
+                cost = "單價未設定，無法估計（`[p]watch vision price_in|price_out`）"
+            lines.append(
+                f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}"
+            )
+            if v_price_in or v_price_out:
+                lines.append(f"**合計**　`${spend + v_spend:.4f}` 美元")
+        embed.add_field(
+            name="花費（估計值，見下方註記）",
+            value="\n".join(lines),
             inline=False,
         )
         embed.add_field(
