@@ -2220,6 +2220,25 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         # TypeSafe's own count is untouched by any of it.
         self.assertEqual(delta["input_tokens"], 100)
 
+    async def test_an_image_failure_reaches_watch_show(self) -> None:
+        # The judgement goes ahead on the text alone when an image cannot be
+        # read, so a missing report proves nothing and this is the only place
+        # anyone finds out. Driven through `flush`, because the earlier version
+        # of this test called `_note` itself and survived deleting the call.
+        cog, _ = self.cog()
+        channel, _report = self.channel()
+        cog.config.channel.return_value.images = AsyncMock(return_value=True)
+        cog.config.channel.return_value.all = AsyncMock(
+            return_value={**module.DEFAULT_CHANNEL, "images": True})
+        cog.judge = AsyncMock(side_effect=lambda *a, **k: (self.QUIET, 0))
+        cog.image_text = AsyncMock(
+            return_value=(None, module.VisionUsage(failure="vision_http_401")))
+        cog._pending[5].extend(window(1, 2, 3))
+        for item in cog._pending[5]:
+            item["images"] = [{"id": 991, "url": "https://cdn.discordapp.com/x.png"}]
+        await cog.flush(channel)
+        self.assertEqual(cog._last_error[5][1], "vision_http_401")
+
     async def test_vision_spend_survives_a_failed_judgement(self) -> None:
         # The images were read before `judge` ran, so that money is gone
         # whether or not the judgement lands. Recording it after the early
@@ -2649,7 +2668,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._reset_state()
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
-        cog._extract_text = AsyncMock(return_value=(None, 0, 0, 0))
+        cog._extract_text = AsyncMock(return_value=(None, 0, 0, 0, "vision_http_500"))
         cog.config = MagicMock()
         for settings in ({"image_model": "", "image_api_base": "https://x"},
                          {"image_model": "m", "image_api_base": ""}):
@@ -2688,8 +2707,8 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         session_ctx.__aenter__ = AsyncMock(return_value=session)
         session_ctx.__aexit__ = AsyncMock(return_value=False)
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            text, tin, tout, nanos = await cog._extract_text("https://x", "k", "m", "data:,")
-        self.assertEqual((text, tin, tout, nanos), ("抄到的字", 316, 41, 69_400))
+            text, tin, tout, nanos, failure = await cog._extract_text("https://x", "k", "m", "data:,")
+        self.assertEqual((text, tin, tout, nanos, failure), ("抄到的字", 316, 41, 69_400, ""))
 
     def test_the_reported_cost_reads_byok_from_the_right_field(self) -> None:
         # Measured against the live relay on 2026-09-21. Under BYOK the
@@ -2731,7 +2750,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog.config = MagicMock()
         cog.config.all = AsyncMock(
             return_value={"image_model": "m", "image_api_base": "https://x"})
-        cog._extract_text = AsyncMock(return_value=("抄到的字", 316, 41, 69_400))
+        cog._extract_text = AsyncMock(return_value=("抄到的字", 316, 41, 69_400, ""))
         response = MagicMock()
         response.status = 200
         response.content.read = AsyncMock(return_value=b"bytes")
@@ -2765,7 +2784,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog.config.all = AsyncMock(
             return_value={"image_model": "m", "image_api_base": "https://x"})
         # The provider billed for the call and returned nothing usable.
-        cog._extract_text = AsyncMock(return_value=(None, 316, 0, 40_600))
+        cog._extract_text = AsyncMock(return_value=(None, 316, 0, 40_600, "vision_empty_text"))
         response = MagicMock()
         response.status = 200
         response.content.read = AsyncMock(return_value=b"bytes")
@@ -2782,7 +2801,55 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                       return_value=("image/png", b"x")):
             got, used = await cog.image_text({"id": 7, "url": "https://x/7.png"})
         self.assertIsNone(got)
-        self.assertEqual(used, module.VisionUsage(images_read=1, input_tokens=316, nanodollars=40_600))
+        self.assertEqual(used, module.VisionUsage(images_read=1, input_tokens=316, nanodollars=40_600, failure="vision_empty_text"))
+
+    async def test_every_image_failure_names_itself(self) -> None:
+        # Five exits used to log and return None, so a channel whose endpoint
+        # refused every request looked exactly like one where nobody had
+        # posted a picture. `[p]watch show` is where anyone finds out, and it
+        # was told nothing.
+        cog = object.__new__(MessageWatch)
+        cog._reset_state()
+        cog.bot = MagicMock()
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
+        cog.config = MagicMock()
+
+        configured = {"image_model": "m", "image_api_base": "https://x"}
+        for vision, expected in (
+            ({"image_model": "", "image_api_base": "https://x"}, "vision_no_model"),
+            ({"image_model": "m", "image_api_base": ""}, "vision_no_api_base"),
+        ):
+            with self.subTest(expected=expected):
+                cog.config.all = AsyncMock(return_value=vision)
+                _text, used = await cog.image_text({"id": 1, "url": "https://x/y.png"})
+                self.assertEqual(used.failure, expected)
+
+        cog.config.all = AsyncMock(return_value=configured)
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={})
+        _text, used = await cog.image_text({"id": 1, "url": "https://x/y.png"})
+        self.assertEqual(used.failure, "vision_no_key")
+
+        cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
+        response = MagicMock()
+        response.status = 404
+        response.content.read = AsyncMock(return_value=b"")
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=response)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get.return_value = ctx
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=session)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+        with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
+            _text, used = await cog.image_text({"id": 2, "url": "https://x/y.png"})
+        self.assertEqual(used.failure, "image_fetch_http_404")
+
+        response.status = 200
+        response.content.read = AsyncMock(return_value=b"not an image")
+        with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
+            _text, used = await cog.image_text({"id": 3, "url": "https://x/y.png"})
+        self.assertEqual(used.failure, "image_unreadable")
 
     async def test_a_cache_hit_is_counted_and_costs_nothing(self) -> None:
         # "images read" is not interpretable without it: the same meme
@@ -2806,7 +2873,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._image_cache[991] = "已經讀過的文字"
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
-        cog._extract_text = AsyncMock(return_value=(None, 0, 0, 0))
+        cog._extract_text = AsyncMock(return_value=(None, 0, 0, 0, "vision_http_500"))
         cog.config = MagicMock()
         cog.config.all = AsyncMock(
             return_value={"image_model": "m", "image_api_base": "https://x"})
@@ -2840,7 +2907,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                 patch("messagewatch.messagewatch.transcode_image",
                       return_value=("image/png", b"x")):
             for i in range(module.IMAGE_CACHE_SIZE + 5):
-                cog._extract_text = AsyncMock(return_value=(str(i), 0, 0, 0))
+                cog._extract_text = AsyncMock(return_value=(str(i), 0, 0, 0, ""))
                 await cog.image_text({"id": i, "url": f"https://x/{i}.png"})
         self.assertEqual(len(cog._image_cache), module.IMAGE_CACHE_SIZE)
         self.assertNotIn(0, cog._image_cache)

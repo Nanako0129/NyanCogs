@@ -163,6 +163,10 @@ Vision usage is recorded before the early return that a failed judgement takes. 
 
 Cache hits are reported beside images read. Without them "images read" is not interpretable: the same image reposted ten times is one paid call and nine hits.
 
+**Image failures reach `[p]watch show`.** The path has five exits that return no text -- the endpoint or model or key unset, the attachment fetch returning a non-200, the attachment unreadable by PIL, the vision model returning a non-200, and an unusable response body -- and all five originally only logged. A channel whose endpoint was refusing every request therefore looked exactly like a channel where nobody had posted a picture.
+
+The reason is recorded after `_last_error` is cleared on a successful judgement, not before it. An image failure is a partial one: the window is still judged on its text and the report still goes out, so a successful judgement must not wipe the note, and recording it earlier meant the clear below the judge call did exactly that every time.
+
 ## 12. What is not solved here
 
 - **Recall remains unmeasured**: The system tracks precision through moderator feedback, but cannot quantify missed violations.
