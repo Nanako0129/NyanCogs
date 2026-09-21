@@ -233,13 +233,6 @@ DEFAULT_TOKEN_PRICE_PER_MILLION = 0.042
 DEFAULT_GLOBAL = {
     "image_api_base": "",
     "image_model": "",
-    # Beside the endpoint and the model rather than beside the guild's TypeSafe
-    # price, because a price belongs to the model it prices and the model is
-    # global. The guild-level `price_per_million_input_tokens` stays where it
-    # is: moving a setting that guilds have already configured would change
-    # their dashboards without anyone asking for it.
-    "vision_price_per_million_input_tokens": 0.0,
-    "vision_price_per_million_output_tokens": 0.0,
 }
 
 DEFAULT_GUILD = {
@@ -281,6 +274,7 @@ DEFAULT_GUILD = {
         "image_cache_hits": 0,
         "vision_input_tokens": 0,
         "vision_output_tokens": 0,
+        "vision_nanodollars": 0,
         "started_at": 0,
     },
     "price_per_million_input_tokens": DEFAULT_TOKEN_PRICE_PER_MILLION,
@@ -302,6 +296,10 @@ class VisionUsage(NamedTuple):
     cache_hits: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Nanodollars, because the provider reports its own figure and one image
+    # costs around 7e-5 dollars: an integer counter keeps the usage dict
+    # homogeneous and takes float accumulation out of the question entirely.
+    nanodollars: int = 0
 
     def __add__(self, other: "VisionUsage") -> "VisionUsage":
         return VisionUsage(*(a + b for a, b in zip(self, other)))
@@ -678,6 +676,46 @@ LAN_NETWORKS = (
 )
 
 
+def _reported_nanodollars(usage: Mapping[str, Any]) -> int:
+    """What the provider says this call cost, in nanodollars, or 0.
+
+    Taken from the response rather than computed from a price table. A table
+    has to be maintained by hand and is wrong the moment the vendor moves, and
+    it was already wrong here: OpenRouter routes `gemma-4-31b-it` across
+    fourteen providers at prices from $0.090 to $0.750 per million input
+    tokens, so the number to enter depends on where a given request landed.
+
+    Two fields, because they mean different things. `cost` is what OpenRouter
+    charged the account, and it is 0 under BYOK, where the upstream provider
+    bills directly -- measured on 2026-09-21 against Friendli, `cost: 0` with
+    `cost_details.upstream_inference_cost: 6.94e-05`. Reading `cost` alone
+    would report every BYOK call as free.
+    """
+    byok = usage.get("is_byok") is True
+    details = usage.get("cost_details")
+    raw: Any = None
+    if byok and isinstance(details, Mapping):
+        raw = details.get("upstream_inference_cost")
+    elif not byok:
+        raw = usage.get("cost")
+    # A numeric type, not something float() happens to parse. `_bounded_token_count`
+    # rejects "512" for the same reason: a provider sending a string is
+    # sending something this code did not agree to read. bool is an int in
+    # Python, and True would price a call at one nanodollar.
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return 0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    # Provider output, so bounded like every other field that arrives from
+    # one. `not 0.0 <= value` rather than `value < 0.0`: NaN fails the first
+    # and passes the second.
+    if not 0.0 <= value <= 1_000.0:
+        return 0
+    return round(value * 1_000_000_000)
+
+
 def endpoint_is_allowed(value: str) -> bool:
     """Whether the vision endpoint may be stored.
 
@@ -1003,6 +1041,7 @@ class MessageWatch(commands.Cog):
                 "messages_queued": 0, "windows_judged": 0, "reports_sent": 0,
                 "input_tokens": 0, "images_read": 0, "image_cache_hits": 0,
                 "vision_input_tokens": 0, "vision_output_tokens": 0,
+                "vision_nanodollars": 0,
             }
         )
         # Per-guild dashboard state. `_dashboard_error` stops the sweep from
@@ -1236,10 +1275,11 @@ class MessageWatch(commands.Cog):
         content_type, encoded = transcoded
         data_uri = f"data:{content_type};base64,{base64.b64encode(encoded).decode('ascii')}"
 
-        text, tokens_in, tokens_out = await self._extract_text(
+        text, tokens_in, tokens_out, nanos = await self._extract_text(
             api_base, token, model, data_uri
         )
-        used = VisionUsage(images_read=1, input_tokens=tokens_in, output_tokens=tokens_out)
+        used = VisionUsage(images_read=1, input_tokens=tokens_in,
+                           output_tokens=tokens_out, nanodollars=nanos)
         if text is None:
             return None, used
         text = " ".join(text.split())[:IMAGE_TEXT_CHARS]
@@ -1250,7 +1290,7 @@ class MessageWatch(commands.Cog):
 
     async def _extract_text(
         self, api_base: str, token: str, model: str, data_uri: str
-    ) -> tuple[str | None, int, int]:
+    ) -> tuple[str | None, int, int, int]:
         """Ask the vision model for the characters, and nothing else.
 
         Verbatim extraction rather than description: a scam image is a
@@ -1279,18 +1319,18 @@ class MessageWatch(commands.Cog):
                 ) as response:
                     if response.status != 200:
                         log.warning("messagewatch: image model returned %d", response.status)
-                        return None, 0, 0
+                        return None, 0, 0, 0
                     body = await response.content.read(MAX_RESPONSE_BYTES + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: image model unreachable (%s)", type(error).__name__)
-            return None, 0, 0
+            return None, 0, 0, 0
         if len(body) > MAX_RESPONSE_BYTES:
-            return None, 0, 0
+            return None, 0, 0, 0
         try:
             decoded = json.loads(body)
         except (ValueError, RecursionError):
             log.warning("messagewatch: image model response was not usable JSON")
-            return None, 0, 0
+            return None, 0, 0, 0
         parts: list[str] = []
         for item in (decoded.get("output") or []) if isinstance(decoded, Mapping) else []:
             for chunk in (item.get("content") or []) if isinstance(item, Mapping) else []:
@@ -1299,15 +1339,16 @@ class MessageWatch(commands.Cog):
                     if isinstance(value, str):
                         parts.append(value)
         usage = decoded.get("usage") if isinstance(decoded, Mapping) else None
-        tokens_in = tokens_out = 0
+        tokens_in = tokens_out = nanos = 0
         if isinstance(usage, Mapping):
             tokens_in = _bounded_token_count(usage.get("input_tokens")) or 0
             tokens_out = _bounded_token_count(usage.get("output_tokens")) or 0
+            nanos = _reported_nanodollars(usage)
         joined = "\n".join(parts).strip()
-        # The tokens are reported even when the text is unusable: the provider
-        # billed for the call either way, and a cost surface that hides the
-        # failures understates exactly the spend worth noticing.
-        return (joined or None), tokens_in, tokens_out
+        # Reported even when the text is unusable: the provider billed for the
+        # call either way, and a cost surface that hides the failures
+        # understates exactly the spend worth noticing.
+        return (joined or None), tokens_in, tokens_out, nanos
 
     async def get_image_key(self) -> str | None:
         """The vision provider's key, from Red's shared token storage."""
@@ -1732,6 +1773,7 @@ class MessageWatch(commands.Cog):
             delta["image_cache_hits"] += vision_used.cache_hits
             delta["vision_input_tokens"] += vision_used.input_tokens
             delta["vision_output_tokens"] += vision_used.output_tokens
+            delta["vision_nanodollars"] += vision_used.nanodollars
             if answers is None:
                 self._note(channel.id, "provider_unavailable")
                 return
@@ -2155,15 +2197,6 @@ class MessageWatch(commands.Cog):
         fields = {
             "api_base": ("image_api_base", "視覺模型的 API 根位址，例如 `https://openrouter.ai`"),
             "model": ("image_model", "視覺模型名稱。沒有預設值——哪一個讀中文截圖最準還沒量過。"),
-            "price_in": (
-                "vision_price_per_million_input_tokens",
-                "視覺模型的 input 單價（每百萬 token 美元）。只用來估計儀表板上的花費。",
-            ),
-            "price_out": (
-                "vision_price_per_million_output_tokens",
-                "視覺模型的 output 單價（每百萬 token 美元）。Jev 的 output 免費，"
-                "視覺模型不是，所以這一項不能省略。",
-            ),
         }
         scope = self.config
         if key not in fields:
@@ -2190,19 +2223,6 @@ class MessageWatch(commands.Cog):
             return
         stored, _ = fields[key]
         value = value.strip()
-        if key in ("price_in", "price_out"):
-            try:
-                price = float(value) if value else 0.0
-            except (TypeError, ValueError, OverflowError):
-                price = None
-            # `not 0.0 <= price <= 1000.0` rather than the two comparisons
-            # written out: NaN fails both of those and would be stored.
-            if price is None or not 0.0 <= price <= 1000.0:
-                await ctx.send("單價要是 0 到 1000 之間的數字（每百萬 token 美元）。")
-                return
-            await scope.set_raw(stored, value=price)
-            await ctx.send(f"`{key}` 設為 `{price}`。")
-            return
         if key == "api_base" and value and not endpoint_is_allowed(value):
             await ctx.send(
                 "`api_base` 必須是 `https://`，或是 `http://` 加上區網的 IP"
@@ -2655,14 +2675,12 @@ class MessageWatch(commands.Cog):
         # different price, and output tokens that are not free the way Jev's
         # are. Folding it into the figure above would have made one number that
         # is wrong for both.
-        vision = await self.config.all()
         images = int(usage.get("images_read", 0))
         hits = int(usage.get("image_cache_hits", 0))
         v_in = int(usage.get("vision_input_tokens", 0))
         v_out = int(usage.get("vision_output_tokens", 0))
-        v_price_in = float(vision.get("vision_price_per_million_input_tokens", 0.0))
-        v_price_out = float(vision.get("vision_price_per_million_output_tokens", 0.0))
-        v_spend = v_in / 1_000_000 * v_price_in + v_out / 1_000_000 * v_price_out
+        v_nanos = int(usage.get("vision_nanodollars", 0))
+        v_spend = v_nanos / 1_000_000_000
 
         healthy = not any(item in self._last_error for item in watched)
         colour = discord.Colour.blurple() if healthy else discord.Colour.orange()
@@ -2688,17 +2706,15 @@ class MessageWatch(commands.Cog):
             read = f"讀圖 `{images}` 張"
             if hits:
                 read += f"（另有 `{hits}` 張命中快取，不計費）"
-            if v_price_in and v_price_out:
-                cost = f"`${v_spend:.4f}`"
+            if v_nanos:
+                cost = f"`${v_spend:.4f}`（供應商回報值）"
             else:
                 # Saying "$0.0000" here would be a measurement nobody took.
-                # One price without the other reads the missing half as free,
-                # which understates in exactly the direction nobody checks.
-                cost = "單價未設定完整，無法估計（需要 `[p]watch vision price_in` 與 `price_out` 兩者）"
+                cost = "供應商未回報成本"
             lines.append(
                 f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}"
             )
-            if v_price_in and v_price_out:
+            if v_nanos:
                 lines.append(f"**合計**　`${spend + v_spend:.4f}` 美元")
         embed.add_field(
             name="花費（估計值，見下方註記）",

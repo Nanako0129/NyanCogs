@@ -2045,6 +2045,7 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
                 "messages_queued": 0, "windows_judged": 0, "reports_sent": 0,
                 "input_tokens": 0, "images_read": 0, "image_cache_hits": 0,
                 "vision_input_tokens": 0, "vision_output_tokens": 0,
+                "vision_nanodollars": 0,
             }
         )
         return cog, scope
@@ -2195,7 +2196,8 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
             calls.append(attachment["id"])
             # Second and third are the same image: one call, two cache hits.
             if len(calls) == 1:
-                return "抄到的字", module.VisionUsage(images_read=1, input_tokens=316, output_tokens=41)
+                return "抄到的字", module.VisionUsage(
+                    images_read=1, input_tokens=316, output_tokens=41, nanodollars=69_400)
             return "抄到的字", module.VisionUsage(cache_hits=1)
         cog.image_text = AsyncMock(side_effect=image_text)
 
@@ -2209,6 +2211,7 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delta["image_cache_hits"], 2)
         self.assertEqual(delta["vision_input_tokens"], 316)
         self.assertEqual(delta["vision_output_tokens"], 41)
+        self.assertEqual(delta["vision_nanodollars"], 69_400)
         # TypeSafe's own count is untouched by any of it.
         self.assertEqual(delta["input_tokens"], 100)
 
@@ -2223,8 +2226,8 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         cog.config.channel.return_value.all = AsyncMock(
             return_value={**module.DEFAULT_CHANNEL, "images": True})
         cog.judge = AsyncMock(side_effect=lambda *a, **k: (None, 0))
-        cog.image_text = AsyncMock(
-            return_value=("字", module.VisionUsage(images_read=1, input_tokens=316, output_tokens=41)))
+        cog.image_text = AsyncMock(return_value=("字", module.VisionUsage(
+            images_read=1, input_tokens=316, output_tokens=41, nanodollars=69_400)))
         cog._pending[5].extend(window(1, 2, 3))
         for item in cog._pending[5]:
             item["images"] = [{"id": 991, "url": "https://cdn.discordapp.com/x.png"}]
@@ -2232,6 +2235,7 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
 
         delta = cog._usage_delta[1]
         self.assertEqual(delta["vision_input_tokens"], 316 * 3)
+        self.assertEqual(delta["vision_nanodollars"], 69_400 * 3)
         self.assertEqual(delta["images_read"], 3)
         # The judgement did not happen, so nothing on that side is counted.
         self.assertEqual(delta["windows_judged"], 0)
@@ -2426,67 +2430,45 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_not_called()
 
     async def test_the_dashboard_separates_the_two_bills(self) -> None:
-        # One total would be wrong for both providers: Jev bills input only,
-        # the vision model bills output too, and the two prices differ by
-        # orders of magnitude.
+        # One total would be wrong for both: TypeSafe is estimated from a
+        # per-guild price because Jev reports none, and the vision figure is
+        # whatever the provider said it charged.
         cog, guild, _channel, guild_scope = self.cog()
         guild_scope.all = AsyncMock(return_value={
             **DEFAULT_GUILD, "watched_channels": [5],
             "price_per_million_input_tokens": 0.042,
             "usage": {**DEFAULT_GUILD["usage"], "input_tokens": 1_500_000,
                       "images_read": 100, "image_cache_hits": 40,
-                      "vision_input_tokens": 31_600, "vision_output_tokens": 4_100},
-        })
-        cog.config.all = AsyncMock(return_value={
-            **module.DEFAULT_GLOBAL,
-            "vision_price_per_million_input_tokens": 0.09,
-            "vision_price_per_million_output_tokens": 0.34,
+                      "vision_input_tokens": 31_600, "vision_output_tokens": 4_100,
+                      "vision_nanodollars": 4_200_000},
         })
         rendered = json.dumps(
             (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False
         )
-        # 1.5M x 0.042 = 0.063; 31600 x 0.09/1e6 + 4100 x 0.34/1e6 = 0.0042.
+        # 1.5M x 0.042 = 0.063 estimated; 4_200_000 nanodollars = 0.0042 reported.
         self.assertIn("$0.0630", rendered)
         self.assertIn("$0.0042", rendered)
         self.assertIn("$0.0672", rendered)
         self.assertIn("100", rendered)
         self.assertIn("40", rendered)
 
-    async def test_an_unpriced_vision_model_says_so_instead_of_showing_zero(self) -> None:
-        # DEFAULT_GLOBAL leaves both prices at 0.0, and "$0.0000" would be a
-        # measurement nobody took -- indistinguishable from a model that cost
-        # nothing. The tokens are still shown, because those were counted.
+    async def test_a_provider_that_reports_no_cost_says_so_instead_of_zero(self) -> None:
+        # "$0.0000" would be a measurement nobody took, indistinguishable from
+        # a provider that charged nothing. The tokens are still shown, because
+        # those were counted, and the combined total is withheld with the line.
         cog, guild, _channel, guild_scope = self.cog()
         guild_scope.all = AsyncMock(return_value={
             **DEFAULT_GUILD, "watched_channels": [5],
             "usage": {**DEFAULT_GUILD["usage"], "images_read": 7,
-                      "vision_input_tokens": 2_200, "vision_output_tokens": 300},
+                      "vision_input_tokens": 2_200, "vision_output_tokens": 300,
+                      "vision_nanodollars": 0},
         })
-        cog.config.all = AsyncMock(return_value=dict(module.DEFAULT_GLOBAL))
         rendered = json.dumps(
             (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False
         )
         self.assertIn("2,200", rendered)
-        self.assertIn("單價未設定完整", rendered)
+        self.assertIn("供應商未回報成本", rendered)
         self.assertNotIn("合計", rendered)
-
-    async def test_one_price_without_the_other_is_not_an_estimate(self) -> None:
-        # Computing with the missing half as zero understates, and understates
-        # silently: the figure looks like a measurement.
-        for prices in ({"vision_price_per_million_input_tokens": 0.09},
-                       {"vision_price_per_million_output_tokens": 0.34}):
-            with self.subTest(prices=prices):
-                cog, guild, _channel, guild_scope = self.cog()
-                guild_scope.all = AsyncMock(return_value={
-                    **DEFAULT_GUILD, "watched_channels": [5],
-                    "usage": {**DEFAULT_GUILD["usage"], "images_read": 7,
-                              "vision_input_tokens": 2_200, "vision_output_tokens": 300},
-                })
-                cog.config.all = AsyncMock(return_value={**module.DEFAULT_GLOBAL, **prices})
-                rendered = json.dumps(
-                    (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False)
-                self.assertIn("單價未設定完整", rendered)
-                self.assertNotIn("合計", rendered)
 
     async def test_the_estimate_is_labelled_an_estimate_and_the_marks_line_says_precision_not_recall(
         self,
@@ -2625,7 +2607,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._reset_state()
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
-        cog._extract_text = AsyncMock(return_value=(None, 0, 0))
+        cog._extract_text = AsyncMock(return_value=(None, 0, 0, 0))
         cog.config = MagicMock()
         for settings in ({"image_model": "", "image_api_base": "https://x"},
                          {"image_model": "m", "image_api_base": ""}):
@@ -2648,7 +2630,9 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._reset_state()
         body = json.dumps({
             "output": [{"content": [{"type": "output_text", "text": "抄到的字"}]}],
-            "usage": {"input_tokens": 316, "output_tokens": 41},
+            "usage": {"input_tokens": 316, "output_tokens": 41,
+                      "is_byok": True,
+                      "cost": 0, "cost_details": {"upstream_inference_cost": 6.94e-05}},
         }).encode()
         response = MagicMock()
         response.status = 200
@@ -2662,8 +2646,38 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         session_ctx.__aenter__ = AsyncMock(return_value=session)
         session_ctx.__aexit__ = AsyncMock(return_value=False)
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            text, tin, tout = await cog._extract_text("https://x", "k", "m", "data:,")
-        self.assertEqual((text, tin, tout), ("抄到的字", 316, 41))
+            text, tin, tout, nanos = await cog._extract_text("https://x", "k", "m", "data:,")
+        self.assertEqual((text, tin, tout, nanos), ("抄到的字", 316, 41, 69_400))
+
+    def test_the_reported_cost_reads_byok_from_the_right_field(self) -> None:
+        # Measured against the live relay on 2026-09-21. Under BYOK the
+        # upstream provider bills directly, so OpenRouter reports `cost: 0`
+        # and the real figure sits in `cost_details.upstream_inference_cost`.
+        # Reading `cost` alone would record every call on this deployment --
+        # which is BYOK through Friendli -- as free.
+        byok = {"is_byok": True, "cost": 0,
+                "cost_details": {"upstream_inference_cost": 6.94e-05}}
+        self.assertEqual(module._reported_nanodollars(byok), 69_400)
+
+        metered = {"is_byok": False, "cost": 0.000337,
+                   "cost_details": {"upstream_inference_cost": 0.000337}}
+        self.assertEqual(module._reported_nanodollars(metered), 337_000)
+
+        # Provider output, bounded like every other field that arrives from
+        # one. NaN passes `value < 0.0` and fails `not 0.0 <= value`.
+        for bad in (
+            {}, {"is_byok": False}, {"is_byok": False, "cost": None},
+            {"is_byok": False, "cost": "0.1"}, {"is_byok": False, "cost": -1},
+            {"is_byok": False, "cost": float("nan")},
+            {"is_byok": False, "cost": float("inf")},
+            {"is_byok": False, "cost": 10**400},
+            {"is_byok": False, "cost": True},
+            {"is_byok": True, "cost": 0},
+            {"is_byok": True, "cost": 0, "cost_details": {}},
+            {"is_byok": True, "cost": 0.5, "cost_details": None},
+        ):
+            with self.subTest(usage=str(bad)[:44]):
+                self.assertEqual(module._reported_nanodollars(bad), 0)
 
     async def test_a_cache_miss_reports_one_image_read_with_its_tokens(self) -> None:
         # The other half of the pair above: a miss is the call that was paid
@@ -2675,7 +2689,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog.config = MagicMock()
         cog.config.all = AsyncMock(
             return_value={"image_model": "m", "image_api_base": "https://x"})
-        cog._extract_text = AsyncMock(return_value=("抄到的字", 316, 41))
+        cog._extract_text = AsyncMock(return_value=("抄到的字", 316, 41, 69_400))
         response = MagicMock()
         response.status = 200
         response.content.read = AsyncMock(return_value=b"bytes")
@@ -2693,7 +2707,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             got, used = await cog.image_text({"id": 7, "url": "https://x/7.png"})
         self.assertEqual(got, "抄到的字")
         self.assertEqual(
-            used, module.VisionUsage(images_read=1, input_tokens=316, output_tokens=41)
+            used, module.VisionUsage(images_read=1, input_tokens=316, output_tokens=41, nanodollars=69_400)
         )
 
     async def test_an_unreadable_image_returns_a_pair_and_still_reports_its_cost(self) -> None:
@@ -2709,7 +2723,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog.config.all = AsyncMock(
             return_value={"image_model": "m", "image_api_base": "https://x"})
         # The provider billed for the call and returned nothing usable.
-        cog._extract_text = AsyncMock(return_value=(None, 316, 0))
+        cog._extract_text = AsyncMock(return_value=(None, 316, 0, 40_600))
         response = MagicMock()
         response.status = 200
         response.content.read = AsyncMock(return_value=b"bytes")
@@ -2726,7 +2740,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                       return_value=("image/png", b"x")):
             got, used = await cog.image_text({"id": 7, "url": "https://x/7.png"})
         self.assertIsNone(got)
-        self.assertEqual(used, module.VisionUsage(images_read=1, input_tokens=316))
+        self.assertEqual(used, module.VisionUsage(images_read=1, input_tokens=316, nanodollars=40_600))
 
     async def test_a_cache_hit_is_counted_and_costs_nothing(self) -> None:
         # "images read" is not interpretable without it: the same meme
@@ -2750,7 +2764,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._image_cache[991] = "已經讀過的文字"
         cog.bot = MagicMock()
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
-        cog._extract_text = AsyncMock(return_value=(None, 0, 0))
+        cog._extract_text = AsyncMock(return_value=(None, 0, 0, 0))
         cog.config = MagicMock()
         cog.config.all = AsyncMock(
             return_value={"image_model": "m", "image_api_base": "https://x"})
@@ -2784,7 +2798,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                 patch("messagewatch.messagewatch.transcode_image",
                       return_value=("image/png", b"x")):
             for i in range(module.IMAGE_CACHE_SIZE + 5):
-                cog._extract_text = AsyncMock(return_value=(str(i), 0, 0))
+                cog._extract_text = AsyncMock(return_value=(str(i), 0, 0, 0))
                 await cog.image_text({"id": i, "url": f"https://x/{i}.png"})
         self.assertEqual(len(cog._image_cache), module.IMAGE_CACHE_SIZE)
         self.assertNotIn(0, cog._image_cache)
@@ -2851,17 +2865,6 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         scope.set_raw.assert_not_awaited()
         await command(cog, ctx, "api_base", value="http://8.8.8.8")
         scope.set_raw.assert_not_awaited()
-        # NaN passes `x < low or x > high` -- both comparisons are false -- and
-        # a NaN price would render the spend estimate as "nan" forever.
-        for bad in ("nan", "-1", "1001", "inf", "abc"):
-            with self.subTest(price=bad):
-                await command(cog, ctx, "price_in", value=bad)
-                scope.set_raw.assert_not_awaited()
-        await command(cog, ctx, "price_out", value="0.34")
-        scope.set_raw.assert_awaited_with(
-            "vision_price_per_million_output_tokens", value=0.34
-        )
-        scope.set_raw.reset_mock()
         # A LAN proxy is the reason this is not simply an https check.
         await command(cog, ctx, "api_base", value="http://192.168.123.208:8318")
         scope.set_raw.assert_awaited_with("image_api_base", value="http://192.168.123.208:8318")
