@@ -475,6 +475,14 @@ QUESTIONS: dict[str, dict[str, Any]] = {
             "false": "只針對做法、數據或論點提出反對，即使語氣強硬或直接；朋友之間的玩笑互虧不算",
         },
     },
+    "hostile_index": {
+        "type": "choice",
+        "instructions": (
+            "若 `recent_messages` 裡有人身攻擊、嘲諷或貶低，最具攻擊性的是哪一則？"
+            "選項是各則訊息的開頭。若沒有任何一則是攻擊，選 none。"
+        ),
+        "criteria": {},
+    },
     "heat": {
         "type": "score",
         "instructions": "這段對話的人際衝突程度。只看人與人之間的緊張，不看話題本身嚴不嚴肅。",
@@ -684,6 +692,7 @@ def build_questions(
     items = list(window)
     questions = {key: dict(value) for key, value in QUESTIONS.items()}
     questions["scam_index"]["criteria"] = _message_options(items, "沒有任何一則是詐騙")
+    questions["hostile_index"]["criteria"] = _message_options(items, "沒有任何一則是攻擊")
     questions.update(build_rule_questions(items, list(rules or ())))
     return questions
 
@@ -1669,6 +1678,20 @@ class MessageWatch(commands.Cog):
         )
         if hostile is not None and hostile >= float(settings["hostile_threshold"]):
             reasons.append(f"敵意 {hostile:.2f}")
+            # A hostility report used to name no message, so the delete,
+            # timeout and role buttons had nothing to act on and a moderator
+            # had to go and find the message themselves. Hostility is a
+            # property of an exchange, which is why it is judged over a window
+            # -- but a moderator times out a person, not a conversation.
+            #
+            # Only when scam has not already pointed somewhere: a window that
+            # is both keeps the scam target, which is the one with a rule
+            # behind it. Unreadable means no target rather than a guess, the
+            # same contract `rule_index` holds.
+            if index is None:
+                picked = answers.get("hostile_index")
+                if isinstance(picked, Mapping):
+                    index = _bounded_index(picked.get("choice"), window_size)
 
         heat_answer = answers.get("heat")
         levels = len(QUESTIONS["heat"]["criteria"])

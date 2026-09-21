@@ -147,6 +147,14 @@ class TestOutboundPayload(unittest.TestCase):
         self.assertEqual(len(build_questions(anonymise(window(*range(8))))["scam_index"]["criteria"]), 9)
         self.assertEqual(module.QUESTIONS["scam_index"]["criteria"], {})
 
+        # `hostile_index` selects a message the same way and needs the same
+        # labels. An ordinal describes nothing, and this is the question that
+        # decides which person a timeout button is pointed at.
+        built = build_questions(items)["hostile_index"]["criteria"]
+        self.assertEqual(sorted(built), ["0", "1", "2", "none"])
+        self.assertTrue(built["0"].startswith("u1："))
+        self.assertEqual(module.QUESTIONS["hostile_index"]["criteria"], {})
+
 
 class TestUntrustedAnswers(unittest.TestCase):
     def test_probabilities_scores_and_indexes_are_bounded(self) -> None:
@@ -187,14 +195,38 @@ class TestUntrustedAnswers(unittest.TestCase):
         self.assertEqual(index, 2)
         self.assertEqual(reasons, ["詐騙 0.97"])
 
+        # A hostility report used to name no message, so the delete, timeout
+        # and role buttons had nothing to act on. Hostility is judged over a
+        # window because it is a property of an exchange -- but a moderator
+        # times out a person, not a conversation.
         fight = {
             "any_scam": {"noul": 0.01},
             "is_hostile": {"noul": 0.95},
+            "hostile_index": {"choice": "3"},
             "heat": {"score": 2.6},
         }
         index, reasons, _ = MessageWatch.findings(fight, settings, 8)
-        self.assertIsNone(index)
+        self.assertEqual(index, 3)
         self.assertEqual(reasons, ["敵意 0.95", "火藥味 2.60/3"])
+
+        # Scam keeps the target where a window is both: that is the finding
+        # with a rule behind it.
+        both = {
+            "any_scam": {"noul": 0.97}, "scam_index": {"choice": "1"},
+            "is_hostile": {"noul": 0.95}, "hostile_index": {"choice": "3"},
+            "heat": {"score": 0.1},
+        }
+        index, _reasons, _ = MessageWatch.findings(both, settings, 8)
+        self.assertEqual(index, 1)
+
+        # Unreadable means no target, not a guess -- the contract `rule_index`
+        # already holds, and the one that decides whether a person is named.
+        for bad in ({"choice": "none"}, {"choice": "99"}, {"choice": None}, {}):
+            with self.subTest(bad=str(bad)):
+                index, reasons, _ = MessageWatch.findings(
+                    {**fight, "hostile_index": bad}, settings, 8)
+                self.assertIsNone(index)
+                self.assertEqual(reasons, ["敵意 0.95", "火藥味 2.60/3"])
 
     def test_a_malformed_answer_reports_nothing_rather_than_guessing(self) -> None:
         settings = dict(DEFAULT_GUILD)
