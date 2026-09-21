@@ -308,6 +308,14 @@ class VisionUsage(NamedTuple):
     failure: str = ""
 
     def __add__(self, other: "VisionUsage") -> "VisionUsage":
+        """Accumulate a window's images: counts add, the reason does not.
+
+        The five numeric fields sum. `failure` takes the later non-empty one,
+        so a window where the third image failed reports that reason and a
+        window where the third failed and the fourth succeeded still does --
+        one image having worked says nothing about the one that did not, and
+        the surface this feeds shows a single line per channel.
+        """
         return VisionUsage(
             *(a + b for a, b in zip(self[:5], other[:5])),
             failure=other.failure or self.failure,
