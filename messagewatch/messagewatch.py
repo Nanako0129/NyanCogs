@@ -2622,12 +2622,32 @@ class MessageWatch(commands.Cog):
     async def watch_rule_remove(
         self, ctx: commands.Context, channel: discord.TextChannel, number: int
     ) -> None:
-        """Remove one rule by the number `[p]watch rule list` shows."""
+        """Remove one rule by the number `[p]watch rule list` shows.
+
+        That list numbers the combined set, server rules first, so the number
+        a moderator reads is not an index into this channel's own list. Before
+        the offset below, deleting displayed number 1 with one server rule
+        configured removed the channel's first rule instead -- the wrong rule,
+        with a success message naming the right one.
+        """
+        server_count = len(await self.config.guild(ctx.guild).server_rules())
+        if 1 <= number <= server_count:
+            await ctx.send(
+                f"第 {number} 條是伺服器規則，不屬於這個頻道。"
+                f"要刪的話用 `[p]watch serverrule remove {number}`，"
+                f"但它會從**所有**被監看的頻道消失。"
+            )
+            return
         async with self.config.channel(channel).rules() as rules:
-            if not 1 <= number <= len(rules):
-                await ctx.send(f"沒有第 {number} 條。目前有 {len(rules)} 條。")
+            index = number - server_count
+            if not 1 <= index <= len(rules):
+                total = server_count + len(rules)
+                await ctx.send(
+                    f"沒有第 {number} 條。目前共 {total} 條"
+                    f"（伺服器 {server_count} 條 + 這個頻道 {len(rules)} 條）。"
+                )
                 return
-            removed = rules.pop(number - 1)
+            removed = rules.pop(index - 1)
         # The numbers are positions, so removing one renumbers the rest. Saying
         # so beats a moderator deleting the wrong rule next time.
         await ctx.send(

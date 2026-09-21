@@ -1144,14 +1144,46 @@ class TestServerRules(unittest.IsolatedAsyncioTestCase):
 
 class TestRuleCommands(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def cog(rules):
+    def cog(rules, server_rules=()):
         cog = object.__new__(MessageWatch)
         cog._reset_state()
         scope = MagicMock()
         scope.rules = MagicMock(return_value=ValueContext(rules))
         cog.config = MagicMock()
         cog.config.channel.return_value = scope
+        guild_scope = MagicMock()
+        guild_scope.server_rules = AsyncMock(return_value=list(server_rules))
+        cog.config.guild.return_value = guild_scope
         return cog
+
+    async def test_remove_counts_from_the_numbers_the_list_shows(self) -> None:
+        # `[p]watch rule list` numbers the combined set, server rules first,
+        # so a displayed number is not an index into this channel's own list.
+        # Before the offset, deleting displayed 1 with one server rule
+        # configured removed the channel's first rule -- the wrong one, with a
+        # success message naming the right one.
+        channel = SimpleNamespace(id=5, mention="<#5>", name="c")
+
+        cog = self.cog(["頻道 A", "頻道 B"], server_rules=["伺服器 1"])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 2)
+        self.assertIn("頻道 A", ctx.send.await_args.args[0])
+
+        # A server number is refused here rather than silently hitting the
+        # channel list, and says where to delete it and what that costs.
+        cog = self.cog(["頻道 A"], server_rules=["伺服器 1"])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 1)
+        message = ctx.send.await_args.args[0]
+        self.assertIn("serverrule remove 1", message)
+        self.assertIn("所有", message)
+
+        # Past the end names both halves rather than a count that looks wrong.
+        cog = self.cog(["頻道 A"], server_rules=["伺服器 1"])
+        ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
+        await MessageWatch.watch_rule_remove.callback(cog, ctx, channel, 3)
+        message = ctx.send.await_args.args[0]
+        self.assertIn("共 2 條", message)
 
     async def test_echoed_rule_text_cannot_ping_the_guild(self) -> None:
         # A rule is moderator-written text echoed back verbatim, so a rule
