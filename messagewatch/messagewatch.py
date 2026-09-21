@@ -2581,7 +2581,12 @@ class MessageWatch(commands.Cog):
             if routed:
                 parts.append(f"→ <#{routed}>")
             judged = self._last_judged.get(item)
-            parts.append(f"上次判斷 <t:{int(judged)}:R>" if judged else "尚未判斷過")
+            # `_last_judged` is in memory, so a reload empties it while the
+            # persisted window count survives. Saying "never" there put two
+            # contradictory facts on one embed -- "judged 21 windows" above a
+            # column of "never judged" -- with nothing to tell a reader which
+            # was wrong. Neither was; the sentence was.
+            parts.append(f"上次判斷 <t:{int(judged)}:R>" if judged else "本次載入後尚未判斷")
             noted = self._last_error.get(item)
             if noted is not None:
                 parts.append(f"⚠️ `{noted[1]}` <t:{int(noted[0])}:R>")
@@ -2702,6 +2707,9 @@ class MessageWatch(commands.Cog):
         lines = [
             f"**TypeSafe**　input `{tokens:,}` · `${spend:.4f}`"
         ]
+        # Always printed, including at zero. Hiding the row made "no images
+        # have been read" indistinguishable from "this cog does not read
+        # images", which is the reading the first person to see it took.
         if images or hits:
             read = f"讀圖 `{images}` 張"
             if hits:
@@ -2716,6 +2724,17 @@ class MessageWatch(commands.Cog):
             )
             if v_nanos:
                 lines.append(f"**合計**　`${spend + v_spend:.4f}` 美元")
+        else:
+            enabled = [
+                item for item in watched
+                if await self.config.channel_from_id(item).images()
+            ]
+            where = (
+                f"已於 {len(enabled)} 個頻道開啟，尚未讀到圖片"
+                if enabled
+                else "未在任何頻道開啟（`[p]watch images #頻道 on`）"
+            )
+            lines.append(f"**視覺模型**　{where} · `$0.0000`")
         embed.add_field(
             name="花費（估計值，見下方註記）",
             value="\n".join(lines),

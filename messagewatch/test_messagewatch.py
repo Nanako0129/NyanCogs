@@ -1818,6 +1818,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
         cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
+        cog.config.channel_from_id.return_value.images = AsyncMock(return_value=False)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)
@@ -1842,6 +1843,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
         cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
+        cog.config.channel_from_id.return_value.images = AsyncMock(return_value=False)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)
@@ -1863,6 +1865,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
         cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
+        cog.config.channel_from_id.return_value.images = AsyncMock(return_value=False)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)
@@ -1890,6 +1893,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
         cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
+        cog.config.channel_from_id.return_value.images = AsyncMock(return_value=False)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)
@@ -1920,6 +1924,7 @@ class TestDiagnosticSurface(unittest.IsolatedAsyncioTestCase):
         cog.config = MagicMock()
         cog.config.guild.return_value = scope
         cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
+        cog.config.channel_from_id.return_value.images = AsyncMock(return_value=False)
         ctx = SimpleNamespace(guild=MagicMock(), send=AsyncMock())
 
         await MessageWatch.watch_show.callback(cog, ctx)
@@ -2365,6 +2370,7 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
         guild_scope.dashboard_message.set = AsyncMock()
         cog.config.guild.return_value = guild_scope
         cog.config.channel_from_id.return_value.report_channel = AsyncMock(return_value=0)
+        cog.config.channel_from_id.return_value.images = AsyncMock(return_value=False)
         cog.bot = MagicMock()
         guild = MagicMock()
         guild.id = 1
@@ -2451,6 +2457,42 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("$0.0672", rendered)
         self.assertIn("100", rendered)
         self.assertIn("40", rendered)
+
+    async def test_the_vision_line_appears_even_before_a_single_image(self) -> None:
+        # Hiding the row at zero made "no images read yet" indistinguishable
+        # from "this cog does not read images" -- which is the reading the
+        # first person to see the live dashboard took. Zero is a measurement
+        # and it is printed as one, with the reason it is zero.
+        cog, guild, _channel, guild_scope = self.cog()
+        guild_scope.all = AsyncMock(return_value={
+            **DEFAULT_GUILD, "watched_channels": [5, 6],
+            "usage": {**DEFAULT_GUILD["usage"], "input_tokens": 33_971},
+        })
+        rendered = json.dumps(
+            (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False)
+        self.assertIn("視覺模型", rendered)
+        self.assertIn("未在任何頻道開啟", rendered)
+
+        # And when it is on somewhere, the zero means "nothing posted yet".
+        cog.config.channel_from_id.return_value.images = AsyncMock(return_value=True)
+        rendered = json.dumps(
+            (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False)
+        self.assertIn("已於 2 個頻道開啟，尚未讀到圖片", rendered)
+
+    async def test_a_channel_not_judged_since_the_reload_does_not_claim_never(self) -> None:
+        # `_last_judged` lives in memory, so a reload empties it while the
+        # persisted window count survives. The live dashboard showed "judged
+        # 21 windows" above a column of "never judged", with nothing to tell a
+        # reader which was wrong. Neither was.
+        cog, guild, _channel, guild_scope = self.cog()
+        guild_scope.all = AsyncMock(return_value={
+            **DEFAULT_GUILD, "watched_channels": [5],
+            "usage": {**DEFAULT_GUILD["usage"], "windows_judged": 21},
+        })
+        rendered = json.dumps(
+            (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False)
+        self.assertIn("本次載入後尚未判斷", rendered)
+        self.assertNotIn("尚未判斷過", rendered)
 
     async def test_a_provider_that_reports_no_cost_says_so_instead_of_zero(self) -> None:
         # "$0.0000" would be a measurement nobody took, indistinguishable from
