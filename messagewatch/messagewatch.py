@@ -97,14 +97,30 @@ EMBED_FIELD_LIMIT = 1024
 # heaviest thing it has ever sent: an image can carry a face, a document, or a
 # screenshot of somebody's private conversation. Off unless a manager turns it
 # on for one channel.
-IMAGE_SUFFIXES = {
-    "image/png": (".png",),
-    "image/jpeg": (".jpg", ".jpeg"),
-    "image/webp": (".webp",),
-    "image/gif": (".gif",),
-}
-MAX_IMAGE_BYTES = 8_000_000
-MAX_IMAGE_PIXELS = 40_000_000
+# Content types only. There used to be a second check requiring the filename's
+# extension to match the type, as defence in depth. Measured against 26 real
+# attachments from this guild on 2026-09-21, it refused 9 of them: Discord
+# re-encodes uploads and reports the new type while keeping the original name,
+# so "image/webp" arrives called "image.png" and "image/jpeg" called
+# "IMG_2007.png" routinely.
+#
+# It was also guarding nothing. The filename is never used to decide anything
+# -- the bytes are downloaded and PIL decides what they actually are, which is
+# the only check that can be true. A guard that cannot be right and refuses a
+# third of real input is worse than no guard.
+IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
+# Both were set below what Discord actually delivers, which rejected ordinary
+# images and said nothing. 8 MB is under Discord's own 10 MB upload limit for
+# an account without Nitro, and 40 MP is under any current phone camera --
+# 48 MP and 50 MP sensors are the norm, so a photo taken rather than
+# screenshotted was refused at ingest every time.
+#
+# 10 MB matches what a free account can upload. 64 MP covers those sensors
+# while still refusing a decompression bomb well before PIL's own ~89 MP
+# guard; the pixel cap exists to bound decode work, and every image is
+# downscaled to IMAGE_MAX_EDGE before it is sent regardless.
+MAX_IMAGE_BYTES = 10_000_000
+MAX_IMAGE_PIXELS = 64_000_000
 IMAGE_MAX_EDGE = 1536  # Text stays legible far below the 4K ChannelSummary uses.
 IMAGE_JPEG_QUALITY = 82
 MAX_IMAGES_PER_WINDOW = 4
@@ -829,15 +845,16 @@ def eligible_attachments(message: Any) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     for attachment in getattr(message, "attachments", ()) or ():
         content_type = getattr(attachment, "content_type", None)
-        filename = getattr(attachment, "filename", None)
         size = getattr(attachment, "size", None)
         width = getattr(attachment, "width", None)
         height = getattr(attachment, "height", None)
         url = getattr(attachment, "url", None)
         attachment_id = getattr(attachment, "id", None)
-        if content_type not in IMAGE_SUFFIXES or not isinstance(filename, str):
-            continue
-        if not filename.casefold().endswith(IMAGE_SUFFIXES[content_type]):
+        # "image/png; charset=binary" is a legal content type and some clients
+        # send one, so the parameters come off before the lookup.
+        if isinstance(content_type, str):
+            content_type = content_type.split(";", 1)[0].strip().casefold()
+        if content_type not in IMAGE_TYPES:
             continue
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0

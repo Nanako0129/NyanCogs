@@ -2709,7 +2709,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                          [{"id": 991, "url": "https://cdn.discordapp.com/x.png"}])
         for over in (
             {"content_type": "application/pdf"},
-            {"content_type": "image/png", "filename": "shot.pdf"},
+            {"content_type": None},
             {"size": module.MAX_IMAGE_BYTES + 1},
             {"width": 20_000, "height": 20_000},
             {"size": 0}, {"width": -1}, {"size": True},
@@ -2720,6 +2720,38 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                 bad = SimpleNamespace(attachments=[self.attachment(**over)])
                 self.assertEqual(module.eligible_attachments(bad), [])
         self.assertEqual(module.eligible_attachments(SimpleNamespace(attachments=None)), [])
+        # Discord re-encodes uploads and reports the new type while keeping the
+        # original name. Measured on 26 real attachments from the target guild
+        # on 2026-09-21: nine arrived with a mismatched pair, and a cross-check
+        # between the two refused every one of them. The filename decides
+        # nothing here now.
+        for real in (
+            {"content_type": "image/webp", "filename": "image.png"},
+            {"content_type": "image/jpeg", "filename": "IMG_2007.png"},
+            {"content_type": "image/png; charset=binary", "filename": "a.png"},
+            {"content_type": "IMAGE/PNG", "filename": "a.png"},
+        ):
+            with self.subTest(real=str(real)[:44]):
+                self.assertEqual(
+                    len(module.eligible_attachments(
+                        SimpleNamespace(attachments=[self.attachment(**real)]))),
+                    1,
+                )
+        # The caps have to clear what Discord actually delivers. 8 MB was under
+        # Discord's own 10 MB upload limit for an account without Nitro, and
+        # 40 MP was under any current phone camera, so a photo taken rather
+        # than screenshotted was refused at ingest every time and said nothing.
+        for shot in (
+            {"size": 9_500_000, "width": 1290, "height": 2796},   # long screenshot
+            {"size": 5_000_000, "width": 8_000, "height": 6_000},  # 48 MP camera
+        ):
+            with self.subTest(shot=str(shot)[:40]):
+                self.assertEqual(
+                    len(module.eligible_attachments(
+                        SimpleNamespace(attachments=[self.attachment(**shot)]))),
+                    1,
+                )
+
         # Bounded per message as well as per window.
         many = SimpleNamespace(attachments=[self.attachment(id=i) for i in range(20)])
         self.assertEqual(len(module.eligible_attachments(many)), module.MAX_IMAGES_PER_WINDOW)
