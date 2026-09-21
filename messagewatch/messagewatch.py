@@ -97,14 +97,30 @@ EMBED_FIELD_LIMIT = 1024
 # heaviest thing it has ever sent: an image can carry a face, a document, or a
 # screenshot of somebody's private conversation. Off unless a manager turns it
 # on for one channel.
-IMAGE_SUFFIXES = {
-    "image/png": (".png",),
-    "image/jpeg": (".jpg", ".jpeg"),
-    "image/webp": (".webp",),
-    "image/gif": (".gif",),
-}
-MAX_IMAGE_BYTES = 8_000_000
-MAX_IMAGE_PIXELS = 40_000_000
+# Content types only. There used to be a second check requiring the filename's
+# extension to match the type, as defence in depth. Measured against 26 real
+# attachments from this guild on 2026-09-21, it refused 9 of them: Discord
+# re-encodes uploads and reports the new type while keeping the original name,
+# so "image/webp" arrives called "image.png" and "image/jpeg" called
+# "IMG_2007.png" routinely.
+#
+# It was also guarding nothing. The filename is never used to decide anything
+# -- the bytes are downloaded and PIL decides what they actually are, which is
+# the only check that can be true. A guard that cannot be right and refuses a
+# third of real input is worse than no guard.
+IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
+# Both were set below what Discord actually delivers, which rejected ordinary
+# images and said nothing. 8 MB is under Discord's own 10 MB upload limit for
+# an account without Nitro, and 40 MP is under any current phone camera --
+# 48 MP and 50 MP sensors are the norm, so a photo taken rather than
+# screenshotted was refused at ingest every time.
+#
+# 10 MB matches what a free account can upload. 64 MP covers those sensors
+# while still refusing a decompression bomb well before PIL's own ~89 MP
+# guard; the pixel cap exists to bound decode work, and every image is
+# downscaled to IMAGE_MAX_EDGE before it is sent regardless.
+MAX_IMAGE_BYTES = 10_000_000
+MAX_IMAGE_PIXELS = 64_000_000
 IMAGE_MAX_EDGE = 1536  # Text stays legible far below the 4K ChannelSummary uses.
 IMAGE_JPEG_QUALITY = 82
 MAX_IMAGES_PER_WINDOW = 4
@@ -817,7 +833,22 @@ def endpoint_is_allowed(value: str) -> bool:
     return any(address in network for network in LAN_NETWORKS)
 
 
-def eligible_attachments(message: Any) -> list[dict[str, Any]]:
+class Attachments(NamedTuple):
+    """What ingest kept, and why it dropped anything it did not.
+
+    The reason travels because every refusal here is silent otherwise: these
+    checks run above the five exits inside `image_text` that `[p]watch show`
+    already reports, so a rejected attachment produced no log line, no note
+    and no counter. It was indistinguishable from nobody having posted a
+    picture, which is how a filename check that refused a third of real
+    uploads survived being reported three times.
+    """
+
+    images: list[dict[str, Any]]
+    skipped: str = ""
+
+
+def eligible_attachments(message: Any) -> Attachments:
     """The image attachments worth reading, as plain data the queue can hold.
 
     Called at ingest, because the queue stores dictionaries and the
@@ -827,31 +858,43 @@ def eligible_attachments(message: Any) -> list[dict[str, Any]]:
     checked again after download.
     """
     found: list[dict[str, Any]] = []
+    skipped = ""
     for attachment in getattr(message, "attachments", ()) or ():
         content_type = getattr(attachment, "content_type", None)
-        filename = getattr(attachment, "filename", None)
         size = getattr(attachment, "size", None)
         width = getattr(attachment, "width", None)
         height = getattr(attachment, "height", None)
         url = getattr(attachment, "url", None)
         attachment_id = getattr(attachment, "id", None)
-        if content_type not in IMAGE_SUFFIXES or not isinstance(filename, str):
-            continue
-        if not filename.casefold().endswith(IMAGE_SUFFIXES[content_type]):
+        # "image/png; charset=binary" is a legal content type and some clients
+        # send one, so the parameters come off before the lookup.
+        if isinstance(content_type, str):
+            content_type = content_type.split(";", 1)[0].strip().casefold()
+        if content_type not in IMAGE_TYPES:
+            # Only named when something image-shaped was refused: a PDF or a
+            # text file in a chat channel is not a problem to report.
+            if isinstance(content_type, str) and content_type.startswith("image/"):
+                skipped = skipped or f"image_type_{content_type.split('/', 1)[1][:16]}"
             continue
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for value in (size, width, height, attachment_id)
         ):
+            skipped = skipped or "image_metadata_unusable"
             continue
         if not isinstance(url, str) or not url.startswith("https://"):
+            skipped = skipped or "image_url_not_https"
             continue
-        if size > MAX_IMAGE_BYTES or width * height > MAX_IMAGE_PIXELS:
+        if size > MAX_IMAGE_BYTES:
+            skipped = skipped or f"image_too_large_{size // 1_000_000}MB"
+            continue
+        if width * height > MAX_IMAGE_PIXELS:
+            skipped = skipped or f"image_too_many_pixels_{width * height // 1_000_000}MP"
             continue
         found.append({"id": int(attachment_id), "url": url})
         if len(found) >= MAX_IMAGES_PER_WINDOW:
             break
-    return found
+    return Attachments(found, skipped)
 
 
 def transcode_image(raw: bytes, max_edge: int = IMAGE_MAX_EDGE) -> tuple[str, bytes] | None:
@@ -944,6 +987,36 @@ def reason_kind(reasons: list[str]) -> str:
         if any(reason.startswith(prefix) for reason in reasons):
             return kind
     return "t"
+
+
+READ_CHUNK = 65_536
+
+
+async def read_bounded(response: Any, limit: int) -> bytes | None:
+    """The whole response body, or None when it exceeds `limit`.
+
+    `StreamReader.read(n)` returns as soon as any data is available -- at most
+    n bytes, not n bytes -- so `read(limit + 1)` handed back whatever the first
+    chunk happened to hold and silently dropped the rest.
+
+    Measured against the production host on 2026-09-21: a 124,759-byte PNG
+    came back as 38,349 bytes under HTTP 200 with a correct content-length,
+    PIL called it truncated, and the cog reported the image as unreadable.
+    Every image bigger than one read was refused that way for as long as the
+    feature existed, which is why a correctly configured channel read nothing
+    and no surface could say why.
+
+    The same call was used for both JSON responses. Those are usually small
+    enough to arrive in one chunk, so they mostly worked -- a failure mode
+    that shows up only on the larger answers is worse than one that always
+    shows.
+    """
+    buf = bytearray()
+    async for chunk in response.content.iter_chunked(READ_CHUNK):
+        buf.extend(chunk)
+        if len(buf) > limit:
+            return None
+    return bytes(buf)
 
 
 def anonymise(window: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1316,11 +1389,11 @@ class MessageWatch(commands.Cog):
                     if response.status != 200:
                         log.warning("messagewatch: attachment fetch returned %d", response.status)
                         return None, VisionUsage(failure=f"image_fetch_http_{response.status}")
-                    raw = await response.content.read(MAX_IMAGE_BYTES + 1)
+                    raw = await read_bounded(response, MAX_IMAGE_BYTES)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: attachment fetch failed (%s)", type(error).__name__)
             return None, VisionUsage(failure=f"image_fetch_{type(error).__name__}")
-        if len(raw) > MAX_IMAGE_BYTES:
+        if raw is None:
             return None, VisionUsage(failure="image_too_large")
 
         # Decoding and resizing are CPU-bound and would stall every other
@@ -1377,11 +1450,11 @@ class MessageWatch(commands.Cog):
                     if response.status != 200:
                         log.warning("messagewatch: image model returned %d", response.status)
                         return None, 0, 0, 0, f"vision_http_{response.status}"
-                    body = await response.content.read(MAX_RESPONSE_BYTES + 1)
+                    body = await read_bounded(response, MAX_RESPONSE_BYTES)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: image model unreachable (%s)", type(error).__name__)
             return None, 0, 0, 0, f"vision_{type(error).__name__}"
-        if len(body) > MAX_RESPONSE_BYTES:
+        if body is None:
             return None, 0, 0, 0, "vision_response_too_large"
         try:
             decoded = json.loads(body)
@@ -1463,8 +1536,8 @@ class MessageWatch(commands.Cog):
                     if response.status != 200:
                         log.warning("messagewatch: provider returned HTTP %d", response.status)
                         return None, tokens
-                    raw = await response.content.read(MAX_RESPONSE_BYTES + 1)
-                    if len(raw) > MAX_RESPONSE_BYTES:
+                    raw = await read_bounded(response, MAX_RESPONSE_BYTES)
+                    if raw is None:
                         log.warning("messagewatch: provider response over %d bytes", MAX_RESPONSE_BYTES)
                         return None, tokens
         except asyncio.TimeoutError:
@@ -1836,7 +1909,16 @@ class MessageWatch(commands.Cog):
                 return
             self._last_judged[channel.id] = time.time()
             self._last_error.pop(channel.id, None)
-            if vision_used.failure:
+            refused = next(
+                (str(item.get("skipped_image")) for item in window if item.get("skipped_image")),
+                "",
+            )
+            if refused:
+                # Before the vision failure below, so a window carrying both
+                # reports the one that happened first. An attachment refused
+                # at ingest never reached the vision call at all.
+                self._note(channel.id, refused)
+            elif vision_used.failure:
                 # After the pop, not before it. An image failure is a partial
                 # one -- the window was judged on its text and the picture was
                 # not read -- so a successful judgement must not clear it, and
@@ -2100,8 +2182,14 @@ class MessageWatch(commands.Cog):
         # A bare screenshot is the commonest shape a scam takes here and it
         # carries no text at all, so dropping it on empty text alone made the
         # image feature unreachable for the case it was built for.
-        attachments = eligible_attachments(message)
-        if not text and not attachments:
+        attachments, skipped_image = eligible_attachments(message)
+        # A message that is only a refused attachment still queues, carrying no
+        # text, so the reason reaches `flush` and from there `[p]watch show`.
+        # That costs one empty slot in a window of `window_size`, occasionally.
+        # The alternative is the state this feature was in all day: someone
+        # posts a screenshot, nothing happens, and every surface reports that
+        # the channel is fine.
+        if not text and not attachments and not skipped_image:
             return
         async with self._locks[channel.id]:
             # Re-read inside the lock. `[p]watch disable` leaves the watched set
@@ -2121,7 +2209,7 @@ class MessageWatch(commands.Cog):
             # holds an image only where the channel reads images, and the
             # window between the two no longer exists to be reasoned about.
             images = attachments if await self.config.channel(channel).images() else []
-            if not text and not images:
+            if not text and not images and not skipped_image:
                 return
             self._pending[channel.id].append(
                 {
@@ -2134,6 +2222,10 @@ class MessageWatch(commands.Cog):
                     # the Message with its attachments is gone by the time the
                     # window is judged.
                     "images": images,
+                    # Rides along to `flush`, which is where a reason can reach
+                    # `[p]watch show` without being wiped by the next
+                    # successful judgement.
+                    "skipped_image": skipped_image,
                 }
             )
             # hasattr: several tests build a partial cog that skips __init__.

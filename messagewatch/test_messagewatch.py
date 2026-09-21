@@ -56,6 +56,34 @@ class ValueContext:
         return False
 
 
+def streamed(body: bytes) -> MagicMock:
+    """A response body the cog reads the way it reads a real one.
+
+    `read_bounded` iterates `content.iter_chunked`, because
+    `StreamReader.read(n)` returns whatever arrived first rather than n bytes
+    -- the defect that made every image over one read come back truncated.
+    A mock that only answers `read` would let that defect back in unnoticed.
+    """
+
+    async def chunks(size: int):
+        for start in range(0, max(len(body), 1), size):
+            piece = body[start:start + size]
+            if piece or not body:
+                yield piece
+
+    async def read(n: int = -1) -> bytes:
+        # What a real StreamReader does: return what arrived, up to n bytes,
+        # never waiting for n. Modelling it faithfully is the point -- a mock
+        # that returned the whole body let `read(limit + 1)` pass a test while
+        # production received a third of a PNG.
+        return body[:module.READ_CHUNK] if n < 0 else body[:min(n, module.READ_CHUNK)]
+
+    content = MagicMock()
+    content.iter_chunked = chunks
+    content.read = read
+    return content
+
+
 class TestOutboundPayload(unittest.TestCase):
     def test_authors_become_per_request_labels_and_ids_never_leave(self) -> None:
         items = anonymise(window(111111111111111111, 222222222222222222, 111111111111111111))
@@ -251,7 +279,7 @@ class TestJudgeTransport(unittest.IsolatedAsyncioTestCase):
     async def request_with(self, status: int, body: bytes, text: str = "", cog: MessageWatch | None = None):
         response = MagicMock()
         response.status = status
-        response.content.read = AsyncMock(return_value=body)
+        response.content = streamed(body)
         response_ctx = MagicMock()
         response_ctx.__aenter__ = AsyncMock(return_value=response)
         response_ctx.__aexit__ = AsyncMock(return_value=False)
@@ -405,6 +433,20 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(cog._pending[5]), 1)
         self.assertEqual(cog._pending[5][0]["images"], [{"id": 991, "url": shot.url}])
 
+    async def test_a_message_that_is_only_a_refused_image_still_queues_its_reason(self) -> None:
+        # The commonest shape of the failure: someone posts a screenshot and
+        # nothing else. Dropping it here would put the reason nowhere, which is
+        # how this went unexplained for a day.
+        huge = SimpleNamespace(content_type="image/png", filename="s.png",
+                               size=module.MAX_IMAGE_BYTES + 1, width=800, height=600,
+                               id=991, url="https://cdn.discordapp.com/x.png")
+        cog = self.cog(images=True)
+        await cog.on_message(self.message(content="", attachments=[huge]))
+        self.assertEqual(len(cog._pending[5]), 1)
+        item = cog._pending[5][0]
+        self.assertEqual(item["images"], [])
+        self.assertTrue(item["skipped_image"].startswith("image_too_large"))
+
     async def test_an_image_only_message_is_dropped_where_images_are_not_read(self) -> None:
         # Otherwise a channel with images off accumulates empty messages that
         # push real ones out of the window.
@@ -481,7 +523,8 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         await cog.on_message(self.message())
         item = cog._pending[5][0]
         self.assertEqual(
-            set(item), {"author_id", "message_id", "text", "jump_url", "at", "images"}
+            set(item),
+            {"author_id", "message_id", "text", "jump_url", "at", "images", "skipped_image"},
         )
         # Captured at ingest because the Message with its attachments is gone
         # by the time the window is judged.
@@ -2348,6 +2391,28 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         # TypeSafe's own count is untouched by any of it.
         self.assertEqual(delta["input_tokens"], 100)
 
+    async def test_an_attachment_refused_at_ingest_reaches_watch_show(self) -> None:
+        # The gap that made this feature undebuggable: the checks in
+        # `eligible_attachments` run above the five exits inside `image_text`,
+        # so a refused attachment produced no log line, no note and no counter
+        # -- indistinguishable from nobody having posted a picture. It took
+        # three rounds of reading a dashboard that had nothing to say.
+        cog, _ = self.cog()
+        channel, _report = self.channel()
+        cog.config.channel.return_value.images = AsyncMock(return_value=True)
+        cog.config.channel.return_value.all = AsyncMock(
+            return_value={**module.DEFAULT_CHANNEL, "images": True})
+        cog.judge = AsyncMock(side_effect=lambda *a, **k: (self.QUIET, 0))
+        cog.image_text = AsyncMock()
+        cog._pending[5].extend(window(1, 2, 3))
+        cog._pending[5][1]["skipped_image"] = "image_too_large_14MB"
+        await cog.flush(channel)
+        # Survives the successful judgement, which clears `_last_error`: the
+        # note is recorded after that clear, exactly like a vision failure.
+        self.assertEqual(cog._last_error[5][1], "image_too_large_14MB")
+        # And the vision provider was never called, because nothing was kept.
+        cog.image_text.assert_not_awaited()
+
     async def test_an_image_failure_reaches_watch_show(self) -> None:
         # The judgement goes ahead on the text alone when an image cannot be
         # read, so a missing report proves nothing and this is the only place
@@ -2429,9 +2494,7 @@ class TestUsageEdges(unittest.IsolatedAsyncioTestCase):
         # The guard is only worth having if the failure stays inside judge.
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(
-            return_value=b'{"answers": {"any_scam": {"noul": 0.5}}, "usage": {"input_tokens": Infinity}}'
-        )
+        response.content = streamed(b'{"answers": {"any_scam": {"noul": 0.5}}, "usage": {"input_tokens": Infinity}}')
         response_ctx = MagicMock()
         response_ctx.__aenter__ = AsyncMock(return_value=response)
         response_ctx.__aexit__ = AsyncMock(return_value=False)
@@ -2705,11 +2768,11 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         # attacker-adjacent, so they narrow the set here and the real bytes are
         # checked again after download.
         good = SimpleNamespace(attachments=[self.attachment()])
-        self.assertEqual(module.eligible_attachments(good),
+        self.assertEqual(module.eligible_attachments(good).images,
                          [{"id": 991, "url": "https://cdn.discordapp.com/x.png"}])
         for over in (
             {"content_type": "application/pdf"},
-            {"content_type": "image/png", "filename": "shot.pdf"},
+            {"content_type": None},
             {"size": module.MAX_IMAGE_BYTES + 1},
             {"width": 20_000, "height": 20_000},
             {"size": 0}, {"width": -1}, {"size": True},
@@ -2718,11 +2781,59 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(over=str(over)[:34]):
                 bad = SimpleNamespace(attachments=[self.attachment(**over)])
-                self.assertEqual(module.eligible_attachments(bad), [])
-        self.assertEqual(module.eligible_attachments(SimpleNamespace(attachments=None)), [])
+                self.assertEqual(module.eligible_attachments(bad).images, [])
+        self.assertEqual(module.eligible_attachments(SimpleNamespace(attachments=None)).images, [])
+
+        # Each refusal names itself. A PDF is not reported, because a document
+        # in a chat channel is not a problem anyone needs told about.
+        for over, expected in (
+            ({"size": module.MAX_IMAGE_BYTES + 1}, "image_too_large_10MB"),
+            ({"width": 9_000, "height": 8_000}, "image_too_many_pixels_72MP"),
+            ({"url": "http://cdn.discordapp.com/x.png"}, "image_url_not_https"),
+            ({"size": 0}, "image_metadata_unusable"),
+            ({"content_type": "image/heic"}, "image_type_heic"),
+            ({"content_type": "application/pdf"}, ""),
+        ):
+            with self.subTest(over=str(over)[:36]):
+                got = module.eligible_attachments(
+                    SimpleNamespace(attachments=[self.attachment(**over)]))
+                self.assertEqual(got.images, [])
+                self.assertEqual(got.skipped, expected)
+        # Discord re-encodes uploads and reports the new type while keeping the
+        # original name. Measured on 26 real attachments from the target guild
+        # on 2026-09-21: nine arrived with a mismatched pair, and a cross-check
+        # between the two refused every one of them. The filename decides
+        # nothing here now.
+        for real in (
+            {"content_type": "image/webp", "filename": "image.png"},
+            {"content_type": "image/jpeg", "filename": "IMG_2007.png"},
+            {"content_type": "image/png; charset=binary", "filename": "a.png"},
+            {"content_type": "IMAGE/PNG", "filename": "a.png"},
+        ):
+            with self.subTest(real=str(real)[:44]):
+                self.assertEqual(
+                    len(module.eligible_attachments(
+                        SimpleNamespace(attachments=[self.attachment(**real)])).images),
+                    1,
+                )
+        # The caps have to clear what Discord actually delivers. 8 MB was under
+        # Discord's own 10 MB upload limit for an account without Nitro, and
+        # 40 MP was under any current phone camera, so a photo taken rather
+        # than screenshotted was refused at ingest every time and said nothing.
+        for shot in (
+            {"size": 9_500_000, "width": 1290, "height": 2796},   # long screenshot
+            {"size": 5_000_000, "width": 8_000, "height": 6_000},  # 48 MP camera
+        ):
+            with self.subTest(shot=str(shot)[:40]):
+                self.assertEqual(
+                    len(module.eligible_attachments(
+                        SimpleNamespace(attachments=[self.attachment(**shot)])).images),
+                    1,
+                )
+
         # Bounded per message as well as per window.
         many = SimpleNamespace(attachments=[self.attachment(id=i) for i in range(20)])
-        self.assertEqual(len(module.eligible_attachments(many)), module.MAX_IMAGES_PER_WINDOW)
+        self.assertEqual(len(module.eligible_attachments(many).images), module.MAX_IMAGES_PER_WINDOW)
 
     def test_transcoding_validates_and_strips(self) -> None:
         from PIL import Image as PILImage
@@ -2810,6 +2921,26 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                 session.assert_not_called()
                 cog._extract_text.assert_not_awaited()
 
+    async def test_a_body_larger_than_one_read_arrives_whole(self) -> None:
+        # The defect that made this feature do nothing. `StreamReader.read(n)`
+        # returns whatever arrived first, at most n bytes, so `read(limit + 1)`
+        # handed back the first chunk and dropped the rest. Measured against
+        # production on 2026-09-21: a 124,759-byte PNG came back as 38,349
+        # bytes under HTTP 200, PIL called it truncated, and the cog reported
+        # the image unreadable -- every image over one read, silently.
+        body = bytes(range(256)) * 900  # 230,400 bytes, several chunks
+        response = MagicMock()
+        response.status = 200
+        response.content = streamed(body)
+        got = await module.read_bounded(response, len(body))
+        self.assertEqual(len(got), len(body))
+        self.assertEqual(got, body)
+
+        # A mock answering only `read` would pass a test written against
+        # `read`, which is how the original survived: assert the stream is
+        # what gets consumed.
+        self.assertIsNone(await module.read_bounded(response, len(body) - 1))
+
     async def test_the_vision_usage_comes_back_with_the_text(self) -> None:
         # Driven through `_extract_text` rather than a mocked `image_text`:
         # the output count is parsed there, and a test that stubs the layer
@@ -2825,7 +2956,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         }).encode()
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(return_value=body)
+        response.content = streamed(body)
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -2881,7 +3012,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._extract_text = AsyncMock(return_value=("抄到的字", 316, 41, 69_400, ""))
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(return_value=b"bytes")
+        response.content = streamed(b"bytes")
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -2915,7 +3046,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog._extract_text = AsyncMock(return_value=(None, 316, 0, 40_600, "vision_empty_text"))
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(return_value=b"bytes")
+        response.content = streamed(b"bytes")
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -2960,7 +3091,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         cog.bot.get_shared_api_tokens = AsyncMock(return_value={"api_key": "k"})
         response = MagicMock()
         response.status = 404
-        response.content.read = AsyncMock(return_value=b"")
+        response.content = streamed(b"")
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=response)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -2974,7 +3105,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(used.failure, "image_fetch_http_404")
 
         response.status = 200
-        response.content.read = AsyncMock(return_value=b"not an image")
+        response.content = streamed(b"not an image")
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
             _text, used = await cog.image_text({"id": 3, "url": "https://x/y.png"})
         self.assertEqual(used.failure, "image_unreadable")
@@ -3022,7 +3153,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             return_value={"image_model": "m", "image_api_base": "https://x"})
         response = MagicMock()
         response.status = 200
-        response.content.read = AsyncMock(return_value=b"bytes")
+        response.content = streamed(b"bytes")
         response_ctx = MagicMock()
         response_ctx.__aenter__ = AsyncMock(return_value=response)
         response_ctx.__aexit__ = AsyncMock(return_value=False)
