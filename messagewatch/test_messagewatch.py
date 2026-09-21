@@ -1049,6 +1049,25 @@ class TestRules(unittest.TestCase):
 class TestServerRules(unittest.IsolatedAsyncioTestCase):
     """Rules every watched channel is judged against, in front of its own."""
 
+    def test_the_length_cap_fits_the_rule_it_was_raised_for(self) -> None:
+        # 200 was the cap until the gender-identity rule was written out in
+        # full. That rule moved a real case from 0.17 to 0.94 precisely because
+        # it names the phrasings it covers and says why each counts, and it is
+        # 218 characters. A cap that excludes the one rule measured hardest on
+        # this cog is the wrong cap, not a rule that needs trimming.
+        measured = (
+            "性別認同相關的問題言論，包含四種：(一)否定或嘲弄他人的性別認同；"
+            "(二)散布恐跨或貶低多元性別的言論；(三)被提醒後仍刻意以錯誤性別稱呼他人；"
+            "(四)把性別表達當成優劣在排序或評價——包括用「男生女相」「女性化的男生」這類說法，"
+            "把一個人的外貌歸回出生指派性別去評價，等於預設「你本質是男的，只是看起來像女的」；"
+            "也包括把性別表達預設成只有陽剛或陰柔兩種選項的假二分法。"
+            "第(四)種即使語氣友善、即使是提問句、即使沒有針對在場的特定人，仍然算。"
+        )
+        self.assertGreater(len(measured), 200)
+        self.assertLessEqual(len(measured), module.MAX_RULE_CHARS)
+        # And the payload stays far inside its own bound at the new length.
+        self.assertLess(module.MAX_RULES * module.MAX_RULE_CHARS * 4, module.MAX_REQUEST_BYTES)
+
     def test_server_rules_come_first_and_channel_rules_follow(self) -> None:
         # The order is the order of the model's options, and a stable prefix
         # keeps a channel's own rules at predictable numbers as the server set

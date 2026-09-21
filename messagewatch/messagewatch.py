@@ -139,7 +139,14 @@ DEFAULT_HEAT_THRESHOLD = 2.50
 # treat as hostile, and members write the state -- a rule placed there is a rule
 # a member could try to write.
 MAX_RULES = 20
-MAX_RULE_CHARS = 200
+# 300, not 200. The rule measured hardest on this cog -- the gender-identity
+# one, which moved a real case from 0.17 to 0.94 when it was rewritten -- is
+# 218 characters, and it works precisely because it names the phrasings it
+# covers and says why each counts. Trimming it to fit removes the part that
+# made it work. Twenty rules at this length is under 7 KB, against a
+# MAX_REQUEST_BYTES of 256 KB, so the cap is about keeping one rule readable
+# rather than about the payload.
+MAX_RULE_CHARS = 300
 MAX_PURPOSE_CHARS = 500
 # How much of a rule is echoed into the report's reason line.
 RULE_REASON_CHARS = 60
