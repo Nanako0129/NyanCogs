@@ -163,7 +163,9 @@ Vision usage is recorded before the early return that a failed judgement takes. 
 
 Cache hits are reported beside images read. Without them "images read" is not interpretable: the same image reposted ten times is one paid call and nine hits.
 
-**Image failures reach `[p]watch show`.** The path has five exits that return no text -- the endpoint or model or key unset, the attachment fetch returning a non-200, the attachment unreadable by PIL, the vision model returning a non-200, and an unusable response body -- and all five originally only logged. A channel whose endpoint was refusing every request therefore looked exactly like a channel where nobody had posted a picture.
+**Every image failure reaches `[p]watch show`, including the ones before the vision call.** An attachment can be refused at ingest -- wrong content type, unusable metadata, a non-https URL, over the byte cap, over the pixel cap -- and those checks run above everything else. They were silent, so a refused attachment was indistinguishable from nobody having posted a picture, and the feature spent a day looking like it worked. `eligible_attachments` returns the reason beside what it kept, the queued item carries it, and `flush` records it in the same place a vision failure goes.
+
+The path also has five exits that return no text -- the endpoint or model or key unset, the attachment fetch returning a non-200, the attachment unreadable by PIL, the vision model returning a non-200, and an unusable response body -- and all five originally only logged. A channel whose endpoint was refusing every request therefore looked exactly like a channel where nobody had posted a picture.
 
 The reason is recorded after `_last_error` is cleared on a successful judgement, not before it. An image failure is a partial one: the window is still judged on its text and the report still goes out, so a successful judgement must not wipe the note, and recording it earlier meant the clear below the judge call did exactly that every time.
 

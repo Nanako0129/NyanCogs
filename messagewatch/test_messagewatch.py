@@ -405,6 +405,20 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(cog._pending[5]), 1)
         self.assertEqual(cog._pending[5][0]["images"], [{"id": 991, "url": shot.url}])
 
+    async def test_a_message_that_is_only_a_refused_image_still_queues_its_reason(self) -> None:
+        # The commonest shape of the failure: someone posts a screenshot and
+        # nothing else. Dropping it here would put the reason nowhere, which is
+        # how this went unexplained for a day.
+        huge = SimpleNamespace(content_type="image/png", filename="s.png",
+                               size=module.MAX_IMAGE_BYTES + 1, width=800, height=600,
+                               id=991, url="https://cdn.discordapp.com/x.png")
+        cog = self.cog(images=True)
+        await cog.on_message(self.message(content="", attachments=[huge]))
+        self.assertEqual(len(cog._pending[5]), 1)
+        item = cog._pending[5][0]
+        self.assertEqual(item["images"], [])
+        self.assertTrue(item["skipped_image"].startswith("image_too_large"))
+
     async def test_an_image_only_message_is_dropped_where_images_are_not_read(self) -> None:
         # Otherwise a channel with images off accumulates empty messages that
         # push real ones out of the window.
@@ -481,7 +495,8 @@ class TestGating(unittest.IsolatedAsyncioTestCase):
         await cog.on_message(self.message())
         item = cog._pending[5][0]
         self.assertEqual(
-            set(item), {"author_id", "message_id", "text", "jump_url", "at", "images"}
+            set(item),
+            {"author_id", "message_id", "text", "jump_url", "at", "images", "skipped_image"},
         )
         # Captured at ingest because the Message with its attachments is gone
         # by the time the window is judged.
@@ -2348,6 +2363,28 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         # TypeSafe's own count is untouched by any of it.
         self.assertEqual(delta["input_tokens"], 100)
 
+    async def test_an_attachment_refused_at_ingest_reaches_watch_show(self) -> None:
+        # The gap that made this feature undebuggable: the checks in
+        # `eligible_attachments` run above the five exits inside `image_text`,
+        # so a refused attachment produced no log line, no note and no counter
+        # -- indistinguishable from nobody having posted a picture. It took
+        # three rounds of reading a dashboard that had nothing to say.
+        cog, _ = self.cog()
+        channel, _report = self.channel()
+        cog.config.channel.return_value.images = AsyncMock(return_value=True)
+        cog.config.channel.return_value.all = AsyncMock(
+            return_value={**module.DEFAULT_CHANNEL, "images": True})
+        cog.judge = AsyncMock(side_effect=lambda *a, **k: (self.QUIET, 0))
+        cog.image_text = AsyncMock()
+        cog._pending[5].extend(window(1, 2, 3))
+        cog._pending[5][1]["skipped_image"] = "image_too_large_14MB"
+        await cog.flush(channel)
+        # Survives the successful judgement, which clears `_last_error`: the
+        # note is recorded after that clear, exactly like a vision failure.
+        self.assertEqual(cog._last_error[5][1], "image_too_large_14MB")
+        # And the vision provider was never called, because nothing was kept.
+        cog.image_text.assert_not_awaited()
+
     async def test_an_image_failure_reaches_watch_show(self) -> None:
         # The judgement goes ahead on the text alone when an image cannot be
         # read, so a missing report proves nothing and this is the only place
@@ -2705,7 +2742,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         # attacker-adjacent, so they narrow the set here and the real bytes are
         # checked again after download.
         good = SimpleNamespace(attachments=[self.attachment()])
-        self.assertEqual(module.eligible_attachments(good),
+        self.assertEqual(module.eligible_attachments(good).images,
                          [{"id": 991, "url": "https://cdn.discordapp.com/x.png"}])
         for over in (
             {"content_type": "application/pdf"},
@@ -2718,8 +2755,24 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(over=str(over)[:34]):
                 bad = SimpleNamespace(attachments=[self.attachment(**over)])
-                self.assertEqual(module.eligible_attachments(bad), [])
-        self.assertEqual(module.eligible_attachments(SimpleNamespace(attachments=None)), [])
+                self.assertEqual(module.eligible_attachments(bad).images, [])
+        self.assertEqual(module.eligible_attachments(SimpleNamespace(attachments=None)).images, [])
+
+        # Each refusal names itself. A PDF is not reported, because a document
+        # in a chat channel is not a problem anyone needs told about.
+        for over, expected in (
+            ({"size": module.MAX_IMAGE_BYTES + 1}, "image_too_large_10MB"),
+            ({"width": 9_000, "height": 8_000}, "image_too_many_pixels_72MP"),
+            ({"url": "http://cdn.discordapp.com/x.png"}, "image_url_not_https"),
+            ({"size": 0}, "image_metadata_unusable"),
+            ({"content_type": "image/heic"}, "image_type_heic"),
+            ({"content_type": "application/pdf"}, ""),
+        ):
+            with self.subTest(over=str(over)[:36]):
+                got = module.eligible_attachments(
+                    SimpleNamespace(attachments=[self.attachment(**over)]))
+                self.assertEqual(got.images, [])
+                self.assertEqual(got.skipped, expected)
         # Discord re-encodes uploads and reports the new type while keeping the
         # original name. Measured on 26 real attachments from the target guild
         # on 2026-09-21: nine arrived with a mismatched pair, and a cross-check
@@ -2734,7 +2787,7 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             with self.subTest(real=str(real)[:44]):
                 self.assertEqual(
                     len(module.eligible_attachments(
-                        SimpleNamespace(attachments=[self.attachment(**real)]))),
+                        SimpleNamespace(attachments=[self.attachment(**real)])).images),
                     1,
                 )
         # The caps have to clear what Discord actually delivers. 8 MB was under
@@ -2748,13 +2801,13 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             with self.subTest(shot=str(shot)[:40]):
                 self.assertEqual(
                     len(module.eligible_attachments(
-                        SimpleNamespace(attachments=[self.attachment(**shot)]))),
+                        SimpleNamespace(attachments=[self.attachment(**shot)])).images),
                     1,
                 )
 
         # Bounded per message as well as per window.
         many = SimpleNamespace(attachments=[self.attachment(id=i) for i in range(20)])
-        self.assertEqual(len(module.eligible_attachments(many)), module.MAX_IMAGES_PER_WINDOW)
+        self.assertEqual(len(module.eligible_attachments(many).images), module.MAX_IMAGES_PER_WINDOW)
 
     def test_transcoding_validates_and_strips(self) -> None:
         from PIL import Image as PILImage
