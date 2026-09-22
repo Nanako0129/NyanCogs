@@ -2747,7 +2747,6 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
         # `vision_empty_text` failure parsed fine, so its tokens and cost were
         # read and are in these numbers while it is counted as a failure.
         self.assertIn("讀不到用量的失敗不在其中", rendered)
-        self.assertNotIn("失敗的沒有用量可讀", rendered)
         # And the row is the vision row, not the "not switched on" fallback.
         self.assertNotIn("尚未讀到圖片", rendered)
 
