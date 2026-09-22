@@ -131,6 +131,9 @@ IMAGE_TIMEOUT_SECONDS = 45.0
 # without limit; the oldest description goes first.
 IMAGE_CACHE_SIZE = 256
 IMAGE_TOKEN_SERVICE = "messagewatch_vision"
+# Enough to tell an HTML error page from a JSON one from an event stream, and
+# short enough that a Responses API body has not reached its `output` yet.
+BAD_JSON_LOG_CHARS = 200
 IMAGE_PROMPT = (
     "把這張圖片裡的所有文字逐字抄出來，保留原本的換行。"
     "只輸出文字本身，不要描述畫面、不要加標題、不要解釋。"
@@ -299,6 +302,12 @@ DEFAULT_GUILD = {
         # reposted image is a hit, and hits cost nothing.
         "images_read": 0,
         "image_cache_hits": 0,
+        # Counted separately because `images_read` used to count both, which
+        # is how 11 consecutive failures were displayed as "讀圖 11 張" while
+        # no image had been read at all. Measured on the production host,
+        # 2026-09-22: images_read 11, every vision token counter 0, and
+        # exactly 11 `vision_bad_json` lines in the log.
+        "image_failures": 0,
         "vision_input_tokens": 0,
         "vision_output_tokens": 0,
         "vision_nanodollars": 0,
@@ -311,6 +320,21 @@ DEFAULT_GUILD = {
     "dashboard_message": 0,
 }
 
+def fresh_delta() -> dict[str, int]:
+    """A zeroed counter set, derived from the stored shape rather than restated.
+
+    The same set of keys was written out three times -- here, in
+    `DEFAULT_GUILD["usage"]`, and again in the test fixture -- and `+=` on a
+    plain dict raises rather than starting from zero, so adding a counter to
+    one of them made `image_failures` a KeyError in every path that touched it.
+    Deriving it means a new counter is declared once.
+
+    `started_at` is excluded: it is a timestamp, not something to accumulate,
+    and `_flush_usage` skips a guild whose deltas are all zero.
+    """
+    return {key: 0 for key in DEFAULT_GUILD["usage"] if key != "started_at"}
+
+
 class VisionUsage(NamedTuple):
     """What one window's image reading cost, for the dashboard.
 
@@ -320,6 +344,10 @@ class VisionUsage(NamedTuple):
     """
 
     images_read: int = 0
+    # A call that was paid for and returned nothing usable. `images_read`
+    # counts what was actually read, so that a dashboard saying zero is
+    # telling the truth rather than describing a feature that is not wired up.
+    images_failed: int = 0
     cache_hits: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -337,14 +365,20 @@ class VisionUsage(NamedTuple):
     def __add__(self, other: "VisionUsage") -> "VisionUsage":
         """Accumulate a window's images: counts add, the reason does not.
 
-        The five numeric fields sum. `failure` takes the later non-empty one,
-        so a window where the third image failed reports that reason and a
-        window where the third failed and the fourth succeeded still does --
-        one image having worked says nothing about the one that did not, and
-        the surface this feeds shows a single line per channel.
+        Every numeric field sums. `failure` takes the later non-empty one, so a
+        window where the third image failed reports that reason and a window
+        where the third failed and the fourth succeeded still does -- one image
+        having worked says nothing about the one that did not, and the surface
+        this feeds shows a single line per channel.
+
+        The slice is computed rather than written as a literal. It was `[:5]`
+        against five numeric fields, so adding a sixth would have silently
+        dropped `nanodollars` from every sum: the cost of a window with two
+        images would have been the cost of its first.
         """
+        numeric = len(self._fields) - 1
         return VisionUsage(
-            *(a + b for a, b in zip(self[:5], other[:5])),
+            *(a + b for a, b in zip(self[:numeric], other[:numeric])),
             failure=other.failure or self.failure,
         )
 
@@ -1170,14 +1204,7 @@ class MessageWatch(commands.Cog):
         # only, on purpose: a Config write per judged window would be a disk
         # write every few messages, so these ride on the 60-second sweep
         # instead. See `_flush_usage`.
-        self._usage_delta: defaultdict[int, dict[str, int]] = defaultdict(
-            lambda: {
-                "messages_queued": 0, "windows_judged": 0, "reports_sent": 0,
-                "input_tokens": 0, "images_read": 0, "image_cache_hits": 0,
-                "vision_input_tokens": 0, "vision_output_tokens": 0,
-                "vision_nanodollars": 0,
-            }
-        )
+        self._usage_delta: defaultdict[int, dict[str, int]] = defaultdict(fresh_delta)
         # Per-guild dashboard state. `_dashboard_error` stops the sweep from
         # retrying a channel that is gone or forbidden every minute forever;
         # it is cleared only by `[p]watch dashboard` posting a new one.
@@ -1416,7 +1443,11 @@ class MessageWatch(commands.Cog):
         text, tokens_in, tokens_out, nanos, failure = await self._extract_text(
             api_base, token, model, data_uri
         )
-        used = VisionUsage(images_read=1, input_tokens=tokens_in,
+        # Spend is recorded either way -- the provider billed for the call --
+        # but only a call that came back with text counts as an image read.
+        used = VisionUsage(images_read=1 if text is not None else 0,
+                           images_failed=0 if text is not None else 1,
+                           input_tokens=tokens_in,
                            output_tokens=tokens_out, nanodollars=nanos,
                            failure=failure)
         if text is None:
@@ -1459,6 +1490,7 @@ class MessageWatch(commands.Cog):
                     if response.status != 200:
                         log.warning("messagewatch: image model returned %d", response.status)
                         return None, 0, 0, 0, f"vision_http_{response.status}"
+                    content_type = response.headers.get("Content-Type", "")
                     body = await read_bounded(response, MAX_RESPONSE_BYTES)
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             log.warning("messagewatch: image model unreachable (%s)", type(error).__name__)
@@ -1468,7 +1500,21 @@ class MessageWatch(commands.Cog):
         try:
             decoded = json.loads(body)
         except (ValueError, RecursionError):
-            log.warning("messagewatch: image model response was not usable JSON")
+            # With the content type and the opening bytes, because the message
+            # on its own was not diagnosable: eleven of these in a row on the
+            # production host said only that something was wrong, and the
+            # endpoint, the relay and the provider all remained candidates.
+            # An error message is not a measurement.
+            #
+            # Bounded at BAD_JSON_LOG_CHARS, and the opening rather than a
+            # middle slice: a Responses API body starts with its own metadata,
+            # so a prefix that short carries the shape without carrying a
+            # member's transcribed image text.
+            log.warning(
+                "messagewatch: image model response was not usable JSON "
+                "(content-type %r, %d bytes, starts %r)",
+                content_type, len(body), body[:BAD_JSON_LOG_CHARS],
+            )
             return None, 0, 0, 0, "vision_bad_json"
         parts: list[str] = []
         for item in (decoded.get("output") or []) if isinstance(decoded, Mapping) else []:
@@ -1930,6 +1976,7 @@ class MessageWatch(commands.Cog):
             # already paid -- the same shape of gap this surface exists to
             # close.
             delta["images_read"] += vision_used.images_read
+            delta["image_failures"] += vision_used.images_failed
             delta["image_cache_hits"] += vision_used.cache_hits
             delta["vision_input_tokens"] += vision_used.input_tokens
             delta["vision_output_tokens"] += vision_used.output_tokens
@@ -2975,6 +3022,7 @@ class MessageWatch(commands.Cog):
         # are. Folding it into the figure above would have made one number that
         # is wrong for both.
         images = int(usage.get("images_read", 0))
+        failures = int(usage.get("image_failures", 0))
         hits = int(usage.get("image_cache_hits", 0))
         v_in = int(usage.get("vision_input_tokens", 0))
         v_out = int(usage.get("vision_output_tokens", 0))
@@ -3004,17 +3052,33 @@ class MessageWatch(commands.Cog):
         # Always printed, including at zero. Hiding the row made "no images
         # have been read" indistinguishable from "this cog does not read
         # images", which is the reading the first person to see it took.
-        if images or hits:
+        if images or hits or failures:
             read = f"讀圖 `{images}` 張"
             if hits:
                 read += f"（另有 `{hits}` 張命中快取，不計費）"
+            # Printed next to the successes rather than only in `watch show`,
+            # because this row is where a failure looked like a success: with
+            # failures counted as reads, eleven that returned nothing rendered
+            # as 讀圖 11 張. A run that is failing has to say so where the
+            # number is read.
+            if failures:
+                read += f" · 失敗 `{failures}` 次（`[p]watch show` 有原因）"
             if v_nanos:
                 cost = f"`${v_spend:.4f}`（供應商回報值）"
             else:
                 # Saying "$0.0000" here would be a measurement nobody took.
                 cost = "供應商未回報成本"
+            # Not "failed calls are excluded": a `vision_empty_text` failure
+            # parsed fine and its tokens and cost were read, so it is in these
+            # numbers while being counted as a failure. What is missing is the
+            # usage of calls whose body never parsed -- and it is unknowable,
+            # not merely unread: the only out-of-band figures OpenRouter
+            # exposes are `X-Generation-Id, X-Provider-Name, request-id,
+            # cf-ray`, an id, a name and two trace ids, measured on 2026-09-22
+            # by dumping every response header of a real call.
+            missing = "（含所有回報了用量的呼叫；讀不到用量的失敗不在其中）" if failures else ""
             lines.append(
-                f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}"
+                f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}{missing}"
             )
             if v_nanos:
                 lines.append(f"**合計**　`${spend + v_spend:.4f}` 美元")
