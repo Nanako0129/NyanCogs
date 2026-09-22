@@ -525,6 +525,22 @@ QUESTIONS: dict[str, dict[str, Any]] = {
     # text contains an attack. The old wording ordered the two backwards:
     # friendly teasing scored 0.76-0.80 while sarcastic contempt scored
     # 0.27-0.41, so no threshold could separate them in either direction.
+    #
+    # KNOWN AND MEASURED: a laughter marker excuses an attack. Appending two
+    # characters to a real one drops it below the threshold -- 「你來幹嘛 沒人
+    # 找你吧」 0.68 to 0.53 with XD, 「你真的很會欸」 0.66 to 0.51 with www,
+    # 「恭喜啊 花了三個月做這種東西」 0.63 to 0.55 with lol (2026-09-22). So
+    # anyone who wants to dodge this signal can, by typing XD.
+    #
+    # Writing 「句尾的 ww、XD、lol 或表情符號不會讓一句貶低變成玩笑」 into the
+    # true criterion does close all three -- the first time an exception clause
+    # has worked in this cog. It was measured and not taken, because it also
+    # lifts mild teasing onto the line: across two runs the highest teasing
+    # reached 0.63 and the lowest evasive attack 0.64, so no threshold
+    # separates them. Hostility precision in production is currently 0 of 2,
+    # and two more reports on jokes costs more than an evasion a human reader
+    # can see through. Revisit when `mark_log` has a real distribution rather
+    # than fifteen cases written by hand.
     "is_hostile": {
         "type": "noul",
         "instructions": (
