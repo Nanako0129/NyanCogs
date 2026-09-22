@@ -219,6 +219,16 @@ class TestUntrustedAnswers(unittest.TestCase):
         index, _reasons, _ = MessageWatch.findings(both, settings, 8)
         self.assertEqual(index, 1)
 
+        # And keeps no target when its own pointer was unreadable. Falling
+        # through to hostility here would aim a report that names a scam at
+        # whoever was rude in the same window.
+        for bad in ({"choice": "none"}, {"choice": "99"}, {}):
+            with self.subTest(scam_index=str(bad)):
+                index, reasons, _ = MessageWatch.findings(
+                    {**both, "scam_index": bad}, settings, 8)
+                self.assertIsNone(index)
+                self.assertEqual(reasons, ["詐騙 0.97", "敵意 0.95"])
+
         # Unreadable means no target, not a guess -- the contract `rule_index`
         # already holds, and the one that decides whether a person is named.
         for bad in ({"choice": "none"}, {"choice": "99"}, {"choice": None}, {}):

@@ -1664,8 +1664,14 @@ class MessageWatch(commands.Cog):
 
         scam_answer = answers.get("any_scam")
         scam = _bounded_probability(scam_answer.get("noul")) if isinstance(scam_answer, Mapping) else None
+        # Not `index is None` further down: that conflates "scam did not fire"
+        # with "scam fired and its own pointer was unreadable", and the second
+        # one must not fall through to hostility. A report carrying a scam
+        # finding would otherwise aim its buttons at whoever was rude.
+        scam_found = False
         if scam is not None and scam >= float(settings["scam_threshold"]):
             reasons.append(f"詐騙 {scam:.2f}")
+            scam_found = True
             picked = answers.get("scam_index")
             if isinstance(picked, Mapping):
                 index = _bounded_index(picked.get("choice"), window_size)
@@ -1684,11 +1690,12 @@ class MessageWatch(commands.Cog):
             # property of an exchange, which is why it is judged over a window
             # -- but a moderator times out a person, not a conversation.
             #
-            # Only when scam has not already pointed somewhere: a window that
-            # is both keeps the scam target, which is the one with a rule
-            # behind it. Unreadable means no target rather than a guess, the
-            # same contract `rule_index` holds.
-            if index is None:
+            # Only when there is no scam finding at all: a window that is both
+            # keeps the scam target, which is the one with a rule behind it,
+            # and keeps no target when that pointer was unreadable. Unreadable
+            # means no target rather than a guess, the contract `rule_index`
+            # already holds.
+            if index is None and not scam_found:
                 picked = answers.get("hostile_index")
                 if isinstance(picked, Mapping):
                     index = _bounded_index(picked.get("choice"), window_size)
