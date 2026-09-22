@@ -2258,14 +2258,9 @@ class TestUsageAccounting(unittest.IsolatedAsyncioTestCase):
         cog._locks = module.defaultdict(module.asyncio.Lock)
         cog._last_judged = {}
         cog._last_error = {}
-        cog._usage_delta = module.defaultdict(
-            lambda: {
-                "messages_queued": 0, "windows_judged": 0, "reports_sent": 0,
-                "input_tokens": 0, "images_read": 0, "image_cache_hits": 0,
-                "vision_input_tokens": 0, "vision_output_tokens": 0,
-                "vision_nanodollars": 0,
-            }
-        )
+        # Derived, not restated: this fixture used to carry its own copy of
+        # the counter set and went stale the moment a counter was added.
+        cog._usage_delta = module.defaultdict(module.fresh_delta)
         return cog, scope
 
     @staticmethod
@@ -2731,6 +2726,35 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
             (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False)
         self.assertIn("已於 2 個頻道開啟，尚未讀到圖片", rendered)
 
+    async def test_failed_vision_calls_are_not_reported_as_images_read(self) -> None:
+        # Measured on the production host on 2026-09-22: images_read 11, every
+        # vision token counter 0, and exactly 11 vision_bad_json lines in the
+        # log. Every call had failed and the dashboard said 讀圖 11 張, which
+        # is the one reading a moderator must not be given -- a feature doing
+        # nothing has to look like a feature doing nothing.
+        cog, guild, _channel, guild_scope = self.cog()
+        guild_scope.all = AsyncMock(return_value={
+            **DEFAULT_GUILD, "watched_channels": [5],
+            "usage": {**DEFAULT_GUILD["usage"], "images_read": 0, "image_failures": 11},
+        })
+        rendered = json.dumps(
+            (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False)
+        self.assertIn("讀圖 `0` 張", rendered)
+        self.assertIn("失敗 `11` 次", rendered)
+        # And the row is the vision row, not the "not switched on" fallback.
+        self.assertNotIn("尚未讀到圖片", rendered)
+
+    def test_accumulating_a_window_sums_every_counter(self) -> None:
+        # The slice in __add__ was a literal [:5] against five numeric fields,
+        # so a sixth would have been dropped from every sum without failing
+        # anything: two images would have reported the cost of the first.
+        a = module.VisionUsage(1, 0, 2, 30, 4, 500, "")
+        b = module.VisionUsage(0, 1, 3, 40, 5, 600, "vision_bad_json")
+        total = a + b
+        self.assertEqual(tuple(total)[:-1], (1, 1, 5, 70, 9, 1100))
+        self.assertEqual(total.failure, "vision_bad_json")
+        self.assertEqual(len(module.VisionUsage._fields) - 1, len(tuple(total)) - 1)
+
     async def test_a_channel_not_judged_since_the_reload_does_not_claim_never(self) -> None:
         # `_last_judged` lives in memory, so a reload empties it while the
         # persisted window count survives. The live dashboard showed "judged
@@ -3102,7 +3126,13 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
                       return_value=("image/png", b"x")):
             got, used = await cog.image_text({"id": 7, "url": "https://x/7.png"})
         self.assertIsNone(got)
-        self.assertEqual(used, module.VisionUsage(images_read=1, input_tokens=316, nanodollars=40_600, failure="vision_empty_text"))
+        # images_read is 0 and images_failed is 1: the provider billed for the
+        # call, so the spend is real, but nothing was read and the dashboard
+        # must not say otherwise. Counting a failure as a read is how eleven
+        # consecutive failures rendered as 讀圖 11 張 in production.
+        self.assertEqual(used, module.VisionUsage(
+            images_read=0, images_failed=1, input_tokens=316,
+            nanodollars=40_600, failure="vision_empty_text"))
 
     async def test_every_image_failure_names_itself(self) -> None:
         # Five exits used to log and return None, so a channel whose endpoint
