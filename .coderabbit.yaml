@@ -49,6 +49,40 @@ reviews:
     # a timeout rather than as a stop. Measured: sepia#250 ran four rounds.
     auto_pause_after_reviewed_commits: 0
 
+  pre_merge_checks:
+    docstrings:
+      # Off, because it cannot be pointed at the files this repository
+      # actually keeps docstrings in, and off is honest about that.
+      #
+      # The check's denominator is every function a diff touches, and there is
+      # no path scoping for it: the schema gives `mode` and `threshold` and
+      # nothing else. `reviews.path_filters` would scope it, by excluding the
+      # test files from review altogether -- which costs more than it saves,
+      # since CodeRabbit reading the tests is what found the scam-target
+      # defect on PR #44.
+      #
+      # Measured on PR #44 (2026-09-22). It reported 33.33% against a 80.00%
+      # threshold. Both production functions in that diff had docstrings; the
+      # two that did not were test methods:
+      #
+      #   messagewatch.py         84/87  = 96.6%
+      #   test_messagewatch.py     2/209 =  1.0%
+      #
+      # Test methods here carry their sentence in the name and their reasoning
+      # in inline comments, across all 209 of them. Writing docstrings for two
+      # of them to move a percentage would satisfy the metric and leave the
+      # file less consistent than before.
+      #
+      # A threshold low enough to pass that diff would be a number picked to
+      # fit one PR, and it would drift the moment the ratio of production to
+      # test functions changed. Turning the check off says what is true: this
+      # repository does not measure the thing the check measures.
+      #
+      # Quoted because YAML 1.1 reads a bare `off` as the boolean false, and
+      # the schema wants the string. Written unquoted first, and the parser
+      # returned `{'docstrings': {'mode': False}}`.
+      mode: "off"
+
 knowledge_base:
   code_guidelines:
     # Enabled by default, but pointed at nothing by default. These are the
