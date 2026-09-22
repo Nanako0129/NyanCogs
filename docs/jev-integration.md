@@ -59,6 +59,7 @@ A typical evaluation window (8 channel rules plus 5 messages) consumes approxima
 | Interpersonal friction (`heat`) | `score` | Continuous scale across ordered levels (0 to 3), rather than a binary flag |
 | Target rule identification (`which_rule`) | `choice` | Selects from defined candidate rules; requires confidence score |
 | Target message identification (`scam_index`, `rule_index`) | `choice` | Identifies specific violating message index within the window |
+| Hostile message identification (`hostile_index`) | `choice` | Hostility is judged over a window because it is a property of an exchange, but a moderator acts on one person. Without this the report named no message and its action buttons had no target |
 | Rule meta commentary (`is_meta` / `meta_index`) | `noul` / `choice` | Veto filter against false positives; see §6 |
 
 Independent questions across the same `state` are dispatched in a single batch request. They execute concurrently, have no visibility into sibling answers, and are filtered downstream in Python.
