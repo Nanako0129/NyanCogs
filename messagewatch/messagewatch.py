@@ -148,7 +148,24 @@ IMAGE_PROMPT = (
 # far above observed background. False negatives are NOT measured: the real
 # sample contained no scam and no argument to catch.
 DEFAULT_SCAM_THRESHOLD = 0.90
-DEFAULT_HOSTILE_THRESHOLD = 0.80
+# The hostility question asks what the person written about would feel, not
+# whether the text contains an attack, so its scale is not the old question's
+# and the old number does not mean the same thing on it. Measured 2026-09-22
+# over twelve cases: friendly teasing 0.33-0.66, hostility 0.61-0.81, and three
+# runs moved any one case by at most 0.03. 0.60 sits under every hostile case
+# and over four of the five teasing ones.
+DEFAULT_HOSTILE_HARM_THRESHOLD = 0.60
+# A separate literal question, consumed here rather than written as an
+# exception inside the hostility criteria -- which was already tried and does
+# not work: `is_hostile` carried 「朋友之間的玩笑互虧不算」 and still scored
+# teasing at 0.76-0.80. The same shape as the `is_meta` veto, for the same
+# reason (jaggedness #1, literal reading).
+#
+# It is what separates the two real false positives from everything else. On a
+# report of eight messages joking about banning "people who worked over the
+# holiday", the old question scored 0.86 and this one scores 0.29-0.31: the
+# contempt is aimed at a class of absent people, not at anyone in the room.
+HOSTILE_TARGET_PRESENT = 0.70
 DEFAULT_HEAT_THRESHOLD = 2.50
 
 # Rules live in the question's `criteria`, never in `state`. Two reasons, both
@@ -270,7 +287,7 @@ DEFAULT_GUILD = {
     "watched_channels": [],
     "disclosure_version": 0,
     "scam_threshold": DEFAULT_SCAM_THRESHOLD,
-    "hostile_threshold": DEFAULT_HOSTILE_THRESHOLD,
+    "hostile_harm_threshold": DEFAULT_HOSTILE_HARM_THRESHOLD,
     "heat_threshold": DEFAULT_HEAT_THRESHOLD,
     "window_size": 8,
     "cooldown_seconds": 300,
@@ -403,9 +420,15 @@ SETTING_RULES: dict[str, Setting] = {
         float, 0.0, 1.0, "詐騙門檻",
         "詐騙機率要多高才報告。實測：合成詐騙 0.93–0.97，而「提醒別人小心釣魚信」只有 0.06。",
     ),
-    "hostile_threshold": Setting(
+    # Deliberately not the old key. The question behind it changed scale, and a
+    # guild that had stored 0.80 against the old one would have carried it onto
+    # the new one and reported almost nothing -- silently, which is the shape
+    # this cog exists to avoid. An unset new key takes the new default; the old
+    # stored value is simply no longer read.
+    "hostile_harm_threshold": Setting(
         float, 0.0, 1.0, "敵意門檻",
-        "針對人的攻擊機率要多高才報告。實測：互相嘲諷 0.95，激烈但就事論事的技術爭論 0.03。",
+        "被針對的人會不會覺得受傷，要多高才報告。實測：朋友互虧 0.33–0.66，"
+        "真正的貶低與排擠 0.61–0.81。只在攻擊對象就在這段對話裡時才會用到。",
     ),
     "heat_threshold": Setting(
         float, 0.0, 3.0, "火藥味門檻",
@@ -498,15 +521,33 @@ QUESTIONS: dict[str, dict[str, Any]] = {
         ),
         "criteria": {},
     },
+    # Asked as what the person written about would feel, not as whether the
+    # text contains an attack. The old wording ordered the two backwards:
+    # friendly teasing scored 0.76-0.80 while sarcastic contempt scored
+    # 0.27-0.41, so no threshold could separate them in either direction.
     "is_hostile": {
         "type": "noul",
         "instructions": (
-            "在 `recent_messages` 裡，是否有人對另一位參與者進行人身攻擊、嘲諷或貶低？"
-            "判斷的對象是人，不是論點。"
+            "在 `recent_messages` 裡，最尖銳的那則訊息，"
+            "被說的那個人看到之後最可能的反應是什麼？"
         ),
         "criteria": {
-            "true": "出現針對某人能力、人格或智商的貶低、嘲笑或羞辱",
-            "false": "只針對做法、數據或論點提出反對，即使語氣強硬或直接；朋友之間的玩笑互虧不算",
+            "true": "覺得被貶低、被羞辱或被排擠，即使對方語氣平靜或包著稱讚",
+            "false": "會笑出來、會回嗆回去，或覺得只是被虧了一下",
+        },
+    },
+    # Whether there is anyone to be hurt. Contempt aimed at a class of people
+    # who are not here is not this cog's business, and it is most of what the
+    # old question was reporting.
+    "hostile_target": {
+        "type": "noul",
+        "instructions": (
+            "在 `recent_messages` 裡，最尖銳的那則訊息，"
+            "針對的是不是這段對話裡的某個人？"
+        ),
+        "criteria": {
+            "true": "針對的是這段對話裡出現過的某個發言者",
+            "false": "針對的是不在這裡的人、某一類人、某種行為、或某件事情本身",
         },
     },
     "hostile_index": {
@@ -1728,7 +1769,24 @@ class MessageWatch(commands.Cog):
             if isinstance(hostile_answer, Mapping)
             else None
         )
-        if hostile is not None and hostile >= float(settings["hostile_threshold"]):
+        target_answer = answers.get("hostile_target")
+        target = (
+            _bounded_probability(target_answer.get("noul"))
+            if isinstance(target_answer, Mapping)
+            else None
+        )
+        # Both, not either. The hostility score says how much the person
+        # written about would be hurt; this one says whether that person is in
+        # the room. Contempt for a class of absent people scores high on the
+        # first and low on the second, and it was most of what this signal
+        # reported. An unreadable answer means no finding rather than a guess:
+        # this decides whether somebody gets named.
+        if (
+            hostile is not None
+            and hostile >= float(settings["hostile_harm_threshold"])
+            and target is not None
+            and target >= HOSTILE_TARGET_PRESENT
+        ):
             reasons.append(f"敵意 {hostile:.2f}")
             # A hostility report used to name no message, so the delete,
             # timeout and role buttons had nothing to act on and a moderator
@@ -2969,7 +3027,7 @@ class MessageWatch(commands.Cog):
         embed.add_field(
             name="門檻",
             value=(
-                f"詐騙=`{settings['scam_threshold']}` · 敵意=`{settings['hostile_threshold']}` · "
+                f"詐騙=`{settings['scam_threshold']}` · 敵意=`{settings['hostile_harm_threshold']}` · "
                 f"火藥味=`{settings['heat_threshold']}`\n"
                 f"違規=`{settings['rule_threshold']}` · 條文信心下限=`{settings['rule_confidence']}`"
             ),

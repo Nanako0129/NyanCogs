@@ -114,7 +114,7 @@ mw:<action>:<kind>:<channel>:<message>:<author>
 - 伺服器全域設定與通報報告頻道 ID。
 - 明確啟用的頻道 ID 集合。
 - 頻道專屬規則、用途說明、報告路由目標、按鈕配置清單與處置身分組 ID。
-- 各項分類門檻（`scam_threshold`、`hostile_threshold`、`heat_threshold`、`rule_threshold`、`rule_confidence`）。
+- 各項分類門檻（`scam_threshold`、`hostile_harm_threshold`、`heat_threshold`、`rule_threshold`、`rule_confidence`）。
 - 管理員標記累計計數（依類別分類的 `ok` 與 `no` 總數）。
 
 ### 排除儲存項目
