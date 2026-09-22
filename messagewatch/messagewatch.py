@@ -464,7 +464,7 @@ SETTING_RULES: dict[str, Setting] = {
 # exactly what it exists to re-ask about, and a guild that accepted version 1
 # never saw them. Bumping halts every guild until a manager accepts again,
 # which is why `[p]watch show` says so in its first field.
-DISCLOSURE_VERSION = 4
+DISCLOSURE_VERSION = 5
 DISCLOSURE_TEXT = (
     "**What leaves Discord:** in an enabled channel, the text of recent human messages is sent "
     "to TypeSafe continuously, together with the name of the channel, with nobody triggering "
@@ -822,6 +822,10 @@ def score_vector(answers: Mapping[str, Any]) -> dict[str, float]:
     for key, question, reader in (
         ("scam", "any_scam", _bounded_probability),
         ("hostile", "is_hostile", _bounded_probability),
+        # Absent on this branch and present once #49 lands, which is why the
+        # extractor omits what it cannot find rather than writing a zero. A
+        # dimension that starts being recorded halfway through a log is a
+        # dimension whose earlier rows say "not asked", not "scored 0".
         ("target", "hostile_target", _bounded_probability),
         ("violation", "any_violation", _bounded_probability),
         ("heat", "heat", None),
