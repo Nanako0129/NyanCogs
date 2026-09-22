@@ -3068,8 +3068,17 @@ class MessageWatch(commands.Cog):
             else:
                 # Saying "$0.0000" here would be a measurement nobody took.
                 cost = "供應商未回報成本"
+            # A failed call was still billed, and its usage is unknowable: a
+            # body that will not parse carries no token counts, and the only
+            # out-of-band figures OpenRouter exposes are
+            # `X-Generation-Id, X-Provider-Name, request-id, cf-ray` -- an id,
+            # a name and two trace ids, measured on 2026-09-22 by dumping
+            # every response header. So the three numbers on this row describe
+            # the calls that worked, and the row says so rather than letting a
+            # reader take them for the total.
+            missing = "（以上為成功呼叫；失敗的沒有用量可讀，未計入）" if failures else ""
             lines.append(
-                f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}"
+                f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}{missing}"
             )
             if v_nanos:
                 lines.append(f"**合計**　`${spend + v_spend:.4f}` 美元")

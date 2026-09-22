@@ -2741,6 +2741,10 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
             (await cog.dashboard_embed(guild)).to_dict(), ensure_ascii=False)
         self.assertIn("讀圖 `0` 張", rendered)
         self.assertIn("失敗 `11` 次", rendered)
+        # And the three numbers beside it say which calls they describe. A
+        # failed call was billed and its usage cannot be read back, so a bare
+        # "in 0 / out 0" would read as a measured total rather than a partial.
+        self.assertIn("未計入", rendered)
         # And the row is the vision row, not the "not switched on" fallback.
         self.assertNotIn("尚未讀到圖片", rendered)
 
