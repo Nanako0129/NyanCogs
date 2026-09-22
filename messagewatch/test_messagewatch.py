@@ -202,6 +202,7 @@ class TestUntrustedAnswers(unittest.TestCase):
         fight = {
             "any_scam": {"noul": 0.01},
             "is_hostile": {"noul": 0.95},
+            "hostile_target": {"noul": 0.92},
             "hostile_index": {"choice": "3"},
             "heat": {"score": 2.6},
         }
@@ -209,11 +210,29 @@ class TestUntrustedAnswers(unittest.TestCase):
         self.assertEqual(index, 3)
         self.assertEqual(reasons, ["敵意 0.95", "火藥味 2.60/3"])
 
+        # Contempt with nobody in the room to receive it is not this cog's
+        # business. Measured on a real report: eight messages joking about
+        # banning "people who worked over the holiday" scored 0.86 on the old
+        # question and 0.29-0.31 on this one, and it was marked a false
+        # positive. Reported here as the shape, not as the score.
+        absent = {**fight, "hostile_target": {"noul": 0.30}}
+        index, reasons, _ = MessageWatch.findings(absent, settings, 8)
+        self.assertIsNone(index)
+        self.assertEqual(reasons, ["火藥味 2.60/3"])
+
+        # And an unreadable target is not a reason to name somebody anyway.
+        for bad in ({"noul": None}, {"noul": "0.9"}, {}, "nonsense"):
+            with self.subTest(target=str(bad)):
+                _index, reasons, _ = MessageWatch.findings(
+                    {**fight, "hostile_target": bad}, settings, 8)
+                self.assertEqual(reasons, ["火藥味 2.60/3"])
+
         # Scam keeps the target where a window is both: that is the finding
         # with a rule behind it.
         both = {
             "any_scam": {"noul": 0.97}, "scam_index": {"choice": "1"},
-            "is_hostile": {"noul": 0.95}, "hostile_index": {"choice": "3"},
+            "is_hostile": {"noul": 0.95}, "hostile_target": {"noul": 0.92},
+            "hostile_index": {"choice": "3"},
             "heat": {"score": 0.1},
         }
         index, _reasons, _ = MessageWatch.findings(both, settings, 8)
@@ -1125,6 +1144,7 @@ class TestRules(unittest.TestCase):
     def test_a_rule_finding_joins_the_other_reasons(self) -> None:
         answers = self.answers()
         answers["is_hostile"] = {"noul": 0.95}
+        answers["hostile_target"] = {"noul": 0.92}
         index, reasons, _ = MessageWatch.findings(answers, self.settings(), 4, self.RULES)
         self.assertEqual(len(reasons), 2)
         self.assertTrue(reasons[0].startswith("敵意"))

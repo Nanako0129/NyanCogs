@@ -114,7 +114,7 @@ Button callbacks check `guild_permissions` directly on the interacting member, v
 - Guild configurations and moderation report channel IDs.
 - Sets of explicitly enabled channel IDs.
 - Per-channel rules, purpose notes, report route targets, button configurations, and action role IDs.
-- Classification thresholds (`scam_threshold`, `hostile_threshold`, `heat_threshold`, `rule_threshold`, `rule_confidence`).
+- Classification thresholds (`scam_threshold`, `hostile_harm_threshold`, `heat_threshold`, `rule_threshold`, `rule_confidence`).
 - Aggregate moderator mark counts (`ok` and `no` totals grouped by category).
 
 ### Excluded data

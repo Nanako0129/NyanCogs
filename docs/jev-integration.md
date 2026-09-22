@@ -55,7 +55,8 @@ A typical evaluation window (8 channel rules plus 5 messages) consumes approxima
 | Judgement Task | Primitive | Operational Rationale |
 |---|---|---|
 | Scam detection (`any_scam`) | `noul` | Evaluates whether a binary condition holds; returns calibrated probability |
-| Hostility detection (`is_hostile`) | `noul` | Independent binary evaluation; scam and hostility can co-occur, requiring separate queries |
+| Hostility detection (`is_hostile`) | `noul` | Asked as what the person written about would feel, not as whether the text contains an attack. The earlier wording ordered the two backwards: friendly teasing scored 0.76–0.80 while sarcastic contempt scored 0.27–0.41 |
+| Target present (`hostile_target`) | `noul` | Whether there is anyone to be hurt. Contempt aimed at a class of absent people scored high on hostility and low here, and it was most of what the signal reported |
 | Interpersonal friction (`heat`) | `score` | Continuous scale across ordered levels (0 to 3), rather than a binary flag |
 | Target rule identification (`which_rule`) | `choice` | Selects from defined candidate rules; requires confidence score |
 | Target message identification (`scam_index`, `rule_index`) | `choice` | Identifies specific violating message index within the window |
@@ -150,7 +151,8 @@ Furthermore, rule criteria formulation directly alters classification performanc
 | Configuration Key | Default Value | Derivation Source |
 |---|---|---|
 | `scam_threshold` | 0.90 | Empirical benchmark |
-| `hostile_threshold` | 0.80 | Empirical benchmark |
+| `hostile_harm_threshold` | 0.60 | Teasing 0.33–0.66, hostility 0.61–0.81 over twelve cases; three runs moved any one by at most 0.03. A new key, because the question changed scale and a stored 0.80 carried onto it would have reported almost nothing, silently |
+| `HOSTILE_TARGET_PRESENT` | 0.70 | Constant, not a setting. Absent-target cases score 0.10–0.34, present-target ones 0.78–0.95 |
 | `heat_threshold` | 2.50 | Empirical benchmark (scale 0–3; real guild background peaked at 1.53) |
 | `rule_threshold` | 0.85 | §8 empirical separation |
 | `rule_confidence` | 0.70 | §7 empirical separation |
