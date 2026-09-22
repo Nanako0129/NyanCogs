@@ -157,6 +157,11 @@ DEFAULT_HEAT_THRESHOLD = 2.50
 # mostly irrelevant to any one window. #6: state is data the model does not
 # treat as hostile, and members write the state -- a rule placed there is a rule
 # a member could try to write.
+# Enough that a guild judging a window a minute takes months to fill it, and
+# small enough that the whole list stays a few hundred kilobytes of Config.
+# Oldest first out.
+MAX_MARK_LOG = 500
+
 MAX_RULES = 20
 # 300, not 200. The rule measured hardest on this cog -- the gender-identity
 # one, which moved a real case from 0.17 to 0.94 when it was rewritten -- is
@@ -281,6 +286,21 @@ DEFAULT_GUILD = {
     # not store message content" stays true, and this is still the only real
     # precision data this cog can ever accumulate.
     "marks": {},
+    # One record per report: the scores that produced it, and the moderator's
+    # verdict once there is one. The counters above say a judgement was wrong;
+    # they cannot say what it looked like, so nothing can ever be learned from
+    # them -- weights would have to be fitted against cases written by hand.
+    #
+    # Numbers, a timestamp, which signals fired, and the id of the cog's own
+    # report message. No member text, no author, no id of anything a member
+    # wrote: the data statement's "does not store message content" stays true.
+    # The report id is what lets a button press find the scores behind the
+    # report it was pressed on, and it names a message this cog wrote itself.
+    #
+    # Unmarked reports stay in the list. What gets reported and never marked is
+    # as much of the picture as what gets marked, and dropping it would leave a
+    # sample selected by whoever happened to press a button.
+    "mark_log": [],
     "idle_seconds": DEFAULT_IDLE_SECONDS,
     # No default model. Picking one without measuring which reads CJK
     # screenshots best would be a guess dressed as a default, and the cog
@@ -473,7 +493,10 @@ DISCLOSURE_TEXT = (
     "**What the bot does with a result:** posts a report in the configured moderator channel. "
     "The bot never acts on its own. A report can carry buttons, and only a moderator with the "
     "matching Discord permission can press one: marking the report right or wrong records a "
-    "count and nothing else, while deleting a message, timing a member out or adding a role "
+    "count, and attaches that verdict to the scores the report was made of -- numbers, a "
+    "timestamp, and the id of the bot's own report message, with nothing a member wrote and "
+    "no member's id. Those scores are recorded for every report whether or not anyone marks "
+    "it. Deleting a message, timing a member out or adding a role "
     "happen only when a person presses that button, and each is recorded in the modlog with "
     "their name.\n"
     "**Scope:** a channel sends nothing until it is enabled individually, and disabling it stops "
@@ -785,6 +808,39 @@ LAN_NETWORKS = (
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("::1/128"),
 )
+
+
+def score_vector(answers: Mapping[str, Any]) -> dict[str, float]:
+    """The numbers behind one judgement, for the mark log.
+
+    Read through the same bounded readers as the decision itself, so a
+    provider sending nonsense cannot put nonsense in the log either, and a
+    dimension that was not asked or did not parse is absent rather than zero --
+    zero is a measurement and absence is not.
+    """
+    out: dict[str, float] = {}
+    for key, question, reader in (
+        ("scam", "any_scam", _bounded_probability),
+        ("hostile", "is_hostile", _bounded_probability),
+        ("target", "hostile_target", _bounded_probability),
+        ("violation", "any_violation", _bounded_probability),
+        ("heat", "heat", None),
+    ):
+        answer = answers.get(question)
+        if not isinstance(answer, Mapping):
+            continue
+        if reader is None:
+            value = _bounded_score(answer.get("score"), len(QUESTIONS["heat"]["criteria"]))
+        else:
+            value = reader(answer.get("noul"))
+        if value is not None:
+            out[key] = round(float(value), 3)
+    picked = answers.get("which_rule")
+    if isinstance(picked, Mapping):
+        confidence = _bounded_probability(picked.get("confidence"))
+        if confidence is not None:
+            out["rule_confidence"] = round(float(confidence), 3)
+    return out
 
 
 def _reported_nanodollars(usage: Mapping[str, Any]) -> int:
@@ -2027,7 +2083,7 @@ class MessageWatch(commands.Cog):
                 int(flagged["author_id"]) if flagged else 0,
             )
             try:
-                await report_channel.send(
+                sent = await report_channel.send(
                     embed=self.report_embed(channel, window, index, reasons, rule_index),
                     allowed_mentions=discord.AllowedMentions.none(),
                     view=view,
@@ -2052,6 +2108,7 @@ class MessageWatch(commands.Cog):
             # sent.
             self._last_report[channel.id] = time.monotonic()
             self._usage_delta[guild.id]["reports_sent"] += 1
+            await self._log_scores(guild, sent.id, reason_kind(reasons), answers)
 
     async def _audit(self, interaction: discord.Interaction, line: str) -> None:
         """Append what was done to the report itself, where a moderator reads it."""
@@ -2152,10 +2209,43 @@ class MessageWatch(commands.Cog):
         if action == "role":
             await self._add_role(interaction, guild, target, channel_id)
 
+    async def _log_scores(
+        self, guild: discord.Guild, report_id: int, kind: str, answers: Mapping[str, Any]
+    ) -> None:
+        """Record what one report was made of, so a mark on it can mean something.
+
+        Written when the report is delivered rather than when it is marked: by
+        the time a button is pressed the answers are long gone, and carrying
+        them in the custom_id is not possible inside its 100 characters.
+        """
+        async with self.config.guild(guild).mark_log() as log:
+            log.append({
+                "t": int(time.time()),
+                "k": kind,
+                "m": int(report_id),
+                "s": score_vector(answers),
+                "v": None,
+            })
+            # Trimmed on write, not on read: a list that only ever grows is a
+            # Config file that only ever grows.
+            del log[:-MAX_MARK_LOG]
+
     async def _record_mark(
         self, interaction: discord.Interaction, guild: discord.Guild, kind: str, action: str
     ) -> None:
-        """Count one moderator judgement. Counts only -- no message content."""
+        """Count one moderator judgement, and attach it to that report's scores."""
+        message = interaction.message
+        if message is not None:
+            async with self.config.guild(guild).mark_log() as log:
+                for record in reversed(log):
+                    if record.get("m") == message.id:
+                        # Last press wins, so a moderator who pressed the wrong
+                        # button and pressed the other one is recorded as
+                        # having meant the second. The counters below cannot be
+                        # corrected that way, and this is the half that will be
+                        # learned from.
+                        record["v"] = action
+                        break
         async with self.config.guild(guild).marks() as marks:
             bucket = marks.setdefault(kind, {"ok": 0, "no": 0})
             bucket[action] = int(bucket.get(action, 0)) + 1
@@ -2535,6 +2625,22 @@ class MessageWatch(commands.Cog):
             title="MessageWatch 標記統計",
             description="\n".join(rows) or "（還沒有任何標記）",
             colour=discord.Colour.blurple(),
+        )
+        # Printed because the log is the thing that makes the counts above
+        # useful later, and something nobody can see is something nobody
+        # maintains. The unmarked count is the honest denominator: a sample of
+        # only the reports somebody felt like judging is a selected one.
+        log = await self.config.guild(ctx.guild).mark_log()
+        judged = sum(1 for record in log if record.get("v"))
+        embed.add_field(
+            name="判斷紀錄",
+            value=(
+                f"已記錄 `{len(log)}` 次報告的分數，其中 `{judged}` 次有人標記過"
+                f"（上限 `{MAX_MARK_LOG}` 筆，滿了會丟掉最舊的）。\n"
+                "存的是各維度的分數與時間，不含訊息內容。門檻要怎麼調，"
+                "要等這裡累積到足以看出分布才有依據。"
+            ),
+            inline=False,
         )
         embed.set_footer(
             text="這些數字是精確率，不是召回率。漏掉而沒有報告的案例不會出現在這裡。"
