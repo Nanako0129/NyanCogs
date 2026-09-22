@@ -642,6 +642,8 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         cog._last_judged = {}
         cog._last_error = {}
         scope.watched_channels = AsyncMock(return_value=settings["watched_channels"])
+        self.log: list[dict] = []
+        scope.mark_log = MagicMock(side_effect=lambda: ValueContext(self.log))
         cog._pending[5].extend(window(111, 222, 333))
         return cog
 
@@ -653,6 +655,42 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         guild.get_channel.return_value = report
         channel = SimpleNamespace(id=5, guild=guild, name="c", mention="<#5>")
         return channel, report
+
+    async def test_a_report_records_the_scores_that_produced_it(self) -> None:
+        # The counters say a judgement was wrong. They cannot say what it
+        # looked like, so nothing can be learned from them -- every threshold
+        # in this cog would have to keep being fitted against cases written by
+        # hand. This is the half that makes a mark mean something later.
+        cog = self.cog(answers=self.SCAM)
+        channel, report = self.channel()
+        report.send = AsyncMock(return_value=SimpleNamespace(id=4242))
+        await cog.flush(channel)
+        self.assertEqual(len(self.log), 1)
+        record = self.log[0]
+        self.assertEqual(record["m"], 4242)
+        self.assertEqual(record["k"], "s")
+        self.assertIsNone(record["v"])
+        self.assertEqual(record["s"]["scam"], 0.97)
+        self.assertEqual(record["s"]["hostile"], 0.01)
+        self.assertEqual(record["s"]["heat"], 0.1)
+        # No member wrote any of this. The only id present is the cog's own
+        # report message, so the data statement's "does not store message
+        # content" is still true.
+        self.assertEqual(set(record), {"t", "k", "m", "s", "v"})
+        rendered = json.dumps(self.log, ensure_ascii=False)
+        for text in ("111", "222", "333"):
+            self.assertNotIn(text, rendered)
+
+    async def test_the_log_stops_growing_and_drops_the_oldest(self) -> None:
+        cog = self.cog(answers=self.SCAM)
+        channel, report = self.channel()
+        report.send = AsyncMock(return_value=SimpleNamespace(id=1))
+        self.log.extend({"t": 0, "k": "s", "m": n, "s": {}, "v": None}
+                        for n in range(module.MAX_MARK_LOG + 5))
+        await cog.flush(channel)
+        self.assertEqual(len(self.log), module.MAX_MARK_LOG)
+        self.assertEqual(self.log[-1]["m"], 1)
+        self.assertNotIn(0, [record["m"] for record in self.log])
 
     SCAM = {"any_scam": {"noul": 0.97}, "scam_index": {"choice": "1"},
             "is_hostile": {"noul": 0.01}, "heat": {"score": 0.1}}
@@ -1543,6 +1581,41 @@ class TestActionAddressing(unittest.TestCase):
         self.assertEqual(module.reason_kind(["火藥味 2.60/3"]), "t")
 
 
+class TestScoreVector(unittest.TestCase):
+    def test_a_dimension_that_was_not_answered_is_absent_not_zero(self) -> None:
+        # Zero is a measurement. A window judged before a question existed, or
+        # one where the provider sent something unusable, has no value for it,
+        # and writing 0.0 there would put a reading into the log that nobody
+        # took -- which is precisely what this log exists to avoid.
+        self.assertEqual(module.score_vector({}), {})
+        partial = module.score_vector({"any_scam": {"noul": 0.4}, "heat": {"score": 1.5}})
+        self.assertEqual(partial, {"scam": 0.4, "heat": 1.5})
+        self.assertNotIn("hostile", partial)
+
+    def test_a_provider_sending_nonsense_puts_nonsense_nowhere(self) -> None:
+        # The same bounded readers as the decision itself. A number the cog
+        # would refuse to act on is a number it must not record either.
+        for bad in ({"noul": "0.9"}, {"noul": None}, {"noul": 1.4}, {"noul": True}, {}):
+            with self.subTest(bad=str(bad)):
+                self.assertEqual(module.score_vector({"any_scam": bad}), {})
+        self.assertEqual(module.score_vector({"any_scam": "not a mapping"}), {})
+
+    def test_every_dimension_the_decision_reads_is_recorded(self) -> None:
+        # Not a fixed list checked by eye: each name here is one the shipping
+        # composition actually branches on, so a new signal added without a
+        # place in the log is a signal nobody can ever fit a weight for.
+        full = module.score_vector({
+            "any_scam": {"noul": 0.97},
+            "is_hostile": {"noul": 0.62},
+            "hostile_target": {"noul": 0.88},
+            "any_violation": {"noul": 0.91},
+            "heat": {"score": 2.4},
+            "which_rule": {"choice": "2", "confidence": 0.74},
+        })
+        self.assertEqual(full, {"scam": 0.97, "hostile": 0.62, "target": 0.88,
+                                "violation": 0.91, "heat": 2.4, "rule_confidence": 0.74})
+
+
 class TestActionPermissions(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def interaction(custom_id, *, perms=None, member=True):
@@ -1594,6 +1667,40 @@ class TestActionPermissions(unittest.IsolatedAsyncioTestCase):
         interaction, _ = self.interaction(module.build_custom_id("ok", "s", 5, 900, 42))
         await MessageWatch.on_interaction(cog, interaction)
         self.assertIn("屬實", interaction.response.send_message.await_args.args[0])
+
+    async def test_a_mark_lands_on_the_record_for_that_report(self) -> None:
+        # A count says a judgement was wrong; the record says what it was made
+        # of. Without this half the counts can never be more than a tally, and
+        # every threshold stays fitted against cases written by hand.
+        log = [
+            {"t": 1, "k": "s", "m": 111, "s": {"scam": 0.11}, "v": None},
+            {"t": 2, "k": "h", "m": 222, "s": {"hostile": 0.81}, "v": None},
+        ]
+        cog = self.cog()
+        scope = MagicMock()
+        scope.marks = MagicMock(return_value=ValueContext({}))
+        scope.mark_log = MagicMock(side_effect=lambda: ValueContext(log))
+        cog.config.guild.return_value = scope
+        cog._audit = AsyncMock()
+        interaction, _ = self.interaction(module.build_custom_id("no", "h", 5, 900, 42))
+        interaction.message = SimpleNamespace(id=222)
+        await MessageWatch.on_interaction(cog, interaction)
+        self.assertEqual([record["v"] for record in log], [None, "no"])
+
+        # Pressed again the other way: the second press is what the moderator
+        # meant. The counters cannot be corrected that way, and this is the
+        # half that will be learned from.
+        interaction, _ = self.interaction(module.build_custom_id("ok", "h", 5, 900, 42))
+        interaction.message = SimpleNamespace(id=222)
+        await MessageWatch.on_interaction(cog, interaction)
+        self.assertEqual(log[1]["v"], "ok")
+
+        # A report older than the log, or one from before this existed, leaves
+        # every record alone rather than marking whichever happens to be last.
+        interaction, _ = self.interaction(module.build_custom_id("no", "h", 5, 900, 42))
+        interaction.message = SimpleNamespace(id=999)
+        await MessageWatch.on_interaction(cog, interaction)
+        self.assertEqual([record["v"] for record in log], [None, "ok"])
 
     async def test_an_unrelated_interaction_is_left_alone(self) -> None:
         for data in ({"custom_id": "someone-elses-button"}, {}, None):
