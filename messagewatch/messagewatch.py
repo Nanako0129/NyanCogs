@@ -3068,15 +3068,15 @@ class MessageWatch(commands.Cog):
             else:
                 # Saying "$0.0000" here would be a measurement nobody took.
                 cost = "供應商未回報成本"
-            # A failed call was still billed, and its usage is unknowable: a
-            # body that will not parse carries no token counts, and the only
-            # out-of-band figures OpenRouter exposes are
-            # `X-Generation-Id, X-Provider-Name, request-id, cf-ray` -- an id,
-            # a name and two trace ids, measured on 2026-09-22 by dumping
-            # every response header. So the three numbers on this row describe
-            # the calls that worked, and the row says so rather than letting a
-            # reader take them for the total.
-            missing = "（以上為成功呼叫；失敗的沒有用量可讀，未計入）" if failures else ""
+            # Not "failed calls are excluded": a `vision_empty_text` failure
+            # parsed fine and its tokens and cost were read, so it is in these
+            # numbers while being counted as a failure. What is missing is the
+            # usage of calls whose body never parsed -- and it is unknowable,
+            # not merely unread: the only out-of-band figures OpenRouter
+            # exposes are `X-Generation-Id, X-Provider-Name, request-id,
+            # cf-ray`, an id, a name and two trace ids, measured on 2026-09-22
+            # by dumping every response header of a real call.
+            missing = "（含所有回報了用量的呼叫；讀不到用量的失敗不在其中）" if failures else ""
             lines.append(
                 f"**視覺模型**　{read} · in `{v_in:,}` / out `{v_out:,}` · {cost}{missing}"
             )

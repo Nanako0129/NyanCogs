@@ -2742,9 +2742,12 @@ class TestDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("讀圖 `0` 張", rendered)
         self.assertIn("失敗 `11` 次", rendered)
         # And the three numbers beside it say which calls they describe. A
-        # failed call was billed and its usage cannot be read back, so a bare
-        # "in 0 / out 0" would read as a measured total rather than a partial.
-        self.assertIn("未計入", rendered)
+        # bare "in 0 / out 0" would read as a measured total rather than a
+        # partial. It must not claim that every failure is excluded either: a
+        # `vision_empty_text` failure parsed fine, so its tokens and cost were
+        # read and are in these numbers while it is counted as a failure.
+        self.assertIn("讀不到用量的失敗不在其中", rendered)
+        self.assertNotIn("失敗的沒有用量可讀", rendered)
         # And the row is the vision row, not the "not switched on" fallback.
         self.assertNotIn("尚未讀到圖片", rendered)
 
