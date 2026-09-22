@@ -953,7 +953,7 @@ class TestRules(unittest.TestCase):
         items = anonymise(window(1, 2))
         self.assertEqual(build_rule_questions(items, []), {})
         self.assertEqual(set(build_questions(items)), set(module.QUESTIONS))
-        self.assertNotIn("channel_rules", build_state("c", items))
+        self.assertNotIn("rules", build_state("c", items))
         self.assertNotIn("channel_purpose", build_state("c", items))
         # A purpose can be set without any rules, and `[p]watch rule clear`
         # leaves one behind. Neither may keep an outbound field alive on its
@@ -1152,6 +1152,18 @@ class TestServerRules(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(measured), module.MAX_RULE_CHARS)
         # And the payload stays far inside its own bound at the new length.
         self.assertLess(module.MAX_RULES * module.MAX_RULE_CHARS * 4, module.MAX_REQUEST_BYTES)
+
+    def test_the_rule_question_names_a_field_the_state_actually_carries(self) -> None:
+        # The question refers to the ruleset by a backticked path, and the
+        # state has to answer to that name. Two places state one contract, so
+        # renaming either alone points the model at a field that is not there
+        # -- and the model would not say so, it would answer anyway.
+        items = anonymise(window(1, 2))
+        instructions = build_rule_questions(items, ["第一條規則"])["any_violation"]["instructions"]
+        referenced = set(re.findall(r"`([a-z_]+)`", instructions))
+        state = build_state("樹洞", items, "倒垃圾用", ["第一條規則"])
+        self.assertTrue(referenced)
+        self.assertLessEqual(referenced, set(state))
 
     def test_server_rules_come_first_and_channel_rules_follow(self) -> None:
         # The order is the order of the model's options, and a stable prefix
@@ -3411,7 +3423,7 @@ class TestDataStatement(unittest.TestCase):
         # out as well, and the statement has to name them.
         with_rules = build_state("樹洞", items, "倒垃圾用", ["第一條規則"])
         self.assertEqual(
-            set(with_rules), {"channel", "recent_messages", "channel_purpose", "channel_rules"}
+            set(with_rules), {"channel", "recent_messages", "channel_purpose", "rules"}
         )
 
         statement = self.statement()

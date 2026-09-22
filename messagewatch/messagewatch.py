@@ -645,7 +645,7 @@ def build_rule_questions(
         "any_violation": {
             "type": "noul",
             "instructions": (
-                "在 `recent_messages` 裡，是否有訊息違反了 `channel_rules` 所列的任一條規則？"
+                "在 `recent_messages` 裡，是否有訊息違反了 `rules` 所列的任一條規則？"
                 "只判斷訊息本身做了什麼，不判斷它談論了什麼。"
             ),
             "criteria": {
@@ -659,11 +659,11 @@ def build_rule_questions(
         "meta_index": {
             "type": "choice",
             "instructions": (
-                "哪一則訊息是在談論這個頻道的規則本身——例如指出別人違規、引用規則、"
+                "哪一則訊息是在談論這個頻道適用的規則本身——例如指出別人違規、引用規則、"
                 "或討論什麼行為在這裡可不可以？選項是各則訊息的開頭。"
                 "注意：解讀或評論某個人，不算談論規則。"
             ),
-            "criteria": _message_options(items, "沒有任何一則在談論這個頻道的規則"),
+            "criteria": _message_options(items, "沒有任何一則在談論這個頻道適用的規則"),
         },
         "which_rule": {
             "type": "choice",
@@ -737,7 +737,7 @@ def build_state(
     if rules:
         if purpose:
             state["channel_purpose"] = purpose
-        state["channel_rules"] = [
+        state["rules"] = [
             f"第 {number} 條" for number in range(1, len(rules) + 1)
         ]
     return state
