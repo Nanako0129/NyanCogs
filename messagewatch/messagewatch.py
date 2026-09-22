@@ -537,10 +537,13 @@ QUESTIONS: dict[str, dict[str, Any]] = {
     # has worked in this cog. It was measured and not taken, because it also
     # lifts mild teasing onto the line: across two runs the highest teasing
     # reached 0.63 and the lowest evasive attack 0.64, so no threshold
-    # separates them. Hostility precision in production is currently 0 of 2,
-    # and two more reports on jokes costs more than an evasion a human reader
-    # can see through. Revisit when `mark_log` has a real distribution rather
-    # than fifteen cases written by hand.
+    # separates them. At 0.60 the clause trades those three closed evasions for
+    # two more reports on jokes in one run and three in the next -- which side
+    # of the line a mild tease lands on is itself unstable. Hostility precision
+    # in production is currently 0 of 2, and a moderator who starts skimming
+    # this channel costs more than an evasion a human reader can see through.
+    # Revisit when `mark_log` has a real distribution rather than a set of
+    # fifteen cases, thirteen of them written by hand.
     "is_hostile": {
         "type": "noul",
         "instructions": (
