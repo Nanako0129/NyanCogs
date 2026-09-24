@@ -27,14 +27,16 @@ log = logging.getLogger("red.nyancogs.spotifyplaylist")
 PLAYLIST_TRACKS_RE = re.compile(r"^https://api\.spotify\.com/v1/playlists/([A-Za-z0-9]{22})/tracks$")
 NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
 EMBED_URL = "https://open.spotify.com/embed/playlist/{}"
-# Measured 2026-09-25: two 100+ track Spotify playlists both came back with exactly 100 entries, and neither the
-# embed page nor the playlist metadata endpoint exposes the real total, so a full page cannot be told from a cut one.
-EMBED_TRACK_CAP = 100
+# The embed page lists at most the first 100 positions, minus tracks Spotify drops as unavailable, and neither it nor
+# the playlist metadata endpoint exposes the real total. Measured 2026-09-25 on seven 100+ track playlists: 100, 100,
+# 100, 100, 100, 100 and 98 entries (258 on Spotify). So truncation cannot be detected exactly; at or above this many
+# raw entries the list is reported as possibly cut. A complete 90-99 track playlist also logs it, which costs nothing.
+EMBED_TRUNCATION_HINT = 90
 _PATCH_FLAG = "_nyancogs_spotifyplaylist_original"
 
 
-def parse_embed(html: str) -> List[Dict[str, Any]]:
-    """Turn an embed page into Web API playlist items (``[{"track": {...}}]``) carrying the fields Audio reads."""
+def _track_list(html: str) -> List[Dict[str, Any]]:
+    """The embed page's raw ``trackList`` entries, or [] when the page has none."""
     match = NEXT_DATA_RE.search(html)
     if not match:
         return []
@@ -44,8 +46,13 @@ def parse_embed(html: str) -> List[Dict[str, Any]]:
         return []
     if not isinstance(entity, dict):
         return []
+    return entity.get("trackList") or []
+
+
+def parse_embed(html: str) -> List[Dict[str, Any]]:
+    """Turn an embed page into Web API playlist items (``[{"track": {...}}]``) carrying the fields Audio reads."""
     items = []
-    for entry in entity.get("trackList") or []:
+    for entry in _track_list(html):
         uri = entry.get("uri") or ""
         track_id = uri.rpartition(":")[2]
         if not entry.get("title") or not uri.startswith("spotify:track:") or not track_id:
@@ -63,13 +70,20 @@ def parse_embed(html: str) -> List[Dict[str, Any]]:
 
 
 async def fetch_embed_items(session: Any, playlist_id: str) -> List[Dict[str, Any]]:
-    # ponytail: embed page is undocumented and capped at EMBED_TRACK_CAP; user OAuth is the path to full lists.
+    # ponytail: the embed page is undocumented and capped near 100. User OAuth does not lift it: measured 2026-09-25,
+    # a user token reads only playlists that user owns (followed and editorial playlists: 403/404).
     async with session.get(EMBED_URL.format(playlist_id), headers={"User-Agent": "Mozilla/5.0"},
                            timeout=aiohttp.ClientTimeout(total=15)) as resp:
         if resp.status != 200:
             log.warning("Spotify embed fallback failed: HTTP %s", resp.status)
             return []
-        return parse_embed(await resp.text())
+        html = await resp.text()
+    raw = _track_list(html)
+    if len(raw) >= EMBED_TRUNCATION_HINT:
+        # Playing the first ~100 beats the "unsupported URL" error, but say so rather than pass it off as whole.
+        log.warning("Spotify playlist %s: embed page listed %d tracks and may be cut at 100; longer playlists "
+                    "play only their first 100", playlist_id, len(raw))
+    return parse_embed(html)
 
 
 def _patch(api_cls: type) -> None:
@@ -89,12 +103,7 @@ def _patch(api_cls: type) -> None:
             return data
         if not items:
             return data
-        if len(items) >= EMBED_TRACK_CAP:
-            # Playing the first 100 beats the "unsupported URL" error, but say so rather than pass it off as whole.
-            log.warning("Spotify playlist %s: embed page returned %d tracks, the embed cap; longer playlists "
-                        "play only their first %d", match.group(1), len(items), EMBED_TRACK_CAP)
-        else:
-            log.info("Spotify playlist %s served from embed page (%d tracks)", match.group(1), len(items))
+        log.info("Spotify playlist %s served from embed page (%d tracks)", match.group(1), len(items))
         return {"items": items, "total": len(items), "next": None}
 
     setattr(api_cls, _PATCH_FLAG, original)

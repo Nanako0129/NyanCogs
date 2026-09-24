@@ -387,9 +387,9 @@ SpotifyPlaylist 包住 Audio 的 Spotify 用戶端。歌單曲目請求回傳錯
 Spotify 公開的嵌入頁讀取歌單，再以 Web API 原本的資料格式交還 Audio，所以找
 YouTube、排入佇列與快取仍由 Audio 自己處理。這個 cog 不儲存任何資料，也沒有指令。
 
-嵌入頁不是公開文件記載的介面，最多只回 100 首，也沒有總曲數可以分辨清單是完整
-還是被截斷。超過 100 首的歌單只會播前 100 首，cog 碰到這個上限時會在日誌寫
-warning。Spotify 若改版，備援會找不到曲目，Audio 就會回到原本的錯誤訊息。
+嵌入頁不是公開文件記載的介面，最多只列出前 100 首（Spotify 會再拿掉無法播放的曲
+目），也沒有總曲數可以分辨清單是完整還是被截斷。超過 100 首的歌單只會播前 100
+首；只要列出 90 首以上，cog 就會在日誌寫 warning，提醒可能被截斷。Spotify 若改版，備援會找不到曲目，Audio 就會回到原本的錯誤訊息。
 
 ```text
 [p]repo add NyanCogs https://github.com/Nanako0129/NyanCogs

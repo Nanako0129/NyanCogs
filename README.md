@@ -535,9 +535,10 @@ and hands Audio the same data shape the Web API would have returned, so YouTube
 matching, queueing and caching stay Audio's own. It stores no data and has no
 commands.
 
-The embed page is undocumented and returns at most 100 tracks, with no total
-to tell a full playlist from a cut one. Longer playlists play only their first
-100 tracks, and the cog logs a warning when it hits that cap. If Spotify changes
+The embed page is undocumented and lists at most the first 100 tracks (minus
+any Spotify drops as unavailable), with no total to tell a full playlist from a
+cut one. Longer playlists play only their first 100 tracks, and the cog logs a
+warning whenever a playlist lists 90 or more, since it may have been cut. If Spotify changes
 the page, the fallback stops finding tracks and Audio shows its original error
 again.
 

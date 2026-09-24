@@ -38,6 +38,38 @@ class ParseEmbedTest(unittest.TestCase):
         self.assertEqual(sp.parse_embed(f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(null_entity)}</script>'), [])
 
 
+class FetchEmbedTest(unittest.TestCase):
+    def fetch(self, entries):
+        class Resp:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def text(self):
+                return embed_html(entries)
+
+        class Session:
+            def get(self, *args, **kwargs):
+                return Resp()
+
+        return asyncio.run(sp.fetch_embed_items(Session(), "0SfYiKmJyx8TM5Ruuzxngd"))
+
+    def test_possibly_cut_list_is_reported_from_the_raw_count(self):
+        # Spotify dropped two unavailable tracks from a 258-track playlist and listed 98: still a cut list.
+        entries = [dict(TRACKS[0], uri=f"spotify:track:{i:022d}") for i in range(98)]
+        with self.assertLogs(sp.log, "WARNING") as logs:
+            self.assertEqual(len(self.fetch(entries)), 98)
+        self.assertIn("may be cut at 100", logs.output[0])
+
+    def test_short_list_is_not_reported(self):
+        with self.assertNoLogs(sp.log, "WARNING"):
+            self.assertEqual(len(self.fetch(TRACKS)), 1)
+
+
 class PatchTest(unittest.TestCase):
     def make_api(self, response):
         class FakeAPI:
