@@ -9,6 +9,7 @@
 | [ChannelSummary](#channelsummary) | 透過相容 OpenAI 介面的 LLM Agent 產生存有出處引註的頻道摘要 |
 | [MessageWatch](#messagewatch) | 監控並向管理頻道通報疑似詐騙與敵意衝突的對話 |
 | [EmbedFixer](#embedfixer) | 將支援的社群平台連結替換為第三方修復後的預覽連結 |
+| [SpotifyPlaylist](#spotifyplaylist) | 讓 Audio 重新能播 Spotify 歌單連結 |
 
 MessageWatch 的架構設計筆記收錄於 [`docs/`](docs/)，提供英文與繁體中文版本。
 
@@ -375,3 +376,25 @@ Provider 詮釋資料、選用的清理後貼文文字與媒體 URL 僅在擷取
 ### 來源出處與授權條款
 
 Provider 清單與轉換規則改編自 [`seriaati/embed-fixer`](https://github.com/seriaati/embed-fixer) 上游 commit [`42be298c49c3c3910859d1f27943abf9c4e95eb8`](https://github.com/seriaati/embed-fixer/tree/42be298c49c3c3910859d1f27943abf9c4e95eb8)。本 Red Cog 保留上游的 GPL-3.0 授權，並依本儲存庫的 [GPL-3.0 license](LICENSE) 散布。
+
+## SpotifyPlaylist
+
+Spotify 現在拒絕 Red Audio 使用的 client-credentials token 呼叫
+`GET /v1/playlists/{id}/tracks`，Audio 3.5.24 因此把所有歌單連結都回成「This
+doesn't seem to be a supported Spotify URL or code.」。單曲與專輯不受影響。
+
+SpotifyPlaylist 包住 Audio 的 Spotify 用戶端。歌單曲目請求回傳錯誤時，改從
+Spotify 公開的嵌入頁讀取歌單，再以 Web API 原本的資料格式交還 Audio，所以找
+YouTube、排入佇列與快取仍由 Audio 自己處理。這個 cog 不儲存任何資料，也沒有指令。
+
+嵌入頁不是公開文件記載的介面。Spotify 若改版或限制長度，備援會找不到曲目，
+Audio 就會回到原本的錯誤訊息。
+
+```text
+[p]repo add NyanCogs https://github.com/Nanako0129/NyanCogs
+[p]cog install NyanCogs spotifyplaylist
+[p]load spotifyplaylist
+[p]play https://open.spotify.com/playlist/<id>
+```
+
+需要先載入 Audio。Audio 重新載入時，這個 cog 會在 Audio 重新加入後，對新匯入的用戶端再套用一次。

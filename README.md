@@ -9,6 +9,7 @@ Cogs for [Red Discord Bot](https://github.com/Cog-Creators/Red-DiscordBot).
 | [ChannelSummary](#channelsummary) | Attributed channel summaries through an OpenAI-compatible LLM Agent |
 | [MessageWatch](#messagewatch) | Reports likely scams and hostile exchanges to a moderator channel |
 | [EmbedFixer](#embedfixer) | Replaces supported social links with provider-fixed links |
+| [SpotifyPlaylist](#spotifyplaylist) | Lets Audio play Spotify playlist links again |
 
 Design notes for MessageWatch live in [`docs/`](docs/), in English and
 Traditional Chinese.
@@ -520,3 +521,29 @@ commit
 [`42be298c49c3c3910859d1f27943abf9c4e95eb8`](https://github.com/seriaati/embed-fixer/tree/42be298c49c3c3910859d1f27943abf9c4e95eb8).
 This Red Cog preserves the upstream GPL-3.0 licensing and is distributed under
 this repository's [GPL-3.0 license](LICENSE).
+
+## SpotifyPlaylist
+
+Spotify now refuses `GET /v1/playlists/{id}/tracks` to the client-credentials
+token that Red's Audio uses, and Audio 3.5.24 reports every playlist link as
+"This doesn't seem to be a supported Spotify URL or code." Single tracks and
+albums are unaffected.
+
+SpotifyPlaylist wraps Audio's Spotify client. When a playlist-tracks request
+comes back as an error, it reads the playlist from Spotify's public embed page
+and hands Audio the same data shape the Web API would have returned, so YouTube
+matching, queueing and caching stay Audio's own. It stores no data and has no
+commands.
+
+The embed page is undocumented. If Spotify changes or caps it, the fallback
+stops finding tracks and Audio shows its original error again.
+
+```text
+[p]repo add NyanCogs https://github.com/Nanako0129/NyanCogs
+[p]cog install NyanCogs spotifyplaylist
+[p]load spotifyplaylist
+[p]play https://open.spotify.com/playlist/<id>
+```
+
+Audio must be loaded. When Audio is reloaded, the cog listens for it being
+added again and re-applies the wrapper to the freshly imported client.
