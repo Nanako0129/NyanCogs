@@ -1,0 +1,18 @@
+{
+    "name": "SpotifyPlaylist",
+    "author": [
+        "Nyanako"
+    ],
+    "short": "Make Audio play Spotify playlists again.",
+    "description": "Spotify refuses playlist tracks to Red's client-credentials token, so Audio reports playlists as unsupported. When that happens this cog reads the playlist from Spotify's public embed page and hands Audio the same data shape, leaving YouTube matching, queueing and caching to Audio.",
+    "install_msg": "Load with `[p]load spotifyplaylist` (Audio must be loaded), then `[p]play` a Spotify playlist link.",
+    "tags": [
+        "audio",
+        "spotify",
+        "music"
+    ],
+    "min_bot_version": "3.5.24",
+    "min_python_version": [3, 11, 0],
+    "requirements": [],
+    "end_user_data_statement": "This cog stores no data. Playlist pages are fetched transiently when a playlist is played."
+}
