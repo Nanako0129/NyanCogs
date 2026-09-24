@@ -27,6 +27,9 @@ log = logging.getLogger("red.nyancogs.spotifyplaylist")
 PLAYLIST_TRACKS_RE = re.compile(r"^https://api\.spotify\.com/v1/playlists/([A-Za-z0-9]{22})/tracks$")
 NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
 EMBED_URL = "https://open.spotify.com/embed/playlist/{}"
+# Measured 2026-09-25: two 100+ track Spotify playlists both came back with exactly 100 entries, and neither the
+# embed page nor the playlist metadata endpoint exposes the real total, so a full page cannot be told from a cut one.
+EMBED_TRACK_CAP = 100
 _PATCH_FLAG = "_nyancogs_spotifyplaylist_original"
 
 
@@ -38,6 +41,8 @@ def parse_embed(html: str) -> List[Dict[str, Any]]:
     try:
         entity = json.loads(match.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
     except (ValueError, KeyError, TypeError):
+        return []
+    if not isinstance(entity, dict):
         return []
     items = []
     for entry in entity.get("trackList") or []:
@@ -58,7 +63,7 @@ def parse_embed(html: str) -> List[Dict[str, Any]]:
 
 
 async def fetch_embed_items(session: Any, playlist_id: str) -> List[Dict[str, Any]]:
-    # ponytail: the embed page is undocumented and may cap long playlists; switch to user OAuth if it breaks.
+    # ponytail: embed page is undocumented and capped at EMBED_TRACK_CAP; user OAuth is the path to full lists.
     async with session.get(EMBED_URL.format(playlist_id), headers={"User-Agent": "Mozilla/5.0"},
                            timeout=aiohttp.ClientTimeout(total=15)) as resp:
         if resp.status != 200:
@@ -84,7 +89,12 @@ def _patch(api_cls: type) -> None:
             return data
         if not items:
             return data
-        log.info("Spotify playlist %s served from embed page (%d tracks)", match.group(1), len(items))
+        if len(items) >= EMBED_TRACK_CAP:
+            # Playing the first 100 beats the "unsupported URL" error, but say so rather than pass it off as whole.
+            log.warning("Spotify playlist %s: embed page returned %d tracks, the embed cap; longer playlists "
+                        "play only their first %d", match.group(1), len(items), EMBED_TRACK_CAP)
+        else:
+            log.info("Spotify playlist %s served from embed page (%d tracks)", match.group(1), len(items))
         return {"items": items, "total": len(items), "next": None}
 
     setattr(api_cls, _PATCH_FLAG, original)
