@@ -34,6 +34,8 @@ class ParseEmbedTest(unittest.TestCase):
     def test_unparseable_page_is_empty(self):
         self.assertEqual(sp.parse_embed("<html>nothing</html>"), [])
         self.assertEqual(sp.parse_embed('<script id="__NEXT_DATA__" type="application/json">{}</script>'), [])
+        self.assertEqual(len(sp.parse_embed(embed_html([None, "x", 3] + TRACKS))), 1)  # non-object entries skipped
+        self.assertEqual(sp.parse_embed(embed_html({"not": "a list"})), [])
         null_entity = {"props": {"pageProps": {"state": {"data": {"entity": None}}}}}
         self.assertEqual(sp.parse_embed(f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(null_entity)}</script>'), [])
 

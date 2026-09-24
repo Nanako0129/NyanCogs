@@ -46,7 +46,8 @@ def _track_list(html: str) -> List[Dict[str, Any]]:
         return []
     if not isinstance(entity, dict):
         return []
-    return entity.get("trackList") or []
+    track_list = entity.get("trackList")
+    return [entry for entry in track_list if isinstance(entry, dict)] if isinstance(track_list, list) else []
 
 
 def parse_embed(html: str) -> List[Dict[str, Any]]:
