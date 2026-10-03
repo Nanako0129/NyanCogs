@@ -7,6 +7,7 @@ Cogs for [Red Discord Bot](https://github.com/Cog-Creators/Red-DiscordBot).
 | Cog | What it does |
 |---|---|
 | [ChannelSummary](#channelsummary) | Attributed channel summaries through an OpenAI-compatible LLM Agent |
+| [Learning](#learning) | Catch-up notes for technical channels: what was learned, Q&A, terms, open questions and links |
 | [MessageWatch](#messagewatch) | Reports likely scams and hostile exchanges to a moderator channel |
 | [EmbedFixer](#embedfixer) | Replaces supported social links with provider-fixed links |
 | [SpotifyPlaylist](#spotifyplaylist) | Lets Audio play Spotify playlist links again |
@@ -18,7 +19,7 @@ Traditional Chinese.
 
 ChannelSummary creates attributed Discord channel summaries through an OpenAI-
 compatible LLM Agent. It supports recent-message, explicit-start, and duration
-ranges. The Agent can search additional history only in the invocation channel
+ranges, and windows anywhere in the past. The Agent can search additional history only in the invocation channel
 and can use native OpenAI or OpenRouter web search when the selected profile
 supports it. Generic Responses and Chat/CLIProxy profiles can instead use the
 application-controlled Firecrawl cloud tools.
@@ -86,6 +87,7 @@ as `zh-TW`, `zh-Hant-TW`, or `Japanese`.
 | `/summary auto [count]` | Summarize recent messages and search backward for the natural topic start |
 | `/summary from <message>` | Summarize from an inclusive same-channel message ID or link |
 | `/summary time <duration>` | Summarize a range such as `30m`, `2h`, or `1d` |
+| `/summary range <start> [end]` | Summarize a window anywhere in the past; each end is a same-channel message link or ID, a local time `2026-10-03 21:00` (use `2026-10-03T21:00` in text commands), or a duration such as `2h` meaning that long ago |
 | `/summary settings` | Open the Manage Messages Select and Modal configuration panel |
 | `[p]summaryset show` | Show all effective guild settings |
 | `[p]summaryset set <key> <value>` | Change any documented text setting |
@@ -112,6 +114,11 @@ Messages, and Embed Links.
 
 Members with guild-level Manage Messages are exempt from the checkpoint, but the
 cooldown, quota, and concurrency limits still apply to them.
+
+A `/summary range` that reaches past the channel's checkpoint is gated and moves
+the checkpoint forward like any summary; one that ends inside already-summarized
+history skips the gate and leaves the checkpoint alone. An end in the future is
+refused. A time start is bounded by `max_duration_hours`.
 
 The Embed footer reports what the summary consumed: input and output tokens,
 reasoning tokens when the provider separates them, and the price when the
@@ -161,6 +168,12 @@ Provider retention and training are unverified. Firecrawl retention and training
 are unverified, and its credits may incur cost. After a guild manager consents,
 any channel reader may trigger these exports.
 
+Any channel reader can export a past window of up to `max_distinct_messages` messages regardless of its age;
+a window that ends inside already-summarized history skips the new-message gate and does not move the checkpoint. This is
+disclosure version 4: after updating, every guild stays disabled until a manager
+accepts again. Other cogs that use ChannelSummary (such as Learning) send the same
+data through the same provider under this consent.
+
 > ⚠️ **Firecrawl's hourly quota is shared across every guild.**
 
 The owner Firecrawl hourly quota is one process-wide shared pool; one enabled
@@ -174,6 +187,56 @@ rebinding and split-horizon behavior remain residual vendor risk.
 ChannelSummary does not persist messages, prompts, searches, provider responses,
 or summaries. The complete statement is in
 [`channelsummary/info.json`](channelsummary/info.json).
+
+## Learning
+
+Learning writes catch-up notes for members who were away from a busy technical
+channel: what could be learned, questions and their answers, terms a newcomer
+would not know, questions still open, and the links people shared. Every item
+points back at the messages it came from.
+
+It runs on ChannelSummary, reached at runtime through `bot.get_cog`. ChannelSummary
+supplies the provider, the consent, the cooldown and guild quota, the history access
+and the window bounds. Learning supplies the prompt, a strict parser for the
+model's JSON, and the Embeds.
+
+### Installation
+
+```text
+[p]cog install NyanCogs learning
+[p]load learning
+[p]learningset show
+[p]learningset enable I_ACCEPT
+```
+
+ChannelSummary must be loaded and enabled in the server first. Learning is off in a
+server until a member with guild-level Manage Messages accepts its own disclosure.
+
+### Commands
+
+| Command | Purpose |
+|---|---|
+| `/learning recent <6h\|1d> [ended_ago]` | Notes for the last hours or days; `ended_ago` (also hours or days) ends the window that long ago |
+| `/learning since-me` | Notes for everything said in this channel since your own last message |
+| `[p]learningset show` / `enable I_ACCEPT` / `disable` | Review the disclosure, enable, or disable (guild-level Manage Messages) |
+
+Windows are bounded by ChannelSummary's `max_duration_hours` and message limits.
+There is no new-message gate, and Learning never moves ChannelSummary's checkpoint.
+
+### Links
+
+Shared links come only from the messages themselves. The application extracts
+each URL that members posted, validates it, and numbers it. The model can only
+pick links by number, and the Embed shows each link's punycode host and the
+member who posted it. Text the model writes has every link and non-author mention
+removed. A URL with a non-printable character, such as a right-to-left override,
+is dropped rather than repaired.
+
+### Privacy
+
+Learning sends what a ChannelSummary summary sends, through the same provider, and
+stores only its enable flag and the accepted disclosure version. See
+[`learning/info.json`](learning/info.json).
 
 ## MessageWatch
 

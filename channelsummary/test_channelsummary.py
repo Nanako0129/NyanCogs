@@ -3563,7 +3563,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             "2026/08/14 21:02–21:36 Asia/Taipei｜model: gpt-5.6-luna｜effort: high",
         )
 
-    def test_cross_day_footer_keeps_the_exact_single_date_shape(self) -> None:
+    def test_cross_day_footer_names_both_dates(self) -> None:
         first = FakeMessage(111111111111111111, 444444444444444444, "first", 2)
         second = FakeMessage(222222222222222222, 555555555555555555, "second", 10)
         first.created_at = datetime(2026, 8, 13, 13, 2, tzinfo=UTC)
@@ -3573,7 +3573,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
         footer = ChannelSummary._footer(settings, state, {first.id, second.id}, "model-1")
         self.assertEqual(
             footer.splitlines()[1],
-            "2026/08/13 21:02–21:10 Asia/Taipei｜model: model-1｜effort: medium",
+            "2026/08/13 21:02–2026/08/14 21:10 Asia/Taipei｜model: model-1｜effort: medium",
         )
 
     def test_embed_has_trigger_author_validated_mentions_and_cog_links(self) -> None:
@@ -3778,7 +3778,7 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
 
     def test_command_tree_exposes_all_surfaces(self) -> None:
         root = ChannelSummary.summary_group
-        self.assertEqual({item.name for item in root.commands}, {"auto", "from", "time", "settings", "provider", "help"})
+        self.assertEqual({item.name for item in root.commands}, {"auto", "from", "time", "range", "settings", "provider", "help"})
         settings = next(item for item in root.commands if item.name == "settings")
         self.assertIsNotNone(settings.app_command.callback)
         self.assertEqual(
@@ -4553,14 +4553,14 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.policy, help_text)
         self.assertIn(self.warning, help_text)
 
-    async def test_v2_is_gated_and_manage_messages_acceptance_records_v3(self) -> None:
+    async def test_v3_is_gated_and_manage_messages_acceptance_records_v4(self) -> None:
         cog = object.__new__(ChannelSummary)
         scope = MagicMock()
         scope.all = AsyncMock(
             return_value={
                 **GUILD_DEFAULTS,
                 "enabled": True,
-                "disclosure_version": 2,
+                "disclosure_version": 3,
                 "provider_profile": "main",
                 "model": "model-1",
             }
@@ -4594,11 +4594,11 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
         }
         await cog.enable_guild(SimpleNamespace())
         scope.disclosure_version.set.assert_awaited_once_with(DISCLOSURE_VERSION)
-        self.assertEqual(DISCLOSURE_VERSION, 3)
+        self.assertEqual(DISCLOSURE_VERSION, 4)
         scope.enabled.set.assert_awaited_once_with(True)
 
     def test_retry_adds_only_the_specific_public_error_without_migrating_disclosure(self) -> None:
-        self.assertEqual(DISCLOSURE_VERSION, 3)
+        self.assertEqual(DISCLOSURE_VERSION, 4)
         self.assertEqual(set(PUBLIC_ERRORS), set(ErrorCode))
         self.assertNotIn("PROVIDER_IMAGE_FETCH_TIMEOUT", {code.value for code in ErrorCode})
 
@@ -4638,6 +4638,7 @@ class TestHttpDisclosure(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("re-encodes it, then sends those bytes inline", normalized)
                 self.assertIn("no Discord CDN URL leaves this bot", normalized)
                 self.assertIn("EXIF metadata such as camera GPS is discarded", normalized)
+                self.assertIn("past window of up to `max_distinct_messages` messages regardless of its age", normalized)
                 self.assertIn("up to 20 stateless turns", normalized)
                 self.assertIn("retention and training are unverified", normalized)
                 self.assertIn("at most 5 Firecrawl calls", normalized)
@@ -4708,3 +4709,362 @@ class TestSetup(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def stamped(hours_ago: float, user_id: int, content: str = "message", *, now: datetime | None = None) -> FakeMessage:
+    """A FakeMessage whose ID is a real snowflake for its timestamp, as time bounds need."""
+    created = (now or datetime.now(UTC)) - timedelta(hours=hours_ago)
+    message = FakeMessage(discord.utils.time_snowflake(created), user_id, content, 0)
+    message.created_at = created
+    return message
+
+
+class TestRangesAndJobs(unittest.IsolatedAsyncioTestCase):
+    GUILD = 123456789012345678
+    CHANNEL = 987654321098765432
+
+    def endpoint(self, text: str, now: datetime) -> int | datetime:
+        from zoneinfo import ZoneInfo
+
+        return channelsummary_module.parse_endpoint(text, self.GUILD, self.CHANNEL, ZoneInfo("Asia/Taipei"), now)
+
+    def test_endpoint_parser_accepts_links_local_times_and_durations(self) -> None:
+        now = datetime(2026, 10, 4, 12, 0, tzinfo=UTC)  # 20:00 in Taipei
+        link = f"https://discord.com/channels/{self.GUILD}/{self.CHANNEL}/333333333333333333"
+        cases = {
+            "2026-10-03 21:00": datetime(2026, 10, 3, 13, 0, tzinfo=UTC),
+            "2026-10-03T21:00": datetime(2026, 10, 3, 13, 0, tzinfo=UTC),
+            "10-03 21:00": datetime(2026, 10, 3, 13, 0, tzinfo=UTC),
+            # Later in the year than today means last year, not a future time.
+            "12-31 23:00": datetime(2025, 12, 31, 15, 0, tzinfo=UTC),
+            "2h": now - timedelta(hours=2),
+            " 1d ": now - timedelta(days=1),
+            link: 333333333333333333,
+            "333333333333333333": 333333333333333333,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(self.endpoint(text, now), expected)
+
+    def test_endpoint_parser_refuses_future_impossible_and_foreign_endpoints(self) -> None:
+        now = datetime(2026, 10, 4, 12, 0, tzinfo=UTC)
+        for text in (
+            "2026-10-04 21:00",  # one hour ahead in Taipei
+            "2026-02-30 10:00",
+            "0m",
+            "99999999d",
+            f"https://discord.com/channels/{self.GUILD}/111111111111111111/333333333333333333",
+            "yesterday",
+            "2014-06-01 00:00",  # before Discord's epoch: the snowflake bound would go negative
+            "5000d",
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.endpoint(text, now)
+
+    def test_shared_links_are_validated_numbered_and_never_spoofed(self) -> None:
+        message = FakeMessage(
+            100000000000000001,
+            444444444444444444,
+            "docs https://docs.python.org/3/library/asyncio.html#tasks, also **https://pypi.org/project/x/** "
+            "and [https://docs.python.org/](https://evil.com/login) "
+            "https://evil‮com.moc/ https://exa​mple.com/ https://good.com\\@evil.net/ "
+            "https://user@pypi.org/ http://192.168.1.1/ https://bücher.de/ https://docs.python.org/3/library/asyncio.html#tasks "
+            # The fragment is not checked by validate_public_url, so it needs its own refusal.
+            "https://pypi.org/#a\u202eb",
+            1,
+        )
+        message.embeds = [SimpleNamespace(url="https://github.com/a/b"), SimpleNamespace(url=None)]
+        links = channelsummary_module.extract_links([message])
+        self.assertEqual(
+            [(link.link_id, link.url, link.host) for link in links],
+            [
+                ("L1", "https://docs.python.org/3/library/asyncio.html#tasks", "docs.python.org"),
+                ("L2", "https://pypi.org/project/x/", "pypi.org"),
+                ("L3", "https://docs.python.org/", "docs.python.org"),
+                ("L4", "https://evil.com/login", "evil.com"),
+                # The backslash ends the URL: what is shown is where it goes.
+                ("L5", "https://good.com", "good.com"),
+                ("L6", "https://bücher.de/", "xn--bcher-kva.de"),
+                ("L7", "https://github.com/a/b", "github.com"),
+            ],
+        )
+        self.assertTrue(all(link.message_id == message.id and link.author_id == 444444444444444444 for link in links))
+
+    def test_shared_links_stop_at_the_table_limit(self) -> None:
+        message = FakeMessage(
+            100000000000000001, 1, " ".join(f"https://site{index}.com/" for index in range(40)), 1
+        )
+        links = channelsummary_module.extract_links([message])
+        self.assertEqual(len(links), channelsummary_module.MAX_SHARED_LINKS)
+        self.assertEqual(links[-1].link_id, f"L{channelsummary_module.MAX_SHARED_LINKS}")
+
+    def window_fixture(self) -> tuple[ChannelSummary, FakeChannel, list[FakeMessage], dict]:
+        now = datetime.now(UTC)
+        messages = [stamped(hours, 444444444444444444 if hours % 2 else 555555555555555555, now=now) for hours in (5, 4, 3, 2, 1)]
+        channel = FakeChannel(messages)
+        channel.id = self.CHANNEL
+        channel.guild = SimpleNamespace(id=self.GUILD)
+        settings = {**GUILD_DEFAULTS, "timezone": "UTC", "max_duration_hours": 24}
+        return object.__new__(ChannelSummary), channel, messages, settings
+
+    async def resolve(self, cog, channel, settings, newest, **kwargs):
+        defaults = {"start": None, "end": None, "since_author": False, "invocation_id": None}
+        return await cog._resolve_window(channel, 444444444444444444, settings, newest, 7, **{**defaults, **kwargs})
+
+    async def test_window_end_bounds_the_snapshot_and_marks_it_past(self) -> None:
+        cog, channel, messages, settings = self.window_fixture()
+        snapshot, inspected, lower = await self.resolve(cog, channel, settings, messages[-1], start="270m", end="90m")
+        self.assertEqual(snapshot.id, messages[3].id)  # the 2h-old message, newest before 90 minutes ago
+        self.assertEqual(inspected, 7 + 1)  # both snapshot scans count against the history budget
+        self.assertFalse(lower[1])
+        self.assertLess(messages[0].id, lower[0])
+        self.assertLessEqual(lower[0], messages[1].id)
+        state = await cog._base_messages(channel, snapshot, settings, "range", lower, None, inspected)
+        self.assertEqual(set(state.messages), {messages[1].id, messages[2].id, messages[3].id})
+        self.assertEqual(state.hard_start_id, lower[0])
+
+    async def test_window_end_at_or_after_newest_keeps_the_newest_snapshot(self) -> None:
+        cog, channel, messages, settings = self.window_fixture()
+        snapshot, inspected, _ = await self.resolve(cog, channel, settings, messages[-1], start="4h", end="1m")
+        self.assertIs(snapshot, messages[-1])
+        self.assertEqual(inspected, 7)
+        future = (datetime.now(UTC) + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await self.resolve(cog, channel, settings, messages[-1], start="4h", end=future)
+        self.assertIn("future", str(caught.exception))
+
+    async def test_window_time_start_is_capped_and_message_start_is_required(self) -> None:
+        cog, channel, messages, settings = self.window_fixture()
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            # Measured to the snapshot (1h old), so 26h back spans 25h against a 24h cap.
+            await self.resolve(cog, channel, settings, messages[-1], start="26h")
+        self.assertIn("duration limit", str(caught.exception))
+        _, _, lower = await self.resolve(cog, channel, settings, messages[-1], start=str(messages[1].id))
+        self.assertEqual(lower, (messages[1].id, True))
+        with self.assertRaises(commands.UserFeedbackCheckFailure):
+            await self.resolve(cog, channel, settings, messages[2], start=str(messages[-1].id))
+
+    async def test_since_me_starts_at_the_members_last_message(self) -> None:
+        cog, channel, messages, settings = self.window_fixture()
+        # 444... wrote the 5h, 3h and 1h messages; the newest is theirs.
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await self.resolve(cog, channel, settings, messages[-1], since_author=True)
+        self.assertIn("since your last message", str(caught.exception))
+        channel.messages = messages[:-1]
+        _, inspected, lower = await self.resolve(cog, channel, settings, messages[3], since_author=True)
+        self.assertEqual(lower, (messages[2].id, True))
+        self.assertEqual(inspected, 7 + 2)  # the since-me scan counts against the history budget
+        channel.messages = [messages[1], messages[3]]
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await self.resolve(cog, channel, settings, messages[3], since_author=True)
+        self.assertIn("No message of yours", str(caught.exception))
+
+    def execution_fixture(self, *, provider_calls: int = 1):
+        cog = object.__new__(ChannelSummary)
+        cog._channel_locks = __import__("collections").defaultdict(asyncio.Lock)
+        cog._guild_semaphores = {}
+        cog._user_attempts = {}
+        settings = {
+            **GUILD_DEFAULTS,
+            "enabled": True,
+            "disclosure_version": DISCLOSURE_VERSION,
+            "provider_profile": "main",
+            "model": "model-1",
+            "web_enabled": False,
+        }
+        guild_scope = MagicMock()
+        guild_scope.all = AsyncMock(return_value=settings)
+        channel_scope = MagicMock()
+        channel_scope.checkpoint_message_id.set = AsyncMock()
+        channel_scope.checkpoint_timestamp.set = AsyncMock()
+        cog.config = MagicMock()
+        cog.config.guild.return_value = guild_scope
+        cog.config.channel.return_value = channel_scope
+        cog.get_profile = AsyncMock(return_value=profile("generic_responses"))
+        cog.get_api_key = AsyncMock(return_value="provider-secret")
+        cog._select_web_backend = AsyncMock(return_value=("off", None))
+        snapshot = FakeMessage(333333333333333333, 444444444444444444, "snapshot", 36)
+        cog._snapshot_message = AsyncMock(return_value=(snapshot, 1))
+        cog._checkpoint_ready = AsyncMock(return_value=True)
+        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot}, provider_calls=provider_calls)
+        cog._base_messages = AsyncMock(return_value=state)
+        cog._reserve_guild_attempt = AsyncMock(return_value=123.0)
+        cog._release_guild_attempt = AsyncMock()
+        cog._run_agent = AsyncMock(return_value=("result", (), "model-1"))
+        cog._render_embeds = MagicMock(return_value=[discord.Embed(description="summary")])
+        progress = MagicMock()
+        progress.edit = AsyncMock()
+        progress.delete = AsyncMock()
+        progress.jump_url = "https://discord.com/channels/1/2/3"
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = self.CHANNEL
+        channel.send = AsyncMock(return_value=progress)
+        channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True, read_message_history=True, send_messages=True,
+            send_messages_in_threads=False, embed_links=True,
+        )
+        ctx = MagicMock()
+        ctx.guild = SimpleNamespace(id=self.GUILD, me=object())
+        ctx.channel = channel
+        ctx.author = SimpleNamespace(id=444444444444444444, guild_permissions=SimpleNamespace(manage_messages=False))
+        ctx.message = SimpleNamespace(id=888888888888888888)
+        ctx.interaction = None
+        ctx.send = AsyncMock()
+        return cog, ctx, snapshot, state, channel_scope
+
+    async def test_range_is_gated_exactly_when_it_reaches_past_the_checkpoint(self) -> None:
+        # stored checkpoint -> whether the range must pass the gate and moves the checkpoint
+        cases = {0: True, 333333333333333332: True, 333333333333333333: False, 333333333333333399: False}
+        for stored, gated in cases.items():
+            with self.subTest(stored=stored):
+                cog, ctx, snapshot, _, channel_scope = self.execution_fixture()
+                channel_scope.checkpoint_message_id = AsyncMock(return_value=stored)
+                channel_scope.checkpoint_message_id.set = AsyncMock()
+                cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id, True)))
+                await cog._execute_summary(ctx, "range", ("2h", "1h"))
+                self.assertEqual(cog._resolve_window.await_args.kwargs["start"], "2h")
+                self.assertEqual(cog._resolve_window.await_args.kwargs["end"], "1h")
+                self.assertEqual(cog._checkpoint_ready.await_count, int(gated))
+                if gated:
+                    channel_scope.checkpoint_message_id.set.assert_awaited_once_with(snapshot.id)
+                else:
+                    channel_scope.checkpoint_message_id.set.assert_not_awaited()
+                # A message start keeps from-mode's explicit opener.
+                self.assertEqual(cog._run_agent.await_args.args[5], "from")
+                self.assertEqual(cog._base_messages.await_args.args[3], "range")
+
+    def job(self, **overrides):
+        values = {
+            "name": "筆記",
+            "instructions": "Return JSON.",
+            "finalize": lambda text, state: text,
+            "render": lambda *args: [discord.Embed(description="job")],
+            "start": "2h",
+            "include_links": True,
+        }
+        return ChannelSummary.ChannelJob(**{**values, **overrides})
+
+    async def test_job_runs_under_the_shared_controls_without_touching_the_checkpoint(self) -> None:
+        cog, ctx, snapshot, state, channel_scope = self.execution_fixture()
+        cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id - 5, False)))
+        job = self.job()
+        self.assertTrue(await cog.run_channel_job(ctx, job))
+        cog._checkpoint_ready.assert_not_awaited()
+        channel_scope.checkpoint_message_id.set.assert_not_awaited()
+        cog._reserve_guild_attempt.assert_awaited_once()
+        self.assertIn((ctx.guild.id, ctx.author.id), cog._user_attempts)
+        self.assertEqual(cog._run_agent.await_args.args[5], "job")
+        self.assertIs(cog._run_agent.await_args.kwargs["job"], job)
+        self.assertEqual(cog._base_messages.await_args.args[3:5], ("range", (snapshot.id - 5, False)))
+        self.assertTrue(state.include_links)
+        cog._render_embeds.assert_not_called()
+        self.assertIn("筆記", ctx.channel.send.await_args.args[0])
+
+    async def test_job_render_failure_is_fixed_refunded_and_never_logs_provider_text(self) -> None:
+        cog, ctx, snapshot, _, _ = self.execution_fixture(provider_calls=0)
+        cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id, True)))
+
+        def render(*args):
+            raise ValueError("SECRET provider text")
+
+        with self.assertLogs("red.nyancogs.channelsummary", logging.WARNING) as logs:
+            with self.assertRaises(SummaryError) as caught:
+                await cog._execute_summary(ctx, "job", job=self.job(render=render))
+        self.assertEqual(caught.exception.code, ErrorCode.RESPONSE_INVALID)
+        self.assertEqual(caught.exception.reason.value, "render_failed")
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn("SECRET", " ".join(logs.output))
+        self.assertNotIn("SECRET", str(caught.exception))
+        cog._release_guild_attempt.assert_awaited_once_with(ctx.guild.id, 123.0)
+        self.assertEqual(cog._user_attempts, {})
+
+    async def test_job_finalize_failure_is_a_fixed_invalid_response(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cog.request_provider = AsyncMock(
+            return_value=NormalizedResponse("not json", None, (), (), "model-1", 0)
+        )
+        snapshot = FakeMessage(333333333333333333, 444444444444444444, "snapshot", 36)
+        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
+
+        def finalize(text, state):
+            raise ValueError(f"SECRET {text}")
+
+        with self.assertRaises(SummaryError) as caught:
+            await cog._run_agent(
+                SimpleNamespace(id=self.GUILD), FakeChannel([snapshot]), profile("openai_responses"),
+                {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False}, state, "job", None,
+                job=self.job(finalize=finalize),
+            )
+        self.assertEqual(caught.exception.reason.value, "finalize_failed")
+        self.assertNotIn("SECRET", str(caught.exception))
+        system = cog.request_provider.await_args.args[1]
+        self.assertIn("application_link", json.dumps(system))
+        self.assertIn("Return JSON.", json.dumps(system))
+
+    async def test_job_history_tool_stays_inside_the_window(self) -> None:
+        now = datetime.now(UTC)
+        older, inside, snapshot = (stamped(hours, 444444444444444444, now=now) for hours in (3, 2, 1))
+        channel = FakeChannel([older, inside, snapshot])
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        args = (
+            '{"query":"","author_id":"","before_message_id":"","after_message_id":"",'
+            '"start_unix":0,"end_unix":0,"limit":10}'
+        )
+        cog.request_provider = AsyncMock(
+            side_effect=[
+                NormalizedResponse(None, None, (FunctionCall("c1", "search_channel_history", args),), (), "m", 0),
+                NormalizedResponse("done", None, (), (), "m", 0),
+            ]
+        )
+        lower = discord.utils.time_snowflake(now - timedelta(hours=2, minutes=30))
+        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot}, hard_start_id=lower)
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=self.GUILD), channel, profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False}, state, "job", None,
+            job=self.job(finalize=lambda text, state: set(state.messages)),
+        )
+        self.assertEqual(result, {inside.id, snapshot.id})
+
+    async def test_job_finalize_receives_the_json_without_a_markdown_fence(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cog.request_provider = AsyncMock(
+            return_value=NormalizedResponse('```json \n{"a": 1}\n```', None, (), (), "m", 0)
+        )
+        snapshot = FakeMessage(333333333333333333, 444444444444444444, "snapshot", 36)
+        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=self.GUILD), FakeChannel([snapshot]), profile("openai_responses"),
+            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False}, state, "job", None,
+            job=self.job(finalize=lambda text, state: json.loads(text)),
+        )
+        self.assertEqual(result, {"a": 1})
+
+    async def test_run_channel_job_answers_every_failure_itself(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cog._send_plain = AsyncMock()
+        ctx = MagicMock()
+        failures = (
+            (SummaryError(ErrorCode.NOT_CONFIGURED), PUBLIC_ERRORS[ErrorCode.NOT_CONFIGURED]),
+            (commands.CommandOnCooldown(commands.Cooldown(1, 60), 42.0, commands.BucketType.user), "42 seconds"),
+            (commands.UserFeedbackCheckFailure("A summary is already running in this channel."), "already running"),
+        )
+        for error, text in failures:
+            with self.subTest(error=type(error).__name__):
+                cog._execute_summary = AsyncMock(side_effect=error)
+                self.assertFalse(await cog.run_channel_job(ctx, self.job()))
+                self.assertIn(text, cog._send_plain.await_args.args[1])
+
+    async def test_channel_lock_refuses_a_job_beside_a_running_summary(self) -> None:
+        cog, ctx, *_ = self.execution_fixture()
+        cog._send_plain = AsyncMock()
+        async with cog._channel_locks[ctx.channel.id]:
+            self.assertFalse(await cog.run_channel_job(ctx, self.job()))
+        self.assertIn("already running", cog._send_plain.await_args.args[1])
+
+    def test_api_surface_is_reachable_through_the_cog(self) -> None:
+        self.assertEqual(ChannelSummary.CORE_API_VERSION, 1)
+        for name in ("ChannelJob", "run_channel_job", "extract_links", "sanitize_text", "split_embed_text", "footer"):
+            self.assertTrue(hasattr(ChannelSummary, name), name)

@@ -7,6 +7,7 @@
 | Cog | 功能說明 |
 |---|---|
 | [ChannelSummary](#channelsummary) | 透過相容 OpenAI 介面的 LLM Agent 產生存有出處引註的頻道摘要 |
+| [Learning](#learning) | 技術頻道的補課筆記：學到什麼、問與答、名詞、未解問題與參考連結 |
 | [MessageWatch](#messagewatch) | 監控並向管理頻道通報疑似詐騙與敵意衝突的對話 |
 | [EmbedFixer](#embedfixer) | 將支援的社群平台連結替換為第三方修復後的預覽連結 |
 | [SpotifyPlaylist](#spotifyplaylist) | 讓 Audio 重新能播 Spotify 歌單連結 |
@@ -66,6 +67,7 @@ HTTP 傳輸僅限於 RFC1918、IPv6 ULA 或 loopback 目標位址。使用 HTTP 
 | `/summary auto [count]` | 摘要近期訊息，並自動向後搜尋自然的討論主題起點 |
 | `/summary from <message>` | 從指定的同頻道訊息 ID 或連結開始摘要（含該起點訊息） |
 | `/summary time <duration>` | 摘要指定時間區間內的訊息，如 `30m`、`2h` 或 `1d` |
+| `/summary range <start> [end]` | 摘要過去任一段區間；起訖點可以是同頻道訊息連結或 ID、伺服器時區的時間 `2026-10-03 21:00`（文字指令請寫成 `2026-10-03T21:00`），或 `2h` 這類「多久以前」 |
 | `/summary settings` | 開啟具備「管理訊息」權限者使用的選單與 Modal 設定面板 |
 | `[p]summaryset show` | 顯示該伺服器目前生效的所有設定 |
 | `[p]summaryset set <key> <value>` | 修改任何已記載於說明的文字設定項 |
@@ -87,6 +89,8 @@ HTTP 傳輸僅限於 RFC1918、IPv6 ULA 或 loopback 目標位址。使用 HTTP 
 | 單一頻道新訊息檢查點 | 成功產生摘要後，該頻道必須累積 20 則真人新訊息才能再次執行摘要 |
 
 具備伺服器層級「管理訊息」權限的成員不受檢查點限制，但仍受冷卻時間、配額與並行上限約束。
+
+`/summary range` 的終點如果超過頻道的檢查點，就和一般摘要一樣要過新訊息門檻，成功後把檢查點往前推；整段都落在已摘要範圍內的區間則不檢查門檻，也不移動檢查點。終點不能是未來的時間。以時間當起點時，區間長度受 `max_duration_hours` 限制。
 
 Embed 頁尾會列出該次摘要消耗的資源：input 與 output tokens，若 provider 有分開提供則包含 reasoning tokens，以及 provider 回傳的花費金額。OpenRouter 會回傳金額；OpenAI 則不會，且系統不會自本機計價表推算費用。
 
@@ -121,6 +125,8 @@ Embed 頁尾會列出該次摘要消耗的資源：input 與 output tokens，若
 
 供應商端對資料的保留與訓練政策尚未取得驗證。Firecrawl 的資料保留與訓練政策同樣未經驗證，且其點數可能產生費用。伺服器管理者同意後，凡具備頻道讀取權限者皆可觸發這些資料匯出。
 
+任何頻道讀者都能匯出過去任一段最多 `max_distinct_messages` 則訊息的區間，不論訊息多舊；終點落在已摘要範圍內的區間不檢查新訊息門檻，也不移動檢查點。這是揭露條款第 4 版：更新後，每個伺服器都會維持停用，直到管理者重新同意。使用 ChannelSummary 的其他 cog（例如 Learning）也在這份同意下，經同一個 provider 送出相同的資料。
+
 > ⚠️ **所有伺服器共用 Firecrawl 的每小時配額。**
 
 Bot owner 的 Firecrawl 每小時配額為全行程（process-wide）共用資源池；單一啟用的伺服器即可能耗盡所有伺服器的 Firecrawl 配額與支出額度；伺服器請求配額並非 owner 端的 Firecrawl 預算控管機制。重啟行程會清空記憶體中的資源池計數，而運行多個行程則會倍增此上限。
@@ -128,6 +134,41 @@ Bot owner 的 Firecrawl 每小時配額為全行程（process-wide）共用資�
 信任 Firecrawl 雲端服務能妥善控管目標 DNS、重新導向與 SSRF；DNS rebinding 與 split-horizon 行為仍屬殘留的廠商端風險。
 
 ChannelSummary 不會持久化儲存訊息、prompt、搜尋內容、provider 回應或摘要結果。完整聲明請參閱 [`channelsummary/info.json`](channelsummary/info.json)。
+
+## Learning
+
+Learning 替離開一陣子、跟不上技術討論的成員整理補課筆記。筆記分成幾類：能學到的重點、問與答、新手可能不懂的名詞、還沒解決的問題，以及大家分享的連結。每一項都附上回到原訊息的跳轉連結。
+
+Learning 透過 `bot.get_cog` 在執行期呼叫 ChannelSummary。Provider、使用者同意、冷卻與配額、讀取歷史訊息和範圍界線都由 ChannelSummary 負責。Learning 只負責 prompt、模型 JSON 的嚴格解析，以及 Embed 的呈現。
+
+### 安裝方式
+
+```text
+[p]cog install NyanCogs learning
+[p]load learning
+[p]learningset show
+[p]learningset enable I_ACCEPT
+```
+
+伺服器必須先載入並啟用 ChannelSummary。之後還要由具備伺服器層級「管理訊息」權限的成員同意 Learning 自己的揭露條款，Learning 才會開啟。
+
+### 指令列表
+
+| 指令 | 用途 |
+|---|---|
+| `/learning recent <6h\|1d> [ended_ago]` | 整理最近幾小時或幾天的筆記；`ended_ago` 同樣以小時或天為單位，讓區間停在那麼久以前 |
+| `/learning since-me` | 整理你在這個頻道最後一則訊息之後的所有討論 |
+| `[p]learningset show` / `enable I_ACCEPT` / `disable` | 檢視揭露條款、啟用或停用（需伺服器層級「管理訊息」權限） |
+
+區間受 ChannelSummary 的 `max_duration_hours` 與訊息數上限約束。Learning 沒有新訊息門檻，也不會移動 ChannelSummary 的檢查點。
+
+### 連結
+
+參考連結只來自訊息本身。程式先從成員貼出的訊息中抽出網址，驗證後編號，模型只能用編號挑選。Embed 會顯示每個連結的 punycode 網域，以及貼出它的成員。模型寫的文字一律移除連結與非發言者的 mention。網址裡如果有不可列印的字元（例如右至左覆寫符號），整個網址會被丟棄，不會嘗試修復。
+
+### 隱私
+
+Learning 送出的資料與 ChannelSummary 摘要相同，經由同一個 provider，本身只儲存是否啟用與已同意的揭露版本。完整聲明請參閱 [`learning/info.json`](learning/info.json)。
 
 ## MessageWatch
 
