@@ -1,0 +1,23 @@
+{
+    "name": "Learning",
+    "author": [
+        "Nyanako"
+    ],
+    "short": "Catch-up notes for technical channels: what was learned, Q&A, terms, open questions and links.",
+    "description": "For members who were away from a busy technical channel. /learning recent 6h or /learning since-me returns notes of what could be learned: takeaways, answered questions, terms, open questions and the links members shared, each pointing back at the messages. Runs on ChannelSummary, which supplies the provider, consent, limits and history access.",
+    "install_msg": "ChannelSummary must be loaded and enabled in the server first. Load with `[p]load learning`, have a manager read `[p]learningset show`, then run `[p]learningset enable I_ACCEPT`.",
+    "tags": [
+        "llm",
+        "summary",
+        "learning",
+        "utility"
+    ],
+    "min_bot_version": "3.5.24",
+    "min_python_version": [
+        3,
+        11,
+        0
+    ],
+    "requirements": [],
+    "end_user_data_statement": "This cog stores only, per guild, whether Learning is enabled and which version of its disclosure a manager accepted. It stores no message content, prompts, model responses, notes or user data, so a Red data deletion request has nothing to remove here. Learning runs through the ChannelSummary cog and sends what a ChannelSummary summary sends, through ChannelSummary's configured LLM provider: selected Discord message text, stable user and message IDs, timestamps, reply and embed metadata; when ChannelSummary's image setting is on, downscaled and re-encoded image bytes with EXIF removed; and in Firecrawl mode, Discord-derived search queries and fetch URLs sent to Firecrawl. It runs only while ChannelSummary is enabled in the guild under ChannelSummary's own consent, and only after a guild manager has also accepted Learning's disclosure. Any channel reader can then request notes for the last hours or days up to ChannelSummary's max_duration_hours, for a window ending in the past, or since their own last message; there is no new-message gate, so the same window can be requested again, limited by ChannelSummary's cooldown and guild quota, which Learning shares. URLs that members posted are re-published as clickable links in the bot's Embed, each shown with the member who posted it. Cooldown timestamps are held and deleted by ChannelSummary. Provider retention and training are unverified."
+}
