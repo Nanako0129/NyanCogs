@@ -9,12 +9,13 @@ from __future__ import annotations
 import json
 import re
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
-from channelsummary.channelsummary import GUILD_DEFAULTS, ChannelSummary, Citation, RunState
+from channelsummary.channelsummary import GUILD_DEFAULTS, ChannelSummary, Citation, RunState, extract_links
 from channelsummary.test_channelsummary import FakeMessage
 from learning import learning as lr
 
@@ -46,7 +47,9 @@ def notes_json(**overrides) -> str:
 def run_state() -> RunState:
     ask = FakeMessage(ASK, ALICE, "how do I cancel a TaskGroup?", 1)
     answer = FakeMessage(ANSWER, BOB, "see https://docs.python.org/3/library/asyncio-task.html#task-groups", 2)
-    return RunState(ANSWER, {ASK, ANSWER}, {ASK: ask, ANSWER: answer})
+    state = RunState(ANSWER, {ASK, ANSWER}, {ASK: ask, ANSWER: answer})
+    state.links = extract_links([ask, answer])
+    return state
 
 
 class ParseNotesTest(unittest.TestCase):
@@ -64,12 +67,20 @@ class ParseNotesTest(unittest.TestCase):
         self.assertEqual(notes.links, (("L1", "docs"),))
         self.assertFalse(notes.empty)
 
+    def test_a_list_over_its_cap_is_cut_not_fatal(self):
+        notes = lr.parse_notes(
+            notes_json(open_questions=[{"question": f"q{index}", "source_message_ids": []} for index in range(9)]),
+            {ASK, ANSWER},
+            {"L1"},
+        )
+        self.assertEqual([question for question, _ in notes.open_questions], [f"q{index}" for index in range(8)])
+
     def test_malformed_output_is_rejected(self):
         bad = {
             "extra root key": notes_json(extra=1),
             "extra item key": notes_json(glossary=[{"term": "a", "definition": "b", "source_message_ids": [], "url": "x"}]),
             "oversize text": notes_json(overview="x" * 2_001),
-            "too many items": notes_json(open_questions=[{"question": "q", "source_message_ids": []}] * 9),
+            "far too many items": notes_json(open_questions=[{"question": "q", "source_message_ids": []}] * 101),
             "non-string link id": notes_json(links=[{"link_id": 1, "note": "n"}]),
             "boolean id": notes_json(open_questions=[{"question": "q", "source_message_ids": [True]}]),
             "not json": "notes: none",
@@ -143,6 +154,65 @@ class RenderNotesTest(unittest.TestCase):
         self.assertIn("實際引用 3 則", embeds[0].footer.text)
 
 
+class MergeInputTest(unittest.TestCase):
+    def test_parts_are_shrunk_from_their_largest_list_and_cite_only_what_remains(self):
+        notes = lr.Notes(
+            "Overview.",
+            tuple((f"T{index}", "d" * 300, (ASK + index,)) for index in range(10)),
+            (("Q?", "A.", ASK, (ANSWER,)),),
+            (("term", "def", (ANSWER,)),),
+            (),
+            (("L1", "docs"),),
+        )
+        full, ids, links = lr.merge_input(notes, 100_000)
+        self.assertEqual(len(full["takeaways"]), 10)
+        self.assertIn(ASK + 9, ids)
+        self.assertEqual(links, {"L1"})
+        small, ids, _ = lr.merge_input(notes, 1_500)
+        self.assertLessEqual(len(json.dumps(small, ensure_ascii=False, separators=(",", ":"))), 1_500)
+        self.assertLess(len(small["takeaways"]), 10)
+        self.assertEqual(small["takeaways"], full["takeaways"][: len(small["takeaways"])])  # dropped from the end
+        self.assertNotIn(ASK + 9, ids)
+        with self.assertRaises(ValueError):
+            lr.merge_input(notes, 10)
+
+    def test_merged_notes_round_trip_through_the_parser(self):
+        notes = lr.parse_notes(notes_json(), {ASK, ANSWER}, {"L1"})
+        data, ids, links = lr.merge_input(notes, 100_000)
+        self.assertEqual(lr.parse_notes(json.dumps(data), ids, links), notes)
+
+
+class WindowLinksTest(unittest.TestCase):
+    def test_a_link_from_a_later_part_renders_its_own_url_and_poster(self):
+        first = FakeMessage(ASK, ALICE, "see https://first.example.org/a", 1)
+        second = FakeMessage(ANSWER, BOB, "see https://second.example.org/b", 2)
+        state = RunState(ANSWER, {ASK, ANSWER}, {ASK: first, ANSWER: second})
+        state.links = extract_links([first, second])  # numbered once over the window: L1 first, L2 second
+        notes = lr.Notes("o", (), (), (), (), (("L2", "the second one"),))
+        core = object.__new__(ChannelSummary)
+        embeds = lr.render_notes(
+            core, SimpleNamespace(id=GUILD), SimpleNamespace(id=CHANNEL, name="c"), SimpleNamespace(display_name="r"),
+            {**GUILD_DEFAULTS, "model": "m"}, state, notes, (), "m",
+        )
+        text = embeds[0].description
+        self.assertIn("(https://second.example.org/b)", text)
+        self.assertIn(f"<@{BOB}>", text)
+        self.assertNotIn("first.example.org", text)
+
+
+class DisclosureTest(unittest.TestCase):
+    def test_every_place_states_the_long_window_terms(self):
+        root = Path(__file__).resolve().parents[1]
+        info = json.loads((root / "learning" / "info.json").read_text(encoding="utf-8"))["end_user_data_statement"]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        for text in (lr.LEARNING_DISCLOSURE_TEXT, info, readme):
+            normalized = " ".join(text.split())
+            for phrase in ("job_max_messages", "job_max_chunks", "merging request", "max_images"):
+                with self.subTest(phrase=phrase, place=normalized[:30]):
+                    self.assertIn(phrase, normalized)
+            self.assertNotIn("everything since", normalized)
+
+
 class LearningCommandTest(unittest.IsolatedAsyncioTestCase):
     def cog(self, *, core=None, enabled=True):
         bot = MagicMock()
@@ -166,7 +236,7 @@ class LearningCommandTest(unittest.IsolatedAsyncioTestCase):
 
     def core(self):
         core = MagicMock()
-        core.CORE_API_VERSION = 1
+        core.CORE_API_VERSION = 2
         core.ChannelJob = ChannelSummary.ChannelJob
         core.run_channel_job = AsyncMock(return_value=True)
         return core
@@ -205,7 +275,7 @@ class LearningCommandTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_gates_answer_before_any_run(self):
         stale = self.core()
-        stale.CORE_API_VERSION = 2
+        stale.CORE_API_VERSION = 1
         cases = (
             (self.cog(core=None), "needs ChannelSummary"),
             (self.cog(core=stale), "needs ChannelSummary"),

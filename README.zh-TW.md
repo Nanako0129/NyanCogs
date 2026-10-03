@@ -114,10 +114,14 @@ Embed 頁尾會列出該次摘要消耗的資源：input 與 output tokens，若
 |---|---|
 | 單一附件上限 | 20 MiB 與 25 MP |
 | 單次請求所有附件合計上限 | 50 MiB 與 100 MP |
-| 納入考量的附件數 | 依時間順序取前 20 個符合條件者 |
-| 單次請求附加之重新編碼位元組 | 最多 16 MB |
+| 納入考量的附件數 | 摘要：依時間順序取前 `max_images` 個符合條件者（預設 20，最多 300）。Learning：取最新的 `max_images` 張，分散到各段 |
+| 單次請求附加之重新編碼位元組 | 最多 16 MB；請求的文字很多時會更少，讓整個請求維持在 18 MB 以內 |
 
-調低 `image_max_edge` 可在單次摘要中容納更多張圖片。
+調低 `image_max_edge` 可在單次請求中容納更多張圖片。
+
+### 每小時伺服器配額
+
+摘要與 Learning 這類 job 共用三個伺服器每小時上限：`guild_attempts_per_hour` 次執行、`guild_provider_calls_per_hour` 次 provider 呼叫、`guild_images_per_hour` 張圖片。每次執行在第一次呼叫前先預扣可能的用量。只有剩下的呼叫次數不夠「最少需要的量」時才直接拒絕：分段的 Learning 每段一次、合併再一次；其他執行至少一次，最多 `agent_max_turns` 次。圖片是剩多少給多少，圖片配額用完時照樣執行，只是不帶圖。結束後改記實際用量，完全沒呼叫到 provider 的執行不計。這些計數存在行程記憶體中，reload 或重啟會清空。`guild_concurrency` 限制的是執行數而不是請求數：分段的 Learning 讓同一個伺服器最多同時有 `guild_concurrency` × `job_chunk_concurrency` 個 provider 請求。
 
 ### 隱私
 
@@ -157,10 +161,10 @@ Learning 透過 `bot.get_cog` 在執行期呼叫 ChannelSummary。Provider、使
 | 指令 | 用途 |
 |---|---|
 | `/learning recent <6h\|1d> [ended_ago]` | 整理最近幾小時或幾天的筆記；`ended_ago` 同樣以小時或天為單位，讓區間停在那麼久以前 |
-| `/learning since-me` | 整理你在這個頻道最後一則訊息之後的所有討論 |
+| `/learning since-me` | 整理你在這個頻道最後一則訊息之後的討論（太長時只取最新的部分） |
 | `[p]learningset show` / `enable I_ACCEPT` / `disable` | 檢視揭露條款、啟用或停用（需伺服器層級「管理訊息」權限） |
 
-區間受 ChannelSummary 的 `max_duration_hours` 與訊息數上限約束。Learning 沒有新訊息門檻，也不會移動 ChannelSummary 的檢查點。
+區間受 ChannelSummary 的 `max_duration_hours` 限制，最多讀取 `job_max_messages` 則，從最新的開始。一次請求放不下的區間會切成多段，每段最多 `max_distinct_messages` 則、實際輸入不超過 `max_input_chars` 的九成；每段是一次不開工具的 provider 呼叫，最多同時 `job_chunk_concurrency` 段，最後再用一次合併請求整合各段筆記。超過 `job_max_chunks` 段或 `job_max_messages` 則時不會報錯：Learning 保留最新的部分，告訴模型區間被截斷，頁尾也會標出截斷點。整次執行限制在 13 分鐘內，避開斜線指令回覆 15 分鐘的失效時間。Learning 沒有新訊息門檻，也不會移動 ChannelSummary 的檢查點。
 
 ### 連結
 

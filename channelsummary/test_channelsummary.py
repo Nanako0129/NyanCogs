@@ -103,7 +103,7 @@ class TestConfiguration(unittest.TestCase):
         self.assertEqual(ChannelSummary._parse_setting_value("agent_max_turns", "20"), 20)
         self.assertEqual(ChannelSummary._parse_setting_value("image_detail", "ORIGINAL"), "original")
         self.assertEqual(ChannelSummary._parse_setting_value("max_images", "0"), 0)
-        for key, value in (("agent_max_turns", "21"), ("image_detail", "full"), ("max_images", "21")):
+        for key, value in (("agent_max_turns", "21"), ("image_detail", "full"), ("max_images", "301")):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 ChannelSummary._parse_setting_value(key, value)
 
@@ -1676,7 +1676,9 @@ class FakeChannel:
         self.id = 987654321098765432
         self.name = "general"
 
-    def history(self, *, limit=None, before=None, after=None, oldest_first=False):
+    def history(self, *, limit=None, before=None, after=None, oldest_first=None):
+        if oldest_first is None:
+            oldest_first = after is not None  # discord.py's own default
         async def iterator():
             selected = []
             for message in self.messages:
@@ -4043,8 +4045,11 @@ class TestAgentAndRendering(unittest.IsolatedAsyncioTestCase):
             ctx.message = SimpleNamespace(id=sentinel_id - 5)
             ctx.interaction = None
 
+            # Each case fakes 999 provider calls; the hourly book would carry them over.
+            channelsummary_module._GUILD_USAGE.clear()
             with (
-                patch("channelsummary.channelsummary.time.monotonic", side_effect=[100.0, 3_700.5]),
+                # start, the hourly-usage reservation, then the failure's elapsed time
+                patch("channelsummary.channelsummary.time.monotonic", side_effect=[100.0, 100.0, 3_700.5]),
                 self.assertRaises(SummaryError),
             ):
                 await cog._execute_summary(ctx, "auto", sentinel)
@@ -4767,7 +4772,7 @@ class TestRangesAndJobs(unittest.IsolatedAsyncioTestCase):
             444444444444444444,
             "docs https://docs.python.org/3/library/asyncio.html#tasks, also **https://pypi.org/project/x/** "
             "and [https://docs.python.org/](https://evil.com/login) "
-            "https://evil‮com.moc/ https://exa​mple.com/ https://good.com\\@evil.net/ "
+            "https://evil\u202ecom.moc/ https://exa\u200bmple.com/ https://good.com\\@evil.net/ "
             "https://user@pypi.org/ http://192.168.1.1/ https://bücher.de/ https://docs.python.org/3/library/asyncio.html#tasks "
             # The fragment is not checked by validate_public_url, so it needs its own refusal.
             "https://pypi.org/#a\u202eb",
@@ -4778,13 +4783,14 @@ class TestRangesAndJobs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(link.link_id, link.url, link.host) for link in links],
             [
-                ("L1", "https://docs.python.org/3/library/asyncio.html#tasks", "docs.python.org"),
-                ("L2", "https://pypi.org/project/x/", "pypi.org"),
-                ("L3", "https://docs.python.org/", "docs.python.org"),
-                ("L4", "https://evil.com/login", "evil.com"),
+                ("L1", "https://pypi.org/project/x/", "pypi.org"),
+                ("L2", "https://docs.python.org/", "docs.python.org"),
+                ("L3", "https://evil.com/login", "evil.com"),
                 # The backslash ends the URL: what is shown is where it goes.
-                ("L5", "https://good.com", "good.com"),
-                ("L6", "https://bücher.de/", "xn--bcher-kva.de"),
+                ("L4", "https://good.com", "good.com"),
+                ("L5", "https://bücher.de/", "xn--bcher-kva.de"),
+                # Posted twice: numbered at its newest posting.
+                ("L6", "https://docs.python.org/3/library/asyncio.html#tasks", "docs.python.org"),
                 ("L7", "https://github.com/a/b", "github.com"),
             ],
         )
@@ -4792,7 +4798,7 @@ class TestRangesAndJobs(unittest.IsolatedAsyncioTestCase):
 
     def test_shared_links_stop_at_the_table_limit(self) -> None:
         message = FakeMessage(
-            100000000000000001, 1, " ".join(f"https://site{index}.com/" for index in range(40)), 1
+            100000000000000001, 1, " ".join(f"https://site{index}.com/" for index in range(120)), 1
         )
         links = channelsummary_module.extract_links([message])
         self.assertEqual(len(links), channelsummary_module.MAX_SHARED_LINKS)
@@ -4955,7 +4961,7 @@ class TestRangesAndJobs(unittest.IsolatedAsyncioTestCase):
         self.assertIn((ctx.guild.id, ctx.author.id), cog._user_attempts)
         self.assertEqual(cog._run_agent.await_args.args[5], "job")
         self.assertIs(cog._run_agent.await_args.kwargs["job"], job)
-        self.assertEqual(cog._base_messages.await_args.args[3:5], ("range", (snapshot.id - 5, False)))
+        self.assertEqual(cog._base_messages.await_args.args[3:5], ("job", (snapshot.id - 5, False)))
         self.assertTrue(state.include_links)
         cog._render_embeds.assert_not_called()
         self.assertIn("筆記", ctx.channel.send.await_args.args[0])
@@ -5002,45 +5008,94 @@ class TestRangesAndJobs(unittest.IsolatedAsyncioTestCase):
         self.assertIn("application_link", json.dumps(system))
         self.assertIn("Return JSON.", json.dumps(system))
 
-    async def test_job_history_tool_stays_inside_the_window(self) -> None:
-        now = datetime.now(UTC)
-        older, inside, snapshot = (stamped(hours, 444444444444444444, now=now) for hours in (3, 2, 1))
-        channel = FakeChannel([older, inside, snapshot])
-        cog = object.__new__(ChannelSummary)
-        cog.fetch_image_inputs = AsyncMock(return_value=())
-        args = (
-            '{"query":"","author_id":"","before_message_id":"","after_message_id":"",'
-            '"start_unix":0,"end_unix":0,"limit":10}'
-        )
-        cog.request_provider = AsyncMock(
-            side_effect=[
-                NormalizedResponse(None, None, (FunctionCall("c1", "search_channel_history", args),), (), "m", 0),
-                NormalizedResponse("done", None, (), (), "m", 0),
-            ]
-        )
-        lower = discord.utils.time_snowflake(now - timedelta(hours=2, minutes=30))
-        state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot}, hard_start_id=lower)
-        result, _, _ = await cog._run_agent(
-            SimpleNamespace(id=self.GUILD), channel, profile("openai_responses"),
-            {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False}, state, "job", None,
-            job=self.job(finalize=lambda text, state: set(state.messages)),
-        )
-        self.assertEqual(result, {inside.id, snapshot.id})
-
-    async def test_job_finalize_receives_the_json_without_a_markdown_fence(self) -> None:
-        cog = object.__new__(ChannelSummary)
-        cog.fetch_image_inputs = AsyncMock(return_value=())
-        cog.request_provider = AsyncMock(
-            return_value=NormalizedResponse('```json \n{"a": 1}\n```', None, (), (), "m", 0)
-        )
+    async def test_a_job_is_offered_no_channel_history_tool(self) -> None:
         snapshot = FakeMessage(333333333333333333, 444444444444444444, "snapshot", 36)
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cog.request_provider = AsyncMock(return_value=NormalizedResponse("done", None, (), (), "m", 0))
         state = RunState(snapshot.id, {snapshot.id}, {snapshot.id: snapshot})
-        result, _, _ = await cog._run_agent(
+        await cog._run_agent(
             SimpleNamespace(id=self.GUILD), FakeChannel([snapshot]), profile("openai_responses"),
             {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False}, state, "job", None,
-            job=self.job(finalize=lambda text, state: json.loads(text)),
+            job=self.job(finalize=lambda text, state: text),
         )
-        self.assertEqual(result, {"a": 1})
+        payload = cog.request_provider.await_args.args[1]
+        self.assertEqual(payload.get("tools", []), [])
+        self.assertNotIn("search_channel_history", payload["instructions"])
+
+    def job_window(self, count: int, *, now: datetime | None = None) -> tuple[FakeMessage, list[FakeMessage], tuple[int, bool]]:
+        now = now or datetime.now(UTC)
+        before_start = stamped(30, 444444444444444444, now=now)
+        window = [stamped(index / 60, 444444444444444444, f"message {index}", now=now) for index in range(count, 0, -1)]
+        return before_start, window, (discord.utils.time_snowflake(now - timedelta(hours=24)), False)
+
+    async def test_a_job_window_too_long_keeps_its_newest_messages(self) -> None:
+        cog = object.__new__(ChannelSummary)
+        cases = {
+            # name: (messages in window, settings overrides, inspected before, kept, truncated)
+            "fits": (20, {}, 0, 20, False),
+            # Earlier scans (since-me, the end snapshot) do not eat the window's own budget.
+            "fits after a long since-me walk": (20, {}, 999, 20, False),
+            # max_distinct_messages caps each chunk, never the job's window.
+            "per-chunk cap does not cut the window": (20, {"max_distinct_messages": 5}, 0, 20, False),
+            # The snapshot plus job_max_messages scanned; the message cap is lifted to isolate the scan cap.
+            "exactly the scan cap": (1_001, {"max_distinct_messages": 2_000, "job_max_messages": 1_000}, 0, 1_001, False),
+            "past the scan cap": (1_002, {"max_distinct_messages": 2_000, "job_max_messages": 1_000}, 0, 1_001, True),
+        }
+        for name, (count, overrides, inspected, kept, truncated) in cases.items():
+            with self.subTest(name):
+                before_start, window, lower = self.job_window(count)
+                state = await cog._base_messages(
+                    FakeChannel([before_start, *window]), window[-1], {**GUILD_DEFAULTS, **overrides},
+                    "job", lower, None, inspected,
+                )
+                self.assertEqual(len(state.messages), kept)
+                self.assertEqual(state.truncated, truncated)
+                self.assertEqual(state.hard_start_id, min(state.messages) if truncated else lower[0])
+                self.assertNotIn(before_start.id, state.messages)
+                self.assertEqual(sorted(state.messages), sorted(message.id for message in window)[-kept:])
+
+    async def test_a_job_started_at_a_missing_message_is_refused_when_nothing_was_cut(self) -> None:
+        now = datetime.now(UTC)
+        window = [stamped(hours, 444444444444444444, now=now) for hours in (3, 2, 1)]
+        with self.assertRaises(commands.UserFeedbackCheckFailure):
+            await object.__new__(ChannelSummary)._base_messages(
+                FakeChannel(window[1:]), window[-1], dict(GUILD_DEFAULTS), "job", (window[0].id, True), None, 0
+            )
+
+    async def test_a_long_job_takes_the_chunked_path_and_reserves_its_calls(self) -> None:
+        cog, ctx, snapshot, state, _ = self.execution_fixture()
+        cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id - 5, False)))
+        cog._split_job = MagicMock(return_value=[[1], [2], [3]])
+        cog._run_chunked_job = AsyncMock(return_value=("result", (), "m"))
+        reserve = AsyncMock(return_value={"calls": [0.0, 4], "images": [0.0, 0]})
+        with patch("channelsummary.channelsummary.reserve_guild_usage", reserve):
+            self.assertTrue(await cog.run_channel_job(ctx, self.job()))
+        cog._run_chunked_job.assert_awaited_once()
+        cog._run_agent.assert_not_awaited()
+        self.assertEqual(reserve.await_args.kwargs["calls"], 4)
+        self.assertEqual(state.chunk_count, 3)
+        kwargs = cog._run_chunked_job.await_args.kwargs
+        self.assertLessEqual(kwargs["run_deadline"] - time.monotonic(), channelsummary_module.RUN_BUDGET_SECONDS)
+
+    async def test_a_failed_chunked_job_logs_which_part_failed(self) -> None:
+        cog, ctx, snapshot, state, _ = self.execution_fixture()
+        cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id - 5, False)))
+        cog._split_job = MagicMock(return_value=[[1], [2], [3]])
+
+        async def fail(*args, **kwargs):
+            state.phase, state.failed_chunk = "map", 2
+            raise SummaryError(
+                ErrorCode.RESPONSE_INVALID,
+                stage=channelsummary_module._ResponseStage.JOB_OUTPUT,
+                reason=channelsummary_module._ResponseReason.JOB_FINALIZE_FAILED,
+            )
+
+        cog._run_chunked_job = AsyncMock(side_effect=fail)
+        cog._send_plain = AsyncMock()
+        with self.assertLogs("red.nyancogs.channelsummary", logging.WARNING) as logs:
+            self.assertFalse(await cog.run_channel_job(ctx, self.job()))
+        self.assertIn("phase=map chunk_index=2 chunk_count=3", logs.output[-1])
 
     async def test_run_channel_job_answers_every_failure_itself(self) -> None:
         cog = object.__new__(ChannelSummary)
@@ -5065,6 +5120,696 @@ class TestRangesAndJobs(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already running", cog._send_plain.await_args.args[1])
 
     def test_api_surface_is_reachable_through_the_cog(self) -> None:
-        self.assertEqual(ChannelSummary.CORE_API_VERSION, 1)
+        self.assertEqual(ChannelSummary.CORE_API_VERSION, 2)
         for name in ("ChannelJob", "run_channel_job", "extract_links", "sanitize_text", "split_embed_text", "footer"):
             self.assertTrue(hasattr(ChannelSummary, name), name)
+
+
+class TestEvidenceEncoding(unittest.TestCase):
+    HIDDEN = {
+        "line separator": "\u2028",
+        "paragraph separator": "\u2029",
+        "right-to-left override": "\u202e",
+        "zero-width space": "\u200b",
+        "byte-order mark": "\ufeff",
+        "soft hyphen": "\u00ad",
+        "tag letter A": "\U000e0041",
+        "plane-15 private use": "\U000f0000",
+        "lone surrogate": "\ud800",
+        "fullwidth quote": "＂",
+        "fullwidth brace": "｛",
+        "fullwidth backslash": "＼",
+        "small brace": "﹛",
+    }
+
+    def test_hidden_and_structure_like_characters_stay_escaped(self) -> None:
+        encode = channelsummary_module.encode_evidence
+        for name, char in self.HIDDEN.items():
+            with self.subTest(name):
+                value = {"content": f"a{char}b"}
+                encoded = encode(value)
+                self.assertNotIn(char, encoded)
+                self.assertEqual(json.loads(encoded), value)
+        self.assertIn("\\udb40\\udc41", encode("\U000e0041"))
+
+    def test_printable_text_travels_raw_and_round_trips(self) -> None:
+        message = "asyncio 的 TaskGroup 要怎麼取消比較好？我試了 cancel 但好像還是會卡住，（真的）：😀"
+        encoded = channelsummary_module.encode_evidence({"content": message})
+        self.assertIn(message, encoded)
+        self.assertEqual(json.loads(encoded), {"content": message})
+
+    def test_a_measured_chinese_record_shrinks(self) -> None:
+        record = {
+            "type": "message",
+            "message_id": "1424500000000000000",
+            "timestamp": "2026-10-03T13:02:11.123000+00:00",
+            "author": "444444444444444444",
+            "evidence": {"content": "asyncio 的 TaskGroup 要怎麼取消比較好？我試了 cancel 但好像還是會卡住"},
+        }
+        self.assertEqual(len(json.dumps(record, ensure_ascii=True, separators=(",", ":"))), 309)
+        self.assertEqual(len(channelsummary_module.encode_evidence(record)), 204)
+
+    def test_a_request_body_with_hidden_characters_still_encodes(self) -> None:
+        transcript = channelsummary_module.encode_evidence({"content": "x\ud800y\U000e0041"})
+        json.dumps({"input": transcript}, ensure_ascii=False).encode()
+
+
+class TestHourlyUsageAndImageBudget(unittest.IsolatedAsyncioTestCase):
+    GUILD = 777777777777777777
+
+    def setUp(self) -> None:
+        channelsummary_module._GUILD_USAGE.clear()
+
+    def test_new_settings_are_bounded(self) -> None:
+        parse = ChannelSummary._parse_setting_value
+        for key, low, high in (
+            ("max_images", 0, 300),
+            ("max_input_chars", 10_000, 1_000_000),
+            ("max_distinct_messages", 1, 5_000),
+            ("guild_images_per_hour", 0, 3_000),
+            ("guild_provider_calls_per_hour", 1, 5_000),
+            ("job_max_messages", 1_000, 10_000),
+            ("job_max_chunks", 1, 12),
+            ("job_chunk_concurrency", 1, 4),
+        ):
+            with self.subTest(key):
+                self.assertEqual(parse(key, str(high)), high)
+                self.assertEqual(parse(key, str(low)), low)
+                for bad in (high + 1, low - 1):
+                    with self.assertRaises(ValueError):
+                        parse(key, str(bad))
+        for category, keys in channelsummary_module.SETTINGS_CATEGORIES.items():
+            self.assertLessEqual(len(keys), 5, category)  # a Discord Modal holds five inputs
+
+    async def test_usage_is_reserved_up_front_and_settled_to_what_was_spent(self) -> None:
+        settings = {**GUILD_DEFAULTS, "guild_provider_calls_per_hour": 10, "guild_images_per_hour": 5}
+        reserve, settle = channelsummary_module.reserve_guild_usage, channelsummary_module.settle_guild_usage
+        first = await reserve(self.GUILD, settings, calls=8, images=5)
+        # Not enough calls left: refused, and nothing is taken.
+        with self.assertRaises(commands.CommandOnCooldown):
+            await reserve(self.GUILD, settings, calls=3, images=1)
+        self.assertEqual(len(channelsummary_module._GUILD_USAGE[(self.GUILD, "images")]), 1)
+        await settle(first, calls=2, images=1)
+        second = await reserve(self.GUILD, settings, calls=8, images=6)
+        self.assertEqual(second["images"][1], 4)  # images are granted up to what is left
+        third = await reserve(self.GUILD + 2, {**settings, "guild_images_per_hour": 0}, calls=1, images=3)
+        self.assertEqual(third["images"][1], 0)  # an image quota of 0 means runs go without images
+        await settle(second, calls=0, images=0)
+        await reserve(self.GUILD, settings, calls=8, images=4)
+        with self.assertRaises(commands.UserFeedbackCheckFailure) as caught:
+            await reserve(self.GUILD + 1, settings, calls=11, images=0)
+        self.assertIn("hourly calls quota of 10", str(caught.exception))
+
+    async def test_retry_after_waits_until_enough_has_expired(self) -> None:
+        settings = {**GUILD_DEFAULTS, "guild_provider_calls_per_hour": 10}
+        with patch("channelsummary.channelsummary.time.monotonic", return_value=0.0):
+            refunded = await channelsummary_module.reserve_guild_usage(self.GUILD, settings, calls=5)
+            await channelsummary_module.settle_guild_usage(refunded, calls=0)
+        with patch("channelsummary.channelsummary.time.monotonic", return_value=100.0):
+            await channelsummary_module.reserve_guild_usage(self.GUILD, settings, calls=10)
+        with patch("channelsummary.channelsummary.time.monotonic", return_value=200.0), self.assertRaises(
+            commands.CommandOnCooldown
+        ) as caught:
+            await channelsummary_module.reserve_guild_usage(self.GUILD, settings, calls=1)
+        self.assertEqual(caught.exception.retry_after, 3_500.0)  # the 10-call entry, not the refunded one
+
+    async def test_usage_older_than_an_hour_frees_up(self) -> None:
+        settings = {**GUILD_DEFAULTS, "guild_provider_calls_per_hour": 10}
+        with patch("channelsummary.channelsummary.time.monotonic", return_value=0.0):
+            await channelsummary_module.reserve_guild_usage(self.GUILD, settings, calls=10)
+        with patch("channelsummary.channelsummary.time.monotonic", return_value=3_600.0):
+            await channelsummary_module.reserve_guild_usage(self.GUILD, settings, calls=10)
+
+    async def test_a_huge_cjk_request_with_many_images_stays_under_the_body_limit(self) -> None:
+        channel_id = 987654321098765432
+        messages = []
+        cache = {}
+        for index in range(20):
+            message = FakeMessage(100000000000000000 + index, 444444444444444444, "x", index)
+            message.attachments = [fake_attachment(900000000000000000 + index, f"shot{index}.png")]
+            messages.append(message)
+            cache[900000000000000000 + index] = "data:image/jpeg;base64," + "A" * 1_000_000
+        settings = {**GUILD_DEFAULTS, "max_images": 300, "max_input_chars": 1_000_000, "model": "model-1"}
+        # At the ceiling: 3 MB of UTF-8 text, so a fixed 16 MB image budget would overflow 18 MB.
+        text = "中" * 1_000_000
+        system = "rules"
+        cog = object.__new__(ChannelSummary)
+        images = await cog.fetch_image_inputs(
+            messages, channel_id, settings, cache, time.monotonic() + 60,
+            byte_budget=channelsummary_module.image_byte_budget(system, text),
+        )
+        self.assertLess(len(images), 20)  # some had to be skipped to make room for the text
+        payload = build_payload(
+            profile("generic_responses"), model="model-1", system=system, input_items=text, effort="medium",
+            output_tokens=1_000, remaining_app_calls=0, remaining_hosted_calls=0, remaining_web_results=0,
+            images=images,
+        )
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        self.assertLessEqual(len(body), channelsummary_module.MAX_REQUEST_BYTES)
+
+    def test_a_job_sends_its_newest_images(self) -> None:
+        channel_id = 987654321098765432
+        messages = []
+        for index in range(5):
+            message = FakeMessage(100000000000000000 + index, 444444444444444444, "x", index)
+            message.attachments = [fake_attachment(900000000000000000 + index, f"shot{index}.png")]
+            messages.append(message)
+        chosen = channelsummary_module.newest_images(messages, channel_id, {**GUILD_DEFAULTS, "max_images": 2})
+        self.assertEqual(chosen, frozenset({900000000000000003, 900000000000000004}))
+        selected = channelsummary_module.eligible_images(messages, channel_id, dict(GUILD_DEFAULTS), chosen)
+        self.assertEqual({item[1].id for item in selected}, set(chosen))
+
+
+class TestChunkedJobs(unittest.IsolatedAsyncioTestCase):
+    GUILD = 123456789012345678
+
+    def setUp(self) -> None:
+        channelsummary_module._GUILD_USAGE.clear()
+
+    def window(self, count: int, *, text: str = "message", links_at: Mapping[int, str] | None = None) -> RunState:
+        now = datetime.now(UTC)
+        messages = [stamped(index / 60, 400000000000000000 + index % 7, f"{text} {index}", now=now) for index in range(count, 0, -1)]
+        for position, url in (links_at or {}).items():
+            messages[position].content += f" {url}"
+        state = RunState(messages[-1].id, {m.id for m in messages}, {m.id: m for m in messages})
+        state.include_links = True
+        state.links = channelsummary_module.extract_links(messages)
+        return state
+
+    def settings(self, **overrides) -> dict:
+        return {**GUILD_DEFAULTS, "model": "model-1", "web_enabled": False, "max_input_chars": 10_000, **overrides}
+
+    def test_a_long_window_splits_into_chunks_that_each_fit(self) -> None:
+        state = self.window(200)
+        settings = self.settings()
+        chunks = ChannelSummary._split_job(state, settings)
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertEqual([message_id for chunk in chunks for message_id in chunk], sorted(state.messages))
+        budget = 10_000 * channelsummary_module.JOB_INPUT_SHARE
+        for index, chunk in enumerate(chunks):
+            probe = ChannelSummary._chunk_state(state, chunk, oldest=index == 0)
+            self.assertLessEqual(len(ChannelSummary._agent_input(probe, 30, [])), budget)
+        self.assertFalse(state.truncated)
+
+    def test_more_chunks_than_allowed_keeps_the_newest_and_marks_only_the_oldest(self) -> None:
+        state = self.window(200)
+        everything = sorted(state.messages)
+        chunks = ChannelSummary._split_job(state, self.settings(job_max_chunks=2))
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(state.truncated)
+        kept = [message_id for chunk in chunks for message_id in chunk]
+        self.assertEqual(kept, everything[-len(kept):])
+        self.assertEqual(state.hard_start_id, kept[0])
+        self.assertEqual(set(state.messages), set(kept))
+        inputs = [
+            ChannelSummary._agent_input(ChannelSummary._chunk_state(state, chunk, oldest=index == 0), 30, [])
+            for index, chunk in enumerate(chunks)
+        ]
+        self.assertIn("window_truncated", inputs[0])
+        self.assertNotIn("window_truncated", inputs[1])
+
+    def test_one_message_too_large_for_any_chunk_is_a_fixed_error(self) -> None:
+        state = self.window(3)
+        # Zero-width spaces stay escaped, six characters each: far over one chunk.
+        state.messages[max(state.messages)].content = "\u200b" * 8_000
+        with self.assertRaises(SummaryError) as caught:
+            ChannelSummary._split_job(state, self.settings(max_input_chars=10_000))
+        self.assertEqual(caught.exception.code, ErrorCode.MESSAGE_TOO_LARGE)
+
+    def test_five_thousand_messages_split_quickly(self) -> None:
+        state = self.window(5_000)
+        started = time.monotonic()
+        chunks = ChannelSummary._split_job(state, self.settings(max_input_chars=250_000, job_max_chunks=12))
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertGreater(len(chunks), 1)
+
+    def test_chunks_keep_window_wide_link_ids(self) -> None:
+        state = self.window(200, links_at={5: "https://first.example.org/a", 190: "https://second.example.org/b"})
+        chunks = ChannelSummary._split_job(state, self.settings())
+        last = ChannelSummary._chunk_state(state, chunks[-1], oldest=False)
+        self.assertEqual([link.link_id for link in last.links], ["L2"])
+        self.assertIn('"link_id":"L2"', ChannelSummary._agent_input(last, 30, []))
+        self.assertNotIn('"link_id":"L1"', ChannelSummary._agent_input(last, 30, []))
+
+    def job(self, **overrides) -> ChannelSummary.ChannelJob:
+        def finalize(text: str, state: RunState) -> list[int]:
+            ids = json.loads(text)["ids"]
+            if any(message_id not in state.messages for message_id in ids):
+                raise ValueError("unknown id")
+            return ids
+
+        values = {
+            "name": "筆記",
+            "instructions": "MAP.",
+            "finalize": finalize,
+            "render": lambda *args: [discord.Embed(description="job")],
+            "start": "1d",
+            "include_links": True,
+            "merge_instructions": "MERGE.",
+            "merge_input": lambda result, budget: ({"ids": result}, set(result), set()),
+        }
+        return ChannelSummary.ChannelJob(**{**values, **overrides})
+
+    async def run_chunked(self, cog, state, chunks, job, *, deadline_in: float = 600.0, **settings):
+        progress = AsyncMock()
+        result = await cog._run_chunked_job(
+            SimpleNamespace(id=self.GUILD), FakeChannel(list(state.messages.values())), profile("openai_responses"),
+            self.settings(**settings), state, chunks, job, None,
+            provider_key="k", run_deadline=time.monotonic() + deadline_in, on_progress=progress,
+        )
+        return result, progress
+
+    async def test_chunks_map_then_merge_only_from_their_notes(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        payloads = []
+
+        async def provider(profile_, payload, **kwargs):
+            payloads.append(json.dumps(payload, ensure_ascii=False))
+            body = payloads[-1]
+            if "MERGE." in body:
+                return NormalizedResponse(json.dumps({"ids": [chunks[0][0]]}), None, (), (), "m", 0)
+            first = next(message_id for chunk in chunks for message_id in chunk if str(message_id) in body)
+            return NormalizedResponse(json.dumps({"ids": [first]}), None, (), (), "m", 0)
+
+        cog.request_provider = provider
+        (result, _, model), progress = await self.run_chunked(cog, state, chunks, self.job())
+        self.assertEqual(result, [chunks[0][0]])
+        self.assertEqual(model, "m")
+        self.assertEqual(state.provider_calls, len(chunks) + 1)
+        merge = payloads[-1]
+        self.assertIn("application_chunk_notes", merge)
+        self.assertNotIn('\\"type\\":\\"message\\"', merge)
+        self.assertNotIn('"tools"', merge)
+        self.assertEqual(progress.await_count, len(chunks) + 1)
+
+    async def test_the_merge_may_only_cite_what_the_chunks_cited(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+
+        async def provider(profile_, payload, **kwargs):
+            body = json.dumps(payload, ensure_ascii=False)
+            if "MERGE." in body:  # cites a real message no chunk cited
+                return NormalizedResponse(json.dumps({"ids": [chunks[-1][-1]]}), None, (), (), "m", 0)
+            first = next(message_id for chunk in chunks for message_id in chunk if str(message_id) in body)
+            return NormalizedResponse(json.dumps({"ids": [first]}), None, (), (), "m", 0)
+
+        cog.request_provider = provider
+        with self.assertRaises(SummaryError) as caught:
+            await self.run_chunked(cog, state, chunks, self.job())
+        self.assertEqual(caught.exception.reason.value, "finalize_failed")
+
+    async def test_a_failing_chunk_cancels_the_rest_and_is_still_charged(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cancelled = asyncio.Event()
+        calls = 0
+
+        async def provider(profile_, payload, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            raise SummaryError(ErrorCode.PROVIDER_UNAVAILABLE)
+
+        cog.request_provider = provider
+        with self.assertRaises(SummaryError) as caught:
+            await self.run_chunked(cog, state, chunks, self.job())
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_UNAVAILABLE)
+        self.assertTrue(cancelled.is_set())
+        self.assertGreaterEqual(state.provider_calls, 2)  # charged before the awaits, so no refund
+        self.assertEqual(state.phase, "map")
+        self.assertGreater(state.failed_chunk, 0)
+
+    async def test_no_call_starts_after_the_run_budget(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cog.request_provider = AsyncMock()
+        with self.assertRaises(SummaryError) as caught:
+            await self.run_chunked(cog, state, chunks, self.job(), deadline_in=1.0)
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_TIMEOUT)
+        cog.request_provider.assert_not_awaited()
+
+    async def test_merge_input_too_large_fails_before_the_merge_call(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        calls = []
+
+        async def provider(profile_, payload, **kwargs):
+            calls.append(payload)
+            body = json.dumps(payload, ensure_ascii=False)
+            first = next(message_id for chunk in chunks for message_id in chunk if str(message_id) in body)
+            return NormalizedResponse(json.dumps({"ids": [first]}), None, (), (), "m", 0)
+
+        cog.request_provider = provider
+        job = self.job(merge_input=lambda result, budget: ({"ids": result, "pad": "x" * 20_000}, set(result), set()))
+        with self.assertRaises(SummaryError) as caught:
+            await self.run_chunked(cog, state, chunks, job)
+        self.assertEqual(caught.exception.reason.value, "merge_input_too_large")
+        self.assertEqual(len(calls), len(chunks))
+
+    def test_first_error_prefers_the_fixed_one(self) -> None:
+        group = BaseExceptionGroup("x", [ValueError("SECRET"), BaseExceptionGroup("y", [SummaryError(ErrorCode.PROVIDER_TIMEOUT)])])
+        self.assertEqual(channelsummary_module.first_error(group).code, ErrorCode.PROVIDER_TIMEOUT)
+        self.assertIsInstance(channelsummary_module.first_error(BaseExceptionGroup("z", [ValueError("v")])), ValueError)
+
+
+class ChunkedJobHelpers(unittest.IsolatedAsyncioTestCase):
+    """The fixtures of TestChunkedJobs without its tests."""
+
+    GUILD = TestChunkedJobs.GUILD
+    setUp = TestChunkedJobs.setUp
+    window = TestChunkedJobs.window
+    settings = TestChunkedJobs.settings
+    job = TestChunkedJobs.job
+    run_chunked = TestChunkedJobs.run_chunked
+
+
+class TestChunkedJobEdges(ChunkedJobHelpers):
+    async def test_a_cut_window_keeps_links_on_the_messages_it_kept(self) -> None:
+        state = self.window(150, links_at={index: f"https://site{index}.example.org/" for index in range(150)})
+        chunks = ChannelSummary._split_job(state, self.settings(job_max_chunks=1))
+        self.assertTrue(state.truncated)
+        self.assertTrue(state.links)
+        self.assertTrue(all(link.message_id in state.messages for link in state.links))
+        probe = ChannelSummary._chunk_state(state, chunks[0], oldest=True)
+        self.assertIn("application_link", ChannelSummary._agent_input(probe, 30, []))
+
+    async def test_chunk_calls_offer_no_tools(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        payloads = []
+
+        async def provider(profile_, payload, **kwargs):
+            payloads.append(payload)
+            body = json.dumps(payload, ensure_ascii=False)
+            if "MERGE." in body:
+                return NormalizedResponse(json.dumps({"ids": []}), None, (), (), "m", 0)
+            first = next(message_id for chunk in chunks for message_id in chunk if str(message_id) in body)
+            return NormalizedResponse(json.dumps({"ids": [first]}), None, (), (), "m", 0)
+
+        cog.request_provider = provider
+        # Web search on, with a profile that has native search: chunk calls still get no tool.
+        await self.run_chunked(cog, state, chunks, self.job(), web_enabled=True)
+        self.assertTrue(all(not payload.get("tools") for payload in payloads))
+
+    async def test_no_call_is_charged_with_less_than_the_minimum_left(self) -> None:
+        state = self.window(3)
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cog.request_provider = AsyncMock()
+        with self.assertRaises(SummaryError) as caught:
+            await cog._run_agent(
+                SimpleNamespace(id=self.GUILD), FakeChannel(list(state.messages.values())), profile("openai_responses"),
+                self.settings(), state, "job", None, job=self.job(), run_deadline=time.monotonic() + 3,
+            )
+        self.assertEqual(caught.exception.code, ErrorCode.PROVIDER_TIMEOUT)
+        self.assertEqual(state.provider_calls, 0)
+        cog.request_provider.assert_not_awaited()
+
+    async def test_a_job_finalize_gets_unfenced_json_and_the_image_budget_shrinks_with_text(self) -> None:
+        # About 840,000 CJK characters: 2.5 MB of UTF-8, so the budget must shrink below 16 MB.
+        state = self.window(120, text="中" * 7_000)
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cog.request_provider = AsyncMock(
+            return_value=NormalizedResponse('```json \n{"ids": []}\n```', None, (), (), "m", 0)
+        )
+        result, _, _ = await cog._run_agent(
+            SimpleNamespace(id=self.GUILD), FakeChannel(list(state.messages.values())), profile("openai_responses"),
+            self.settings(max_input_chars=1_000_000), state, "job", None, job=self.job(),
+        )
+        self.assertEqual(result, [])
+        budget = cog.fetch_image_inputs.await_args.kwargs["byte_budget"]
+        self.assertLess(budget, channelsummary_module.MAX_INLINE_IMAGE_BYTES)
+        self.assertEqual(budget, channelsummary_module.image_byte_budget(
+            cog.request_provider.await_args.args[1]["instructions"], cog.request_provider.await_args.args[1]["input"]
+        ))
+
+    async def test_images_are_not_charged_when_no_call_happened(self) -> None:
+        tests = TestRangesAndJobs()
+        cog, ctx, snapshot, state, _ = tests.execution_fixture(provider_calls=0)
+        cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id, True)))
+
+        async def fail(*args, **kwargs):
+            state.image_ids.add(900000000000000001)
+            raise SummaryError(ErrorCode.PROVIDER_TIMEOUT)
+
+        cog._run_agent = AsyncMock(side_effect=fail)
+        settle = AsyncMock()
+        with patch("channelsummary.channelsummary.settle_guild_usage", settle), self.assertRaises(SummaryError):
+            await cog._execute_summary(ctx, "job", job=tests.job())
+        self.assertEqual(settle.await_args.kwargs, {"calls": 0, "images": 0})
+
+
+class TestChunkedJobFixes(ChunkedJobHelpers):
+    async def test_the_merge_shrinks_every_part_until_its_input_fits(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        shares = []
+
+        def merge_input(result, budget):
+            shares.append(budget)
+            # Ignores its budget by a fixed margin, as a wrapper and escaping would.
+            return {"ids": result, "pad": "x" * max(0, budget + 400)}, set(result), set()
+
+        async def provider(profile_, payload, **kwargs):
+            body = json.dumps(payload, ensure_ascii=False)
+            if "MERGE." in body:
+                return NormalizedResponse(json.dumps({"ids": []}), None, (), (), "m", 0)
+            first = next(message_id for chunk in chunks for message_id in chunk if str(message_id) in body)
+            return NormalizedResponse(json.dumps({"ids": [first]}), None, (), (), "m", 0)
+
+        cog.request_provider = provider
+        (result, _, _), _ = await self.run_chunked(cog, state, chunks, self.job(merge_input=merge_input))
+        self.assertEqual(result, [])
+        self.assertGreater(len(shares), len(chunks))  # a second, smaller round happened
+        self.assertLess(shares[-1], shares[0])
+
+    def test_a_job_request_drops_its_oldest_images_first(self) -> None:
+        channel_id = 987654321098765432
+        messages = []
+        for index in range(5):
+            message = FakeMessage(100000000000000000 + index, 444444444444444444, "x", index)
+            message.attachments = [fake_attachment(900000000000000000 + index, f"s{index}.png", width=6000, height=4000)]
+            messages.append(message)
+        allowed = frozenset(900000000000000000 + index for index in range(5))
+        # 24 MP each against the 100 MP per-request total: four fit, and the one left out is the oldest.
+        selected = channelsummary_module.eligible_images(
+            messages, channel_id, {**GUILD_DEFAULTS, "max_images": 300}, allowed, newest_first=True
+        )
+        self.assertEqual({item[1].id - 900000000000000000 for item in selected}, {1, 2, 3, 4})
+        # A summary keeps its chronological rule: the newest is the one left out.
+        summary = channelsummary_module.eligible_images(messages, channel_id, {**GUILD_DEFAULTS, "max_images": 300})
+        self.assertEqual({item[1].id - 900000000000000000 for item in summary}, {0, 1, 2, 3})
+
+    def test_an_oversized_message_in_the_part_that_is_cut_does_not_fail_the_run(self) -> None:
+        state = self.window(200)
+        oldest = min(state.messages)
+        state.messages[oldest].content = "\u200b" * 8_000
+        chunks = ChannelSummary._split_job(state, self.settings(job_max_chunks=2))
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(state.truncated)
+        self.assertNotIn(oldest, state.messages)
+
+
+class TestReviewRoundTwo(ChunkedJobHelpers):
+    async def test_chunks_leave_time_for_the_merge(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        deadlines = []
+
+        async def run_agent(*args, **kwargs):
+            deadlines.append((kwargs.get("input_override") is not None, kwargs["run_deadline"]))
+            return ([], (), "m") if kwargs.get("input_override") is None else ([], (), "m")
+
+        cog._run_agent = run_agent
+        run_deadline = time.monotonic() + 600
+        await cog._run_chunked_job(
+            SimpleNamespace(id=self.GUILD), FakeChannel([]), profile("openai_responses"),
+            self.settings(request_timeout_seconds=600), state, chunks,
+            self.job(merge_input=lambda result, budget: ({"ids": []}, set(), set())), None,
+            provider_key="k", run_deadline=run_deadline, on_progress=AsyncMock(),
+        )
+        chunk_deadlines = {deadline for is_merge, deadline in deadlines if not is_merge}
+        merge_deadline = next(deadline for is_merge, deadline in deadlines if is_merge)
+        self.assertEqual(chunk_deadlines, {run_deadline - channelsummary_module.MERGE_RESERVE_SECONDS})
+        self.assertEqual(merge_deadline, run_deadline)
+
+    async def test_since_me_looks_back_as_far_as_a_job_reads(self) -> None:
+        now = datetime.now(UTC)
+        mine = stamped(5, 444444444444444444, "me", now=now)
+        others = [stamped(4 - index / 1_000, 555555555555555555, now=now) for index in range(1_500)]
+        channel = FakeChannel([mine, *others])
+        channel.id, channel.guild = 987654321098765432, SimpleNamespace(id=self.GUILD)
+        cog = object.__new__(ChannelSummary)
+        settings = {**GUILD_DEFAULTS, "timezone": "UTC", "job_max_messages": 5_000}
+        _, _, lower = await cog._resolve_window(
+            channel, 444444444444444444, settings, others[-1], 0,
+            start=None, end=None, since_author=True, invocation_id=None,
+        )
+        self.assertEqual(lower, (mine.id, True))
+
+    async def test_a_low_call_quota_still_lets_a_summary_run(self) -> None:
+        settings = {**GUILD_DEFAULTS, "guild_provider_calls_per_hour": 10}
+        reserved = await channelsummary_module.reserve_guild_usage(self.GUILD, settings, calls=20, calls_needed=1)
+        self.assertEqual(reserved["calls"][1], 10)
+        await channelsummary_module.settle_guild_usage(reserved, calls=2)
+        with self.assertRaises(commands.CommandOnCooldown):  # a chunked run needs all of its calls
+            await channelsummary_module.reserve_guild_usage(self.GUILD, settings, calls=9, calls_needed=9)
+
+    async def test_a_summary_reserves_room_for_images_its_tools_may_add(self) -> None:
+        tests = TestRangesAndJobs()
+        cog, ctx, snapshot, state, _ = tests.execution_fixture()
+        reserve = AsyncMock(return_value={"calls": [0.0, 20], "images": [0.0, 20]})
+        with patch("channelsummary.channelsummary.reserve_guild_usage", reserve):
+            await cog._execute_summary(ctx, "auto")
+        self.assertEqual(reserve.await_args.kwargs["images"], GUILD_DEFAULTS["max_images"])
+        self.assertIsNone(state.image_allowlist)  # fully granted: the summary rule is unchanged
+
+    async def test_images_count_only_once_their_call_is_charged(self) -> None:
+        state = self.window(3)
+        cog = object.__new__(ChannelSummary)
+        image = channelsummary_module.ImageInput(max(state.messages), 900000000000000001, "data:image/png;base64,AA", "auto")
+        cog.fetch_image_inputs = AsyncMock(return_value=(image,))
+        cog.request_provider = AsyncMock()
+        with self.assertRaises(SummaryError):
+            await cog._run_agent(
+                SimpleNamespace(id=self.GUILD), FakeChannel(list(state.messages.values())), profile("openai_responses"),
+                self.settings(), state, "job", None, job=self.job(), run_deadline=time.monotonic() + 3,
+            )
+        self.assertEqual(state.image_ids, set())
+
+    async def test_a_part_that_cannot_fit_after_a_shrink_is_a_size_failure(self) -> None:
+        state = self.window(200)
+        chunks = ChannelSummary._split_job(state, self.settings())
+        cog = object.__new__(ChannelSummary)
+        cog._run_agent = AsyncMock(return_value=([], (), "m"))
+
+        def merge_input(result, budget):
+            if budget < 1_000:
+                raise ValueError("cannot shrink further")
+            return {"pad": "x" * 5_000}, set(), set()
+
+        with self.assertRaises(SummaryError) as caught:
+            await cog._run_chunked_job(
+                SimpleNamespace(id=self.GUILD), FakeChannel([]), profile("openai_responses"), self.settings(),
+                state, chunks, self.job(merge_input=merge_input), None,
+                provider_key="k", run_deadline=time.monotonic() + 600, on_progress=AsyncMock(),
+            )
+        self.assertEqual(caught.exception.reason.value, "merge_input_too_large")
+
+    async def test_a_charged_call_counts_its_images_and_a_job_asks_for_the_newest(self) -> None:
+        state = self.window(3)
+        image = channelsummary_module.ImageInput(max(state.messages), 900000000000000001, "data:image/png;base64,AA", "auto")
+        for job, newest in ((self.job(), True), (None, False)):
+            with self.subTest(job=bool(job)):
+                cog = object.__new__(ChannelSummary)
+                cog.fetch_image_inputs = AsyncMock(return_value=(image,))
+                cog.request_provider = AsyncMock(return_value=NormalizedResponse('{"ids": []}', None, (), (), "m", 0))
+                state.image_ids.clear()
+                try:
+                    await cog._run_agent(
+                        SimpleNamespace(id=self.GUILD), FakeChannel(list(state.messages.values())),
+                        profile("openai_responses"), self.settings(), state, "job" if job else "from", None, job=job,
+                    )
+                except SummaryError:
+                    pass  # a summary's parser rejects this stub text; the call was still made
+                self.assertEqual(cog.fetch_image_inputs.await_args.kwargs["newest_first"], newest)
+                self.assertEqual(state.image_ids, {900000000000000001})
+
+
+class TestReviewRoundThree(ChunkedJobHelpers):
+    async def test_a_run_makes_no_more_calls_than_it_was_granted(self) -> None:
+        state = self.window(3)
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        args = (
+            '{"query":"","author_id":"","before_message_id":"","after_message_id":"",'
+            '"start_unix":0,"end_unix":0,"limit":10}'
+        )
+        cog.request_provider = AsyncMock(
+            return_value=NormalizedResponse(None, None, (FunctionCall("c", "search_channel_history", args),), (), "m", 0)
+        )
+        with self.assertRaises((SummaryError, commands.UserFeedbackCheckFailure)):
+            await cog._run_agent(
+                SimpleNamespace(id=self.GUILD), FakeChannel(list(state.messages.values())), profile("openai_responses"),
+                self.settings(), state, "from", None, max_calls=1,
+            )
+        self.assertEqual(cog.request_provider.await_count, 1)
+
+    async def test_a_summary_sends_no_more_distinct_images_than_granted(self) -> None:
+        state = self.window(3)
+        cog = object.__new__(ChannelSummary)
+        images = tuple(
+            channelsummary_module.ImageInput(max(state.messages), 900000000000000000 + index, "data:image/png;base64,AA", "auto")
+            for index in range(3)
+        )
+        cog.fetch_image_inputs = AsyncMock(return_value=images)
+        cog.request_provider = AsyncMock(return_value=NormalizedResponse('{"ids": []}', None, (), (), "m", 0))
+        await cog._run_agent(
+            SimpleNamespace(id=self.GUILD), FakeChannel(list(state.messages.values())), profile("openai_responses"),
+            self.settings(), state, "job", None, job=self.job(), max_images=2,
+        )
+        self.assertEqual(state.image_ids, {900000000000000000, 900000000000000001})
+
+    async def test_the_merge_call_is_told_how_to_read_notes(self) -> None:
+        state = self.window(3)
+        cog = object.__new__(ChannelSummary)
+        cog.fetch_image_inputs = AsyncMock(return_value=())
+        cog.request_provider = AsyncMock(return_value=NormalizedResponse('{"ids": []}', None, (), (), "m", 0))
+        await cog._run_agent(
+            SimpleNamespace(id=self.GUILD), FakeChannel([]), profile("openai_responses"), self.settings(),
+            RunState(state.snapshot_id, set(), {}), "job", None, job=self.job(), input_override="notes", tools=False,
+        )
+        instructions = cog.request_provider.await_args.args[1]["instructions"]
+        self.assertIn(channelsummary_module.MERGE_EVIDENCE_RULES, instructions)
+        self.assertNotIn("top-level author IDs", instructions)
+
+    async def test_a_job_that_waited_out_its_budget_is_refused_before_any_call(self) -> None:
+        tests = TestRangesAndJobs()
+        cog, ctx, snapshot, state, _ = tests.execution_fixture(provider_calls=0)
+        cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id, True)))
+        cog._send_plain = AsyncMock()
+        with patch.object(channelsummary_module, "RUN_BUDGET_SECONDS", 100):
+            self.assertFalse(await cog.run_channel_job(ctx, tests.job()))
+        self.assertIn("Too many summaries", cog._send_plain.await_args.args[1])
+        cog._run_agent.assert_not_awaited()
+        cog._release_guild_attempt.assert_awaited_once()
+
+    def test_long_window_settings_are_in_the_panel_and_defaults_fit_together(self) -> None:
+        values = {option.value for option in channelsummary_module.SettingsSelect(MagicMock()).options}
+        self.assertIn("jobs", values)
+        self.assertEqual(set(channelsummary_module.SETTINGS_CATEGORIES) - values, set())
+        defaults = GUILD_DEFAULTS
+        self.assertLessEqual(
+            defaults["job_max_messages"], 2 * defaults["max_distinct_messages"] * defaults["job_max_chunks"]
+        )
+
+    async def test_a_run_is_handed_the_calls_and_images_it_was_granted(self) -> None:
+        tests = TestRangesAndJobs()
+        cog, ctx, snapshot, state, _ = tests.execution_fixture()
+        reserve = AsyncMock(return_value={"calls": [0.0, 3], "images": [0.0, 2]})
+        with patch("channelsummary.channelsummary.reserve_guild_usage", reserve):
+            await cog._execute_summary(ctx, "auto")
+        kwargs = cog._run_agent.await_args.kwargs
+        self.assertEqual((kwargs["max_calls"], kwargs["max_images"]), (3, 2))
