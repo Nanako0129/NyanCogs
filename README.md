@@ -150,10 +150,25 @@ metadata such as camera GPS is discarded before sending.
 |---|---|
 | Per attachment | 20 MiB and 25 MP |
 | Per request, all attachments | 50 MiB and 100 MP |
-| Attachments considered | The first 20 eligible ones in chronological order |
-| Re-encoded bytes added to one request | At most 16 MB |
+| Attachments considered | A summary: the first `max_images` (default 20, up to 300) eligible ones in chronological order. A Learning run: the newest `max_images`, spread over its parts |
+| Re-encoded bytes added to one request | At most 16 MB, less when the request's text is large, so the body stays under 18 MB |
 
-A lower `image_max_edge` fits more images into one summary.
+A lower `image_max_edge` fits more images into one request.
+
+### Hourly guild quotas
+
+Summaries and jobs such as Learning share three per-guild hourly limits:
+`guild_attempts_per_hour` runs, `guild_provider_calls_per_hour` provider calls and
+`guild_images_per_hour` images. Before its first call a run reserves what it may
+use. It is refused up front only when the calls it needs are not left: a chunked
+Learning run needs one per part plus one to merge, any other run needs one and may
+take up to `agent_max_turns`. Images are granted up to what is left, so a spent image
+quota makes a run go without images rather than fail. Afterwards each reservation
+is replaced by what the run actually used, and a run that never reached the
+provider uses nothing. These counts live in process memory, so a reload or restart
+clears them. `guild_concurrency` limits runs, not requests: with a chunked Learning
+run, one guild can have up to `guild_concurrency` x `job_chunk_concurrency`
+provider requests in flight.
 
 ### Privacy
 
@@ -217,11 +232,19 @@ server until a member with guild-level Manage Messages accepts its own disclosur
 | Command | Purpose |
 |---|---|
 | `/learning recent <6h\|1d> [ended_ago]` | Notes for the last hours or days; `ended_ago` (also hours or days) ends the window that long ago |
-| `/learning since-me` | Notes for everything said in this channel since your own last message |
+| `/learning since-me` | Notes for what was said in this channel since your own last message (its newest part if very long) |
 | `[p]learningset show` / `enable I_ACCEPT` / `disable` | Review the disclosure, enable, or disable (guild-level Manage Messages) |
 
-Windows are bounded by ChannelSummary's `max_duration_hours` and message limits.
-There is no new-message gate, and Learning never moves ChannelSummary's checkpoint.
+Windows are bounded by ChannelSummary's `max_duration_hours`. Up to
+`job_max_messages` messages are read, newest first. A window too long for one
+request is split into parts of at most `max_distinct_messages` messages and nine
+tenths of `max_input_chars` each, measured on the real input; each part is one
+provider call without tools, up to `job_chunk_concurrency` at a time, and one more
+merging request combines the parts' notes. More than `job_max_chunks` parts, or more
+than `job_max_messages` messages, is not refused: Learning keeps the newest, the
+model is told the window was cut, and the footer names the cutoff. A whole run is
+limited to 13 minutes, inside the 15-minute life of a slash command's reply. There
+is no new-message gate, and Learning never moves ChannelSummary's checkpoint.
 
 ### Links
 

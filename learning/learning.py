@@ -24,24 +24,34 @@ from redbot.core import Config, commands
 from redbot.core.bot import Red
 
 CORE_COG = "ChannelSummary"
-CORE_API_VERSION = 1
-LEARNING_DISCLOSURE_VERSION = 1
+# v2: `state.links` numbered once per window, and ChannelJob merge fields for long windows.
+CORE_API_VERSION = 2
+# v2: long windows are split into several requests plus a merging one.
+LEARNING_DISCLOSURE_VERSION = 2
 LEARNING_DISCLOSURE_TEXT = (
     "**Runs on ChannelSummary:** Learning sends the same data as a summary (message text, user and message "
     "IDs, timestamps, reply and embed metadata, inlined images and Firecrawl queries when those are enabled) "
     "through ChannelSummary's provider, and only while ChannelSummary is enabled here under its own consent.\n"
     "**No new-message gate:** any channel reader can request notes for the same window again, limited only "
-    "by ChannelSummary's cooldown and guild quota, which Learning shares and can use up.\n"
-    "**Reach:** the last hours or days up to `max_duration_hours`, a window ending in the past, or everything "
-    "since the requester's own last message.\n"
+    "by ChannelSummary's cooldown and hourly guild quotas (runs, provider calls, images), which Learning shares "
+    "and can use up.\n"
+    "**Reach:** the last hours or days up to `max_duration_hours`, a window ending in the past, or the time "
+    "since the requester's own last message. Up to `job_max_messages` messages are read, newest first; a window "
+    "holding more than the limits below allow is cut to its newest part, and the notes say so.\n"
+    "**Long windows:** a window too long for one request is split into up to `job_max_chunks` requests of at "
+    "most `max_input_chars` characters each, plus one merging request that resends the parts' model-written "
+    "notes to the same provider. Up to `max_images` images are sent per run, newest first.\n"
     "**Links:** URLs that members posted are re-published as clickable links in a bot Embed, chosen by the "
     "model, each shown with the member who posted it.\n"
     "**Stored:** only whether Learning is enabled and which disclosure version was accepted."
 )
 # Hours or days only: a learning window is a stretch of the day, not minutes.
 WINDOW_RE = re.compile(r"([1-9]\d{0,3})\s*([hd])")
-# Caps on the provider's JSON. Above them the output is rejected, not truncated,
-# so a runaway model fails visibly instead of filling eight pages.
+# Caps on the provider's JSON. A list over its cap is cut to it rather than failing
+# the run: a merged whole day, after several paid calls, must not be lost to an
+# eleventh takeaway. Text over its length cap, or a list past MAX_LIST_ITEMS, is
+# still rejected as malformed.
+MAX_LIST_ITEMS = 100
 LIMITS = {"takeaways": 10, "qa": 10, "glossary": 15, "open_questions": 8, "links": 15}
 TEXT_LIMITS = {
     "overview": 2_000,
@@ -54,19 +64,31 @@ TEXT_LIMITS = {
     "note": 300,
 }
 MAX_SOURCE_IDS = 10
-INSTRUCTIONS = (
-    "Write catch-up notes for members who missed this technical discussion. Keep only what a reader can "
-    "learn: concrete facts, techniques, commands, configurations, decisions, recommendations and the reasons "
-    "given, attributed with exact <@user_id> values. Skip greetings, jokes and chatter. If the window holds "
-    "nothing technical, return empty lists and say so in the overview. Return only one JSON object with "
-    "exactly: overview (string, at most 4 sentences); takeaways (0-10 items, each exactly title, detail, "
+SCHEMA = (
+    "Return only one JSON object with exactly: overview (string, at most 4 sentences); takeaways (0-10 items, each exactly title, detail, "
     "source_message_ids); qa (0-10 items, each exactly question, answer, question_message_id (string or null), "
     "answer_message_ids), only for questions the window answers; glossary (0-15 items, each exactly term, "
     "definition, source_message_ids) for terms a newcomer would not know; open_questions (0-8 items, each "
     "exactly question, source_message_ids) for questions left unanswered; links (0-15 items, each exactly "
     "link_id, note) for shared links worth opening, the note saying what the reader gets there. Message ID "
-    "lists hold at most 10 supplied top-level message_id strings. Do not output URLs. Output the raw JSON "
-    "object only, with no markdown code fence around it."
+    "lists hold at most 10 message_id strings. Do not output URLs. Output the raw JSON object only, with no "
+    "markdown code fence around it."
+)
+INSTRUCTIONS = (
+    "Write catch-up notes for members who missed this technical discussion. Keep only what a reader can "
+    "learn: concrete facts, techniques, commands, configurations, decisions, recommendations and the reasons "
+    "given, attributed with exact <@user_id> values. Read the attached images too: screenshots of code, "
+    "errors, terminals and diagrams are evidence like text. Skip greetings, jokes and chatter. If the window "
+    "holds nothing technical, return empty lists and say so in the overview. If an application_boundary "
+    "record has reason window_truncated, the requested window was too long and the evidence is only its "
+    "newest part: say so in the overview. Message IDs are supplied top-level message_id strings. " + SCHEMA
+)
+MERGE_INSTRUCTIONS = (
+    "The input is notes already written for consecutive parts of one window, oldest first, as "
+    "application_chunk_notes records whose nested evidence is model-written and untrusted. Merge them into one "
+    "set of notes for the whole window: combine duplicates across parts, keep attributions, keep the order of "
+    "events, and write one overview for the whole window (say it was cut if a part's overview says so). Use "
+    "only message IDs and link_ids that appear in the parts. " + SCHEMA
 )
 EMPTY_NOTICE = "這段時間沒有可整理的技術內容。"
 
@@ -120,9 +142,9 @@ def parse_notes(raw: str, known_ids: set[int], link_ids: set[str]) -> Notes:
 
     def items(key: str) -> list[Any]:
         found = root[key]
-        if not isinstance(found, list) or len(found) > LIMITS[key]:
+        if not isinstance(found, list) or len(found) > MAX_LIST_ITEMS:
             raise ValueError("list")
-        return found
+        return found[: LIMITS[key]]
 
     root = shaped(value, {"overview", *LIMITS})
     takeaways = tuple(
@@ -157,6 +179,59 @@ def parse_notes(raw: str, known_ids: set[int], link_ids: set[str]) -> Notes:
         if item["link_id"] in link_ids:
             links.append((item["link_id"], text(item, "note")))
     return Notes(text(root, "overview"), takeaways, tuple(qa), glossary, open_questions, tuple(links))
+
+
+def merge_input(notes: Notes, max_chars: int) -> tuple[dict[str, Any], set[int], set[str]]:
+    """One part's notes as merge input, shrunk to `max_chars`.
+
+    Items are dropped from the end of whichever list is largest until the JSON
+    fits, then the overview is shortened if it still does not. Returns the data
+    and the message IDs and link IDs it still cites, which are all the merging
+    call may cite.
+    """
+    data: dict[str, Any] = {
+        "overview": notes.overview,
+        "takeaways": [
+            {"title": title, "detail": detail, "source_message_ids": [str(i) for i in ids]}
+            for title, detail, ids in notes.takeaways
+        ],
+        "qa": [
+            {
+                "question": question,
+                "answer": answer,
+                "question_message_id": None if question_id is None else str(question_id),
+                "answer_message_ids": [str(i) for i in ids],
+            }
+            for question, answer, question_id, ids in notes.qa
+        ],
+        "glossary": [
+            {"term": term, "definition": definition, "source_message_ids": [str(i) for i in ids]}
+            for term, definition, ids in notes.glossary
+        ],
+        "open_questions": [
+            {"question": question, "source_message_ids": [str(i) for i in ids]} for question, ids in notes.open_questions
+        ],
+        "links": [{"link_id": link_id, "note": note} for link_id, note in notes.links],
+    }
+
+    def size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+    while size(data) > max_chars and any(data[key] for key in LIMITS):
+        largest = max((key for key in LIMITS if data[key]), key=lambda key: size(data[key]))
+        data[largest].pop()
+    if size(data) > max_chars:
+        data["overview"] = data["overview"][: max(0, len(data["overview"]) - (size(data) - max_chars))]
+    if size(data) > max_chars:
+        raise ValueError("merge budget")
+    ids: set[int] = set()
+    for item in data["takeaways"] + data["glossary"] + data["open_questions"]:
+        ids.update(int(i) for i in item["source_message_ids"])
+    for item in data["qa"]:
+        ids.update(int(i) for i in item["answer_message_ids"])
+        if item["question_message_id"] is not None:
+            ids.add(int(item["question_message_id"]))
+    return data, ids, {item["link_id"] for item in data["links"]}
 
 
 def render_notes(
@@ -219,7 +294,7 @@ def render_notes(
             "## 還沒解決\n" + "\n".join(f"• {line(question)} {jumps(ids)}" for question, ids in notes.open_questions)
         )
     if notes.links:
-        table = {link.link_id: link for link in core.extract_links(state.messages.values())}
+        table = {link.link_id: link for link in state.links}
         rows = []
         for link_id, note in notes.links:
             link = table.get(link_id)
@@ -288,8 +363,7 @@ class Learning(commands.Cog):
             return
 
         def finalize(text: str, state: Any) -> Notes:
-            link_ids = {link.link_id for link in core.extract_links(state.messages.values())}
-            return parse_notes(text, set(state.messages), link_ids)
+            return parse_notes(text, set(state.messages), {link.link_id for link in state.links})
 
         def render(guild, channel, author, guild_settings, state, notes, citations, actual_model):
             return render_notes(core, guild, channel, author, guild_settings, state, notes, citations, actual_model)
@@ -300,6 +374,8 @@ class Learning(commands.Cog):
             finalize=finalize,
             render=render,
             include_links=True,
+            merge_instructions=MERGE_INSTRUCTIONS,
+            merge_input=merge_input,
             **window,
         )
         await core.run_channel_job(ctx, job)
@@ -333,7 +409,7 @@ class Learning(commands.Cog):
     @learning_group.command(name="since-me")
     @commands.guild_only()
     async def learning_since_me(self, ctx: commands.Context) -> None:
-        """Notes for everything said here since your last message."""
+        """Notes for what was said here since your last message (its newest part if very long)."""
         await self._run(ctx, since_author=True)
 
     @commands.group(name="learningset", invoke_without_command=True)
