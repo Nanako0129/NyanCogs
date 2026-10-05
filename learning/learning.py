@@ -20,14 +20,17 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 import discord
+from discord import app_commands
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
 CORE_COG = "ChannelSummary"
 # v2: `state.links` numbered once per window, and ChannelJob merge fields for long windows.
-CORE_API_VERSION = 2
+# v3: jobs reach as far as job_max_messages, whatever max_duration_hours says.
+CORE_API_VERSION = 3
 # v2: long windows are split into several requests plus a merging one.
-LEARNING_DISCLOSURE_VERSION = 2
+# v3: reach is bounded by job_max_messages, not max_duration_hours, and `from` exists.
+LEARNING_DISCLOSURE_VERSION = 3
 LEARNING_DISCLOSURE_TEXT = (
     "**Runs on ChannelSummary:** Learning sends the same data as a summary (message text, user and message "
     "IDs, timestamps, reply and embed metadata, inlined images and Firecrawl queries when those are enabled) "
@@ -35,9 +38,10 @@ LEARNING_DISCLOSURE_TEXT = (
     "**No new-message gate:** any channel reader can request notes for the same window again, limited only "
     "by ChannelSummary's cooldown and hourly guild quotas (runs, provider calls, images), which Learning shares "
     "and can use up.\n"
-    "**Reach:** the last hours or days up to `max_duration_hours`, a window ending in the past, or the time "
-    "since the requester's own last message. Up to `job_max_messages` messages are read, newest first; a window "
-    "holding more than the limits below allow is cut to its newest part, and the notes say so.\n"
+    "**Reach:** a window of any age: the last hours or days, from a given message or time, a window ending in "
+    "the past, or the time since the requester's own last message. It is not limited by `max_duration_hours`; "
+    "instead up to `job_max_messages` messages are read, newest first, and a window holding more than the "
+    "limits below allow is cut to its newest part, and the notes say so.\n"
     "**Long windows:** a window too long for one request is split into up to `job_max_chunks` requests of at "
     "most `max_input_chars` characters each, plus one merging request that resends the parts' model-written "
     "notes to the same provider. Up to `max_images` images are sent per run, newest first.\n"
@@ -383,17 +387,23 @@ class Learning(commands.Cog):
     @commands.hybrid_group(name="learning", invoke_without_command=True)
     @commands.guild_only()
     async def learning_group(self, ctx: commands.Context) -> None:
-        """Catch-up notes: what was learned, Q&A, terms, open questions and links."""
+        """補課筆記：學到什麼、問與答、名詞、未解問題與參考連結。"""
         await self._send(
             ctx,
-            "`/learning recent <6h|1d> [ended 1d ago]` — notes for a window of hours or days\n"
-            "`/learning since-me` — notes for everything since your last message here",
+            "`/learning recent <6h|1d> [多久以前結束]` — 整理最近幾小時或幾天\n"
+            "`/learning from <訊息連結|2026-10-03T21:00|2d> [終點]` — 從指定的訊息或時間開始整理\n"
+            "`/learning since-me` — 整理你在這裡最後一則訊息之後的討論\n"
+            "每次最多讀伺服器設定的訊息數，從最新的開始；區間更長時只整理最新的部分，頁尾會註明。",
         )
 
     @learning_group.command(name="recent")
     @commands.guild_only()
+    @app_commands.describe(
+        window="整理多久：以小時或天為單位，例如 6h、1d、3d",
+        ended_ago="（選填）讓區間停在多久以前，例如 1d 表示整理到一天前為止",
+    )
     async def learning_recent(self, ctx: commands.Context, window: str, ended_ago: str | None = None) -> None:
-        """Notes for the last hours or days, such as 6h or 1d, optionally ending that long ago."""
+        """整理最近幾小時或幾天的補課筆記，例如 6h、1d。"""
         def hours(text: str) -> int | None:
             match = WINDOW_RE.fullmatch(text.strip().casefold())
             return int(match.group(1)) * (24 if match.group(2) == "d" else 1) if match else None
@@ -401,15 +411,25 @@ class Learning(commands.Cog):
         span = hours(window)
         ended = 0 if ended_ago is None else hours(ended_ago)
         if span is None or ended is None:
-            await self._send(ctx, "Use hours or days, such as 6h or 2d.")
+            await self._send(ctx, "請用小時或天為單位，例如 6h 或 2d。")
             return
-        # Both ends relative to now, so ChannelSummary resolves and bounds them itself.
+        # Both ends relative to now; ChannelSummary resolves them and bounds the read by job_max_messages.
         await self._run(ctx, start=f"{span + ended}h", end=f"{ended}h" if ended else None)
+
+    @learning_group.command(name="from")
+    @commands.guild_only()
+    @app_commands.describe(
+        start="起點：訊息連結（右鍵「複製訊息連結」）、時間 2026-10-03T21:00，或 2d（多久以前）",
+        end="終點（選填，不填就是現在）：訊息連結、時間，或 1h（多久以前）",
+    )
+    async def learning_from(self, ctx: commands.Context, start: str, end: str | None = None) -> None:
+        """從指定的訊息或時間開始整理補課筆記（太長時取最新的部分）。"""
+        await self._run(ctx, start=start, end=end)
 
     @learning_group.command(name="since-me")
     @commands.guild_only()
     async def learning_since_me(self, ctx: commands.Context) -> None:
-        """Notes for what was said here since your last message (its newest part if very long)."""
+        """整理你在這個頻道最後一則訊息之後的討論（太長時取最新的部分）。"""
         await self._run(ctx, since_author=True)
 
     @commands.group(name="learningset", invoke_without_command=True)

@@ -5120,7 +5120,7 @@ class TestRangesAndJobs(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already running", cog._send_plain.await_args.args[1])
 
     def test_api_surface_is_reachable_through_the_cog(self) -> None:
-        self.assertEqual(ChannelSummary.CORE_API_VERSION, 2)
+        self.assertEqual(ChannelSummary.CORE_API_VERSION, 3)
         for name in ("ChannelJob", "run_channel_job", "extract_links", "sanitize_text", "split_embed_text", "footer"):
             self.assertTrue(hasattr(ChannelSummary, name), name)
 
@@ -5813,3 +5813,76 @@ class TestReviewRoundThree(ChunkedJobHelpers):
             await cog._execute_summary(ctx, "auto")
         kwargs = cog._run_agent.await_args.kwargs
         self.assertEqual((kwargs["max_calls"], kwargs["max_images"]), (3, 2))
+
+
+class TestJobReach(unittest.IsolatedAsyncioTestCase):
+    GUILD = 123456789012345678
+
+    def fixture(self, count: int = 5):
+        now = datetime.now(UTC)
+        messages = [stamped(hours * 10, 555555555555555555, now=now) for hours in range(count, 0, -1)]
+        channel = FakeChannel(messages)
+        channel.id, channel.guild = 987654321098765432, SimpleNamespace(id=self.GUILD)
+        settings = {**GUILD_DEFAULTS, "timezone": "UTC", "max_duration_hours": 24, "job_max_messages": 3}
+        return object.__new__(ChannelSummary), channel, messages, settings
+
+    async def resolve(self, cog, channel, settings, newest, **kwargs):
+        args = {"start": None, "end": None, "since_author": False, "invocation_id": None, **kwargs}
+        return await cog._resolve_window(channel, 444444444444444444, settings, newest, 0, **args)
+
+    async def test_a_job_time_start_is_not_capped_by_the_duration_setting(self) -> None:
+        cog, channel, messages, settings = self.fixture()
+        with self.assertRaises(commands.UserFeedbackCheckFailure):
+            await self.resolve(cog, channel, settings, messages[-1], start="45h")
+        _, _, lower = await self.resolve(cog, channel, settings, messages[-1], start="45h", time_limited=False)
+        # 45 h back falls between the 50 h and 40 h messages: accepted, not capped at 24 h.
+        self.assertTrue(messages[0].id < lower[0] <= messages[1].id)
+
+    async def test_since_me_beyond_a_jobs_reach_reads_the_newest_part(self) -> None:
+        cog, channel, messages, settings = self.fixture()
+        # 444... never wrote here; five messages exceed job_max_messages=3.
+        _, _, lower = await self.resolve(cog, channel, settings, messages[-1], since_author=True, time_limited=False)
+        self.assertEqual(lower, (0, False))
+        state = await cog._base_messages(channel, messages[-1], settings, "job", lower, None, 0)
+        self.assertTrue(state.truncated)
+        self.assertEqual(len(state.messages), 1 + 3)  # the snapshot plus job_max_messages
+        # A channel no longer than the limit where the member never spoke is still refused,
+        # including one of exactly job_max_messages messages.
+        # 5 messages: the snapshot plus 4 older ones fit job_max_messages=4 exactly.
+        for limit in (10, 5, 4):
+            with self.subTest(limit=limit), self.assertRaises(commands.UserFeedbackCheckFailure):
+                await self.resolve(
+                    cog, channel, {**settings, "job_max_messages": limit}, messages[-1], since_author=True, time_limited=False
+                )
+
+    async def test_a_job_takes_its_cooldown_before_scanning_the_window(self) -> None:
+        tests = TestRangesAndJobs()
+        cog, ctx, snapshot, _, _ = tests.execution_fixture()
+        cog._user_attempts[(ctx.guild.id, ctx.author.id)] = time.monotonic()
+        cog._resolve_window = AsyncMock()
+        with self.assertRaises(commands.CommandOnCooldown):
+            await cog._execute_summary(ctx, "job", job=tests.job())
+        cog._resolve_window.assert_not_awaited()
+
+    async def test_a_failed_job_that_published_nothing_gets_its_cooldown_back(self) -> None:
+        tests = TestRangesAndJobs()
+        cog, ctx, snapshot, _, _ = tests.execution_fixture(provider_calls=0)
+        cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id, True)))
+        cog._run_agent = AsyncMock(side_effect=SummaryError(ErrorCode.PROVIDER_TIMEOUT))
+        with self.assertRaises(SummaryError):
+            await cog._execute_summary(ctx, "job", job=tests.job())
+        self.assertNotIn((ctx.guild.id, ctx.author.id), cog._user_attempts)
+
+    async def test_only_jobs_resolve_without_the_duration_limit(self) -> None:
+        tests = TestRangesAndJobs()
+        for job in (tests.job(), None):
+            with self.subTest(job=bool(job)):
+                cog, ctx, snapshot, _, channel_scope = tests.execution_fixture()
+                channel_scope.checkpoint_message_id = AsyncMock(return_value=0)
+                channel_scope.checkpoint_message_id.set = AsyncMock()
+                cog._resolve_window = AsyncMock(return_value=(snapshot, 1, (snapshot.id, True)))
+                if job:
+                    await cog._execute_summary(ctx, "job", job=job)
+                else:
+                    await cog._execute_summary(ctx, "range", ("2h", None))
+                self.assertEqual(cog._resolve_window.await_args.kwargs["time_limited"], job is None)

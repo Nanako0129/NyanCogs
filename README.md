@@ -232,10 +232,11 @@ server until a member with guild-level Manage Messages accepts its own disclosur
 | Command | Purpose |
 |---|---|
 | `/learning recent <6h\|1d> [ended_ago]` | Notes for the last hours or days; `ended_ago` (also hours or days) ends the window that long ago |
+| `/learning from <start> [end]` | Notes from a same-channel message link or ID, a local time `2026-10-03T21:00`, or `2d` ago, to an optional end of the same kinds |
 | `/learning since-me` | Notes for what was said in this channel since your own last message (its newest part if very long) |
 | `[p]learningset show` / `enable I_ACCEPT` / `disable` | Review the disclosure, enable, or disable (guild-level Manage Messages) |
 
-Windows are bounded by ChannelSummary's `max_duration_hours`. Up to
+Learning windows are not limited by `max_duration_hours`. Up to
 `job_max_messages` messages are read, newest first. A window too long for one
 request is split into parts of at most `max_distinct_messages` messages and nine
 tenths of `max_input_chars` each, measured on the real input; each part is one
