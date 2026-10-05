@@ -207,7 +207,7 @@ class DisclosureTest(unittest.TestCase):
         readme = (root / "README.md").read_text(encoding="utf-8")
         for text in (lr.LEARNING_DISCLOSURE_TEXT, info, readme):
             normalized = " ".join(text.split())
-            for phrase in ("job_max_messages", "job_max_chunks", "merging request", "max_images"):
+            for phrase in ("job_max_messages", "job_max_chunks", "merging request", "max_images", "not limited by"):
                 with self.subTest(phrase=phrase, place=normalized[:30]):
                     self.assertIn(phrase, normalized)
             self.assertNotIn("everything since", normalized)
@@ -236,7 +236,7 @@ class LearningCommandTest(unittest.IsolatedAsyncioTestCase):
 
     def core(self):
         core = MagicMock()
-        core.CORE_API_VERSION = 2
+        core.CORE_API_VERSION = 3
         core.ChannelJob = ChannelSummary.ChannelJob
         core.run_channel_job = AsyncMock(return_value=True)
         return core
@@ -264,7 +264,13 @@ class LearningCommandTest(unittest.IsolatedAsyncioTestCase):
                 ctx = self.ctx()
                 await lr.Learning.learning_recent.callback(self.cog(core=core), ctx, window, ended)
                 core.run_channel_job.assert_not_awaited()
-                self.assertIn("hours or days", ctx.send.await_args.args[0])
+                self.assertIn("小時或天", ctx.send.await_args.args[0])
+
+    async def test_from_passes_its_endpoints_to_the_core(self):
+        core = self.core()
+        await lr.Learning.learning_from.callback(self.cog(core=core), self.ctx(), "https://discord.com/x", "2h")
+        job = core.run_channel_job.await_args.args[1]
+        self.assertEqual((job.start, job.end, job.since_author), ("https://discord.com/x", "2h", False))
 
     async def test_since_me_is_resolved_by_the_core(self):
         core = self.core()
@@ -275,7 +281,7 @@ class LearningCommandTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_gates_answer_before_any_run(self):
         stale = self.core()
-        stale.CORE_API_VERSION = 1
+        stale.CORE_API_VERSION = 2
         cases = (
             (self.cog(core=None), "needs ChannelSummary"),
             (self.cog(core=stale), "needs ChannelSummary"),

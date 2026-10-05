@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
+from discord import app_commands
 from PIL import Image, UnidentifiedImageError
 from redbot.core import Config, checks, commands
 from redbot.core.bot import Red
@@ -75,7 +76,8 @@ DISCLOSURE_VERSION = 4
 # The runtime contract other cogs reach through `bot.get_cog("ChannelSummary")`;
 # see `run_channel_job`. Bump it on any incompatible change to that surface.
 # v2: ChannelJob merge fields for long windows, and `state.links` numbered once per window.
-CORE_API_VERSION = 2
+# v3: a job's reach is bounded by job_max_messages, not max_duration_hours.
+CORE_API_VERSION = 3
 # A shared-links table longer than this costs more input than it is worth; a
 # whole day of a busy channel is split across chunks, each showing its own links.
 MAX_SHARED_LINKS = 100
@@ -570,13 +572,15 @@ class SharedLink:
 
 @dataclass(frozen=True)
 class ChannelJob:
-    """A non-summary run over a bounded window of the invoking channel (API v1).
+    """A non-summary run over a window of the invoking channel (see CORE_API_VERSION).
 
     Another cog builds one through `ChannelSummary.ChannelJob` and passes it to
     `run_channel_job`. The window is given as raw endpoint text and resolved by
     ChannelSummary after its own permission and consent checks, so a consumer
-    cannot widen it. A job never completes topic boundaries, never consults the
-    new-message gate and never moves the checkpoint.
+    cannot widen it. Its reach is bounded by `job_max_messages`, newest first,
+    not by `max_duration_hours`; a longer window is cut to its newest part. A job
+    never completes topic boundaries, never consults the new-message gate and
+    never moves the checkpoint.
 
     `finalize(text, state)` turns the provider's final text into a result and
     raises on anything invalid; `render(guild, channel, author, settings, state,
@@ -2989,17 +2993,19 @@ class ChannelSummary(commands.Cog):
         end: str | None,
         since_author: bool,
         invocation_id: int | None,
+        time_limited: bool = True,
     ) -> tuple[discord.Message, int, tuple[int, bool]]:
         """Resolve range text against this channel, after the permission and consent checks.
 
         Returns the snapshot (newest eligible message at or before the end), the
         history read so far, and the inclusive lower snowflake paired with whether
-        it is a message that must exist.
+        it is a message that must exist. A job is not `time_limited`: its reach is
+        bounded by `job_max_messages` instead of `max_duration_hours`.
         """
         zone = ZoneInfo(str(settings["timezone"]))
         now = datetime.now(UTC)
         include_bots = bool(settings["include_bots"])
-        max_age = timedelta(hours=int(settings["max_duration_hours"]))
+        max_age = timedelta(hours=int(settings["max_duration_hours"])) if time_limited else None
 
         def endpoint(text: str) -> int | datetime:
             try:
@@ -3018,10 +3024,12 @@ class ChannelSummary(commands.Cog):
                 inspected += scanned
         if since_author:
             start_id, scanned = await self._last_message_by(
-                channel, author_id, snapshot, include_bots, invocation_id, max_age, int(settings["job_max_messages"])
+                channel, author_id, snapshot, include_bots, invocation_id, int(settings["job_max_messages"])
             )
             inspected += scanned
-            lower = (start_id, True)
+            # 0: the member's message is older than a job reads, so the window has no
+            # start of its own and collection cuts it to its newest part.
+            lower = (start_id, start_id != 0)
         elif start is None:
             raise commands.UserFeedbackCheckFailure("A range needs a start.")
         else:
@@ -3029,7 +3037,7 @@ class ChannelSummary(commands.Cog):
             if isinstance(bound, int):
                 lower = (bound, True)
             else:
-                if snapshot.created_at - bound > max_age:
+                if max_age is not None and snapshot.created_at - bound > max_age:
                     raise commands.UserFeedbackCheckFailure("The range exceeds this server's configured duration limit.")
                 lower = (discord.utils.time_snowflake(bound, high=False), False)
         if lower[0] > snapshot.id:
@@ -3043,23 +3051,25 @@ class ChannelSummary(commands.Cog):
         snapshot: discord.Message,
         include_bots: bool,
         invocation_id: int | None,
-        max_age: timedelta,
-        scan_limit: int = 1_000,
+        scan_limit: int,
     ) -> tuple[int, int]:
-        """The member's newest eligible message at or before the snapshot, and the messages read."""
-        cutoff = snapshot.created_at - max_age
+        """For since-me: the member's newest eligible message, or 0, and the messages read.
+
+        A job reads the snapshot plus `scan_limit` older messages. When the member's
+        message lies beyond that, 0 comes back and collection cuts the window to its
+        newest part; one extra message is read to tell "beyond" from "never posted
+        in a channel this short", which is refused.
+        """
         scanned = 0
-        async for message in channel.history(limit=scan_limit, before=discord.Object(id=snapshot.id + 1)):
+        async for message in channel.history(limit=scan_limit + 2, before=discord.Object(id=snapshot.id + 1)):
             scanned += 1
-            if message.created_at < cutoff:
-                break
             if message.author.id == author_id and is_eligible(message, include_bots, invocation_id):
                 if message.id == snapshot.id:
                     raise commands.UserFeedbackCheckFailure("Nothing has been said here since your last message.")
                 return message.id, scanned
-        raise commands.UserFeedbackCheckFailure(
-            "No message of yours was found here within the scan and duration limits."
-        )
+        if scanned > scan_limit + 1:
+            return 0, scanned
+        raise commands.UserFeedbackCheckFailure("No message of yours was found in this channel.")
 
     @staticmethod
     def _split_job(state: RunState, settings: Mapping[str, Any]) -> list[list[int]]:
@@ -4273,6 +4283,12 @@ class ChannelSummary(commands.Cog):
                     invocation_id=invocation_id,
                     progress_id=None,
                 )
+                # Before any window scan: since-me alone can read job_max_messages + 2
+                # messages, which a member on cooldown must not trigger. A run that
+                # publishes nothing is still refunded below, as it always was.
+                user_reservation = self._reserve_user_attempt(
+                    ctx.guild.id, ctx.author.id, int(settings["user_cooldown_seconds"])
+                )
                 if mode in {"range", "job"}:
                     start, end, since_author = (*value, False) if job is None else (job.start, job.end, job.since_author)
                     snapshot, initial_inspected, value = await self._resolve_window(
@@ -4285,6 +4301,7 @@ class ChannelSummary(commands.Cog):
                         end=end,
                         since_author=since_author,
                         invocation_id=invocation_id,
+                        time_limited=job is None,
                     )
                 # A job never waits for new messages or moves the checkpoint. A range
                 # does both exactly when it reaches past the checkpoint, so ending it one
@@ -4308,11 +4325,6 @@ class ChannelSummary(commands.Cog):
                         f"This channel needs {settings['new_messages_required']} new human messages after its last "
                         "successful summary. Members with guild-level Manage Messages are exempt."
                     )
-                user_reservation = self._reserve_user_attempt(
-                    ctx.guild.id,
-                    ctx.author.id,
-                    int(settings["user_cooldown_seconds"]),
-                )
                 state = await self._base_messages(
                     ctx.channel,
                     snapshot,
@@ -4776,7 +4788,7 @@ class ChannelSummary(commands.Cog):
 
     @commands.hybrid_group(name="summary", invoke_without_command=True)
     async def summary_group(self, ctx: commands.Context) -> None:
-        """Create an attributed channel summary or configure the cog."""
+        """摘要這個頻道的討論：誰說了什麼、決定了什麼、還有什麼沒解決。"""
         embed = discord.Embed(
             title="ChannelSummary help",
             description=(
@@ -4796,14 +4808,16 @@ class ChannelSummary(commands.Cog):
 
     @summary_group.command(name="auto")
     @commands.guild_only()
+    @app_commands.describe(count="要讀幾則最近的訊息（不填用伺服器預設；上限依伺服器設定）")
     async def summary_auto(self, ctx: commands.Context, count: int | None = None) -> None:
-        """Summarize recent messages and complete the natural topic start."""
+        """摘要最近的訊息，並往回補到話題的起點。"""
         await self._invoke_summary(ctx, "auto", count)
 
     @summary_group.command(name="from")
     @commands.guild_only()
+    @app_commands.describe(message="起點訊息：在訊息上按右鍵「複製訊息連結」貼上，或填訊息 ID")
     async def summary_from(self, ctx: commands.Context, message: str) -> None:
-        """Summarize from a same-channel message ID or link."""
+        """從指定的訊息開始摘要到現在（含那則訊息）。"""
         try:
             message_id = parse_message_reference(message, ctx.guild.id, ctx.channel.id)
         except ValueError as error:
@@ -4813,8 +4827,9 @@ class ChannelSummary(commands.Cog):
 
     @summary_group.command(name="time")
     @commands.guild_only()
+    @app_commands.describe(duration="多久以內：例如 30m、2h、1d（m 分鐘、h 小時、d 天）")
     async def summary_time(self, ctx: commands.Context, duration: str) -> None:
-        """Summarize a duration such as 30m, 2h, or 1d."""
+        """摘要最近一段時間的訊息，例如 30m、2h、1d。"""
         try:
             parsed = parse_duration(duration)
         except ValueError as error:
@@ -4824,14 +4839,18 @@ class ChannelSummary(commands.Cog):
 
     @summary_group.command(name="range")
     @commands.guild_only()
+    @app_commands.describe(
+        start="起點：訊息連結、時間 2026-10-03T21:00，或 2h（多久以前）",
+        end="終點（選填，不填就是現在）：訊息連結、時間，或 1h（多久以前）",
+    )
     async def summary_range(self, ctx: commands.Context, start: str, end: str | None = None) -> None:
-        """Summarize from start to end: a message link, `YYYY-MM-DDTHH:MM`, or `2h` ago."""
+        """摘要過去任一段區間：起訖點可用訊息連結、時間或「多久以前」。"""
         await self._invoke_summary(ctx, "range", (start, end))
 
     @summary_group.command(name="settings")
     @commands.guild_only()
     async def summary_settings(self, ctx: commands.Context) -> None:
-        """Open the complete Select and Modal settings panel."""
+        """開啟設定面板（需要伺服器層級「管理訊息」權限）。"""
         await self._send_settings_panel(ctx)
 
     @commands.group(name="summaryset", aliases=["sumset"], invoke_without_command=True)
@@ -4928,7 +4947,7 @@ class ChannelSummary(commands.Cog):
     @summary_group.group(name="provider", invoke_without_command=True)
     @checks.is_owner()
     async def summary_provider(self, ctx: commands.Context) -> None:
-        """Manage global non-secret provider profiles (bot owner only)."""
+        """管理 provider 設定檔（僅限 bot 擁有者）。"""
         if ctx.invoked_subcommand is None:
             await ctx.invoke(self.provider_list)
 
@@ -4945,7 +4964,7 @@ class ChannelSummary(commands.Cog):
 
     @summary_provider.command(name="list")
     async def provider_list(self, ctx: commands.Context) -> None:
-        """List provider profiles without secrets."""
+        """列出所有 provider 設定檔（不含金鑰）。"""
         profiles = await self.config.profiles()
         if not profiles:
             await self._send_plain(ctx, "No provider profiles are configured.")
@@ -4964,6 +4983,13 @@ class ChannelSummary(commands.Cog):
             await self._send_plain(ctx, page)
 
     @summary_provider.command(name="add")
+    @app_commands.describe(
+        name="設定檔名稱，例如 cliproxy",
+        dialect="openai_responses、openrouter_responses、generic_responses 或 generic_chat",
+        origin="provider 位址，例如 https://api.openai.com 或 http://192.168.x.x:8317",
+        token_service="Red 共用金鑰的服務名稱，例如 channelsummary_cliproxy",
+        models="允許的模型，以逗號分隔",
+    )
     async def provider_add(
         self,
         ctx: commands.Context,
@@ -4974,7 +5000,7 @@ class ChannelSummary(commands.Cog):
         *,
         models: str,
     ) -> None:
-        """Add or replace a profile; models is a comma-separated allowlist."""
+        """新增或取代 provider 設定檔；models 是以逗號分隔的允許清單。"""
         raw = {
             "dialect": dialect,
             "origin": origin,
@@ -5012,8 +5038,9 @@ class ChannelSummary(commands.Cog):
         )
 
     @summary_provider.command(name="remove")
+    @app_commands.describe(name="要移除的設定檔名稱")
     async def provider_remove(self, ctx: commands.Context, name: str) -> None:
-        """Remove a non-secret provider profile."""
+        """移除 provider 設定檔。"""
         profiles = await self.config.profiles()
         normalized = name.casefold()
         if profiles.pop(normalized, None) is None:
@@ -5024,8 +5051,9 @@ class ChannelSummary(commands.Cog):
         await ctx.tick()
 
     @summary_provider.command(name="models")
+    @app_commands.describe(name="設定檔名稱", models="新的模型允許清單，以逗號分隔（會整份取代）")
     async def provider_models(self, ctx: commands.Context, name: str, *, models: str) -> None:
-        """Replace a profile's comma-separated model allowlist."""
+        """取代設定檔的模型允許清單。"""
         profiles = await self.config.profiles()
         raw = profiles.get(name.casefold())
         if not isinstance(raw, dict):
@@ -5044,8 +5072,9 @@ class ChannelSummary(commands.Cog):
         await ctx.tick()
 
     @summary_provider.command(name="key")
+    @app_commands.describe(name="要設定金鑰的設定檔名稱")
     async def provider_key(self, ctx: commands.Context, name: str) -> None:
-        """Open Red's owner-only shared API token modal for a profile."""
+        """開啟設定檔的 API 金鑰輸入視窗（僅限 bot 擁有者）。"""
         try:
             item = await self.get_profile(name)
         except SummaryError as error:
@@ -5059,7 +5088,7 @@ class ChannelSummary(commands.Cog):
 
     @summary_provider.command(name="webkey")
     async def provider_webkey(self, ctx: commands.Context) -> None:
-        """Open Red's owner-only Firecrawl shared API token modal."""
+        """開啟 Firecrawl API 金鑰輸入視窗（僅限 bot 擁有者）。"""
         view = SetApiView(
             default_service=FIRECRAWL_TOKEN_SERVICE,
             default_keys={"api_key": ""},
@@ -5073,8 +5102,9 @@ class ChannelSummary(commands.Cog):
         await ctx.send("Set the Firecrawl `api_key` through Red's shared API token storage.", **kwargs)
 
     @summary_provider.command(name="webquota")
+    @app_commands.describe(limit="（選填）新的每小時 Firecrawl 呼叫上限；不填只顯示目前值")
     async def provider_webquota(self, ctx: commands.Context, limit: int | None = None) -> None:
-        """Show or set the process-wide shared Firecrawl hourly call cap."""
+        """查看或設定所有伺服器共用的 Firecrawl 每小時呼叫上限。"""
         if limit is not None:
             if isinstance(limit, bool) or not 1 <= limit <= 500:
                 await self._send_plain(ctx, "Firecrawl hourly quota must be between 1 and 500.")

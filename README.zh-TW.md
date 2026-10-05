@@ -161,10 +161,11 @@ Learning 透過 `bot.get_cog` 在執行期呼叫 ChannelSummary。Provider、使
 | 指令 | 用途 |
 |---|---|
 | `/learning recent <6h\|1d> [ended_ago]` | 整理最近幾小時或幾天的筆記；`ended_ago` 同樣以小時或天為單位，讓區間停在那麼久以前 |
+| `/learning from <起點> [終點]` | 從同頻道的訊息連結或 ID、當地時間 `2026-10-03T21:00`，或 `2d`（多久以前）開始整理，終點可選，格式相同 |
 | `/learning since-me` | 整理你在這個頻道最後一則訊息之後的討論（太長時只取最新的部分） |
 | `[p]learningset show` / `enable I_ACCEPT` / `disable` | 檢視揭露條款、啟用或停用（需伺服器層級「管理訊息」權限） |
 
-區間受 ChannelSummary 的 `max_duration_hours` 限制，最多讀取 `job_max_messages` 則，從最新的開始。一次請求放不下的區間會切成多段，每段最多 `max_distinct_messages` 則、實際輸入不超過 `max_input_chars` 的九成；每段是一次不開工具的 provider 呼叫，最多同時 `job_chunk_concurrency` 段，最後再用一次合併請求整合各段筆記。超過 `job_max_chunks` 段或 `job_max_messages` 則時不會報錯：Learning 保留最新的部分，告訴模型區間被截斷，頁尾也會標出截斷點。整次執行限制在 13 分鐘內，避開斜線指令回覆 15 分鐘的失效時間。Learning 沒有新訊息門檻，也不會移動 ChannelSummary 的檢查點。
+Learning 的區間不受 `max_duration_hours` 限制，最多讀取 `job_max_messages` 則，從最新的開始。一次請求放不下的區間會切成多段，每段最多 `max_distinct_messages` 則、實際輸入不超過 `max_input_chars` 的九成；每段是一次不開工具的 provider 呼叫，最多同時 `job_chunk_concurrency` 段，最後再用一次合併請求整合各段筆記。超過 `job_max_chunks` 段或 `job_max_messages` 則時不會報錯：Learning 保留最新的部分，告訴模型區間被截斷，頁尾也會標出截斷點。整次執行限制在 13 分鐘內，避開斜線指令回覆 15 分鐘的失效時間。Learning 沒有新訊息門檻，也不會移動 ChannelSummary 的檢查點。
 
 ### 連結
 
