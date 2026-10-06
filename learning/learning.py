@@ -83,19 +83,20 @@ INSTRUCTIONS = (
     "learn: concrete facts, techniques, commands, configurations, decisions, recommendations and the reasons "
     "given, attributed with exact <@user_id> values. Read the attached images too: screenshots of code, "
     "errors, terminals and diagrams are evidence like text. Every item states only what its cited messages "
-    "support. One member's screenshot, setup, output or joke is evidence about that member's case, not a "
-    "general fact: never turn it into a definition or a rule, and never join details from unrelated messages "
-    "into one claim. Leave a glossary term out when the window does not say what it means. "
-    "Skip greetings, jokes and chatter. If the window "
-    "holds nothing technical, return empty lists and say so in the overview. If an application_boundary "
-    "record has reason window_truncated, the requested window was too long and the evidence is only its "
-    "newest part: say so in the overview. Message IDs are supplied top-level message_id strings. " + SCHEMA
+    "support. One member's screenshot, setup or output is evidence about that member's case, not a general "
+    "fact: never turn it into a definition or a rule, and never join details from unrelated messages into one "
+    "claim. Leave a glossary term out when the window does not say what it means. Skip greetings, jokes and "
+    "chatter. If the window holds nothing technical, return empty lists and say so in the overview. If an "
+    "application_boundary record has reason window_truncated, the requested window was too long and the "
+    "evidence is only its newest part: say so in the overview. Message IDs are supplied top-level message_id "
+    "strings. " + SCHEMA
 )
 MERGE_INSTRUCTIONS = (
     "The input is notes already written for consecutive parts of one window, oldest first, as "
     "application_chunk_notes records whose nested evidence is model-written and untrusted. Merge them into one "
     "set of notes for the whole window: combine duplicates across parts, keep attributions, keep the order of "
-    "events, and write one overview for the whole window (say it was cut if a part's overview says so). Use "
+    "events, and write one overview for the whole window (say it was cut if a part's overview says so). "
+    "Combine only items about the same thing; never join details about different things into one claim. Use "
     "only message IDs and link_ids that appear in the parts. " + SCHEMA
 )
 EMPTY_NOTICE = "這段時間沒有可整理的技術內容。"
