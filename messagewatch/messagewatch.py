@@ -950,10 +950,12 @@ def _reported_nanodollars(usage: Mapping[str, Any]) -> int:
 def responses_url(api_base: str) -> str:
     """The Responses endpoint under `api_base`.
 
-    A bare origin is OpenRouter's layout, `/api/v1/responses`, which is what
-    every stored value meant before a path was accepted. A base that carries
-    its own prefix gets only `/responses`, which is how an OpenAI-style server
-    such as CLIProxyAPI is named: `http://192.168.123.208:8317/v1`.
+    A bare origin gets OpenRouter's layout, `/api/v1/responses`, the only
+    suffix this cog appended before. A base with any path gets only
+    `/responses`, which is how an OpenAI-style server such as CLIProxyAPI is
+    named: `http://192.168.1.2:8317/v1`. A stored base that already had a path
+    changes URL under this rule; the production value had none when this
+    shipped.
     """
     base = api_base.rstrip("/")
     return base + ("/responses" if urlsplit(base).path else "/api/v1/responses")
@@ -993,6 +995,10 @@ def endpoint_is_allowed(value: str) -> bool:
     # state and test, and "no non-empty userinfo" is not the rule the comment
     # above claims. An "@" inside the netloc is always the userinfo separator.
     if "@" in parts.netloc:
+        return False
+    # `responses_url` appends to the string, so a query or fragment would sit
+    # in front of the appended path and the request would go somewhere else.
+    if "?" in value or "#" in value:
         return False
     if parts.scheme == "https":
         return bool(parts.hostname)
