@@ -3188,8 +3188,8 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(url("http://10.0.0.2:8318/"), "http://10.0.0.2:8318/api/v1/responses")
         self.assertEqual(url("http://10.0.0.2:8317/v1"), "http://10.0.0.2:8317/v1/responses")
         self.assertEqual(url("http://10.0.0.2:8317/v1/"), "http://10.0.0.2:8317/v1/responses")
-        self.assertFalse(module.endpoint_is_allowed("https://openrouter.ai?x=1"))
-        self.assertFalse(module.endpoint_is_allowed("http://10.0.0.2:8317/v1#a"))
+        self.assertEqual(url("http://10.0.0.2:8317/v1/responses"), "http://10.0.0.2:8317/v1/responses")
+        self.assertEqual(url("https://openrouter.ai?x=1"), "https://openrouter.ai/api/v1/responses?x=1")
 
     def test_the_reported_cost_reads_byok_from_the_right_field(self) -> None:
         # Measured against the live relay on 2026-09-21. Under BYOK the

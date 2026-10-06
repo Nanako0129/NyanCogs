@@ -27,7 +27,7 @@ from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Iterable, Mapping, NamedTuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import discord
@@ -953,12 +953,16 @@ def responses_url(api_base: str) -> str:
     A bare origin gets OpenRouter's layout, `/api/v1/responses`, the only
     suffix this cog appended before. A base with any path gets only
     `/responses`, which is how an OpenAI-style server such as CLIProxyAPI is
-    named: `http://192.168.1.2:8317/v1`. A stored base that already had a path
-    changes URL under this rule; the production value had none when this
-    shipped.
+    named: `http://192.168.1.2:8317/v1`. A path already ending in
+    `/responses` is used as given. Built from the parts, so a query stays
+    after the path. A stored base that already had a path changes URL under
+    this rule; the production value had none when this shipped.
     """
-    base = api_base.rstrip("/")
-    return base + ("/responses" if urlsplit(base).path else "/api/v1/responses")
+    parts = urlsplit(api_base)
+    path = parts.path.rstrip("/")
+    if not path.endswith("/responses"):
+        path += "/responses" if path else "/api/v1/responses"
+    return urlunsplit(parts._replace(path=path))
 
 
 def endpoint_is_allowed(value: str) -> bool:
@@ -995,10 +999,6 @@ def endpoint_is_allowed(value: str) -> bool:
     # state and test, and "no non-empty userinfo" is not the rule the comment
     # above claims. An "@" inside the netloc is always the userinfo separator.
     if "@" in parts.netloc:
-        return False
-    # `responses_url` appends to the string, so a query or fragment would sit
-    # in front of the appended path and the request would go somewhere else.
-    if "?" in value or "#" in value:
         return False
     if parts.scheme == "https":
         return bool(parts.hostname)
@@ -2620,7 +2620,7 @@ class MessageWatch(commands.Cog):
         """
         fields = {
             "api_base": ("image_api_base", "視覺模型的 API 根位址。只寫 origin（`https://openrouter.ai`）會接 `/api/v1/responses`；"
-                         "帶路徑（`http://192.168.1.2:8317/v1`）則只接 `/responses`"),
+                         "帶路徑（`http://192.168.1.2:8317/v1`）則只接 `/responses`；已以 `/responses` 結尾就原樣使用"),
             "model": ("image_model", "視覺模型名稱。沒有預設值——哪一個讀中文截圖最準還沒量過。"),
         }
         scope = self.config

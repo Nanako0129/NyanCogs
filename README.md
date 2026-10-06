@@ -356,7 +356,7 @@ A channel can have its image attachments read, off by default:
 ```
 
 A bare origin is called at `/api/v1/responses` (OpenRouter's layout); a base with
-a path, such as `http://192.168.1.2:8317/v1` for CLIProxyAPI, gets `/responses`.
+a path, such as `http://192.168.1.2:8317/v1` for CLIProxyAPI, gets `/responses`; a path already ending in `/responses` is used as given.
 
 Only the **characters in the image** are asked for, verbatim — not a description
 of it. A scam here is a screenshot with text in it, the text is the evidence, and
