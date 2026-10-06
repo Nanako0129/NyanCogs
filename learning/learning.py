@@ -96,8 +96,8 @@ MERGE_INSTRUCTIONS = (
     "application_chunk_notes records whose nested evidence is model-written and untrusted. Merge them into one "
     "set of notes for the whole window: combine only duplicates (items stating the same fact), keep "
     "attributions, keep the order of events, and write one overview for the whole window (say it was cut if a "
-    "part's overview says so). Never join details from different items into one claim, never present one "
-    "member's case as a general definition or fact, and leave a glossary term out when no part defines it. Use "
+    "part's overview says so). Never join details from different items into one item, and never present one "
+    "member's case as a general definition or fact. Use "
     "only message IDs and link_ids that appear in the parts. " + SCHEMA
 )
 EMPTY_NOTICE = "這段時間沒有可整理的技術內容。"
