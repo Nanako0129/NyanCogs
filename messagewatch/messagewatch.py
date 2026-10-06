@@ -947,6 +947,18 @@ def _reported_nanodollars(usage: Mapping[str, Any]) -> int:
     return round(value * 1_000_000_000)
 
 
+def responses_url(api_base: str) -> str:
+    """The Responses endpoint under `api_base`.
+
+    A bare origin is OpenRouter's layout, `/api/v1/responses`, which is what
+    every stored value meant before a path was accepted. A base that carries
+    its own prefix gets only `/responses`, which is how an OpenAI-style server
+    such as CLIProxyAPI is named: `http://192.168.123.208:8317/v1`.
+    """
+    base = api_base.rstrip("/")
+    return base + ("/responses" if urlsplit(base).path else "/api/v1/responses")
+
+
 def endpoint_is_allowed(value: str) -> bool:
     """Whether the vision endpoint may be stored.
 
@@ -1601,7 +1613,7 @@ class MessageWatch(commands.Cog):
                 timeout=timeout, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
             ) as session:
                 async with session.post(
-                    api_base.rstrip("/") + "/api/v1/responses",
+                    responses_url(api_base),
                     data=payload,
                     headers={"Authorization": f"Bearer {token}",
                              "Content-Type": "application/json"},
@@ -2601,7 +2613,8 @@ class MessageWatch(commands.Cog):
         open to the administrators who have to configure a channel around it.
         """
         fields = {
-            "api_base": ("image_api_base", "視覺模型的 API 根位址，例如 `https://openrouter.ai`"),
+            "api_base": ("image_api_base", "視覺模型的 API 根位址。只寫 origin（`https://openrouter.ai`）會接 `/api/v1/responses`；"
+                         "帶路徑（`http://192.168.1.2:8317/v1`）則只接 `/responses`"),
             "model": ("image_model", "視覺模型名稱。沒有預設值——哪一個讀中文截圖最準還沒量過。"),
         }
         scope = self.config

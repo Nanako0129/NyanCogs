@@ -3180,6 +3180,13 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
             text, tin, tout, nanos, failure = await cog._extract_text("https://x", "k", "m", "data:,")
         self.assertEqual((text, tin, tout, nanos, failure), ("抄到的字", 316, 41, 69_400, ""))
 
+    def test_the_responses_url_keeps_a_bare_origin_on_openrouter(self) -> None:
+        url = module.responses_url
+        self.assertEqual(url("https://openrouter.ai"), "https://openrouter.ai/api/v1/responses")
+        self.assertEqual(url("http://10.0.0.2:8318/"), "http://10.0.0.2:8318/api/v1/responses")
+        self.assertEqual(url("http://10.0.0.2:8317/v1"), "http://10.0.0.2:8317/v1/responses")
+        self.assertEqual(url("http://10.0.0.2:8317/v1/"), "http://10.0.0.2:8317/v1/responses")
+
     def test_the_reported_cost_reads_byok_from_the_right_field(self) -> None:
         # Measured against the live relay on 2026-09-21. Under BYOK the
         # upstream provider bills directly, so OpenRouter reports `cost: 0`

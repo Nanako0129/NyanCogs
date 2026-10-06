@@ -355,6 +355,9 @@ A channel can have its image attachments read, off by default:
 [p]watch images #一般討論 on                      # guild manager
 ```
 
+A bare origin is called at `/api/v1/responses` (OpenRouter's layout); a base with
+a path, such as `http://192.168.1.2:8317/v1` for CLIProxyAPI, gets `/responses`.
+
 Only the **characters in the image** are asked for, verbatim — not a description
 of it. A scam here is a screenshot with text in it, the text is the evidence, and
 a description is open-ended generation whose errors nobody can check against the
