@@ -3177,8 +3177,19 @@ class TestImageAux(unittest.IsolatedAsyncioTestCase):
         session_ctx.__aenter__ = AsyncMock(return_value=session)
         session_ctx.__aexit__ = AsyncMock(return_value=False)
         with patch("messagewatch.messagewatch.aiohttp.ClientSession", return_value=session_ctx):
-            text, tin, tout, nanos, failure = await cog._extract_text("https://x", "k", "m", "data:,")
+            text, tin, tout, nanos, failure = await cog._extract_text(
+                "http://10.0.0.2:8317/v1", "k", "m", "data:,")
         self.assertEqual((text, tin, tout, nanos, failure), ("抄到的字", 316, 41, 69_400, ""))
+        self.assertEqual(session.post.call_args.args[0], "http://10.0.0.2:8317/v1/responses")
+
+    def test_the_responses_url_keeps_a_bare_origin_on_openrouter(self) -> None:
+        url = module.responses_url
+        self.assertEqual(url("https://openrouter.ai"), "https://openrouter.ai/api/v1/responses")
+        self.assertEqual(url("http://10.0.0.2:8318/"), "http://10.0.0.2:8318/api/v1/responses")
+        self.assertEqual(url("http://10.0.0.2:8317/v1"), "http://10.0.0.2:8317/v1/responses")
+        self.assertEqual(url("http://10.0.0.2:8317/v1/"), "http://10.0.0.2:8317/v1/responses")
+        self.assertEqual(url("http://10.0.0.2:8317/v1/responses"), "http://10.0.0.2:8317/v1/responses")
+        self.assertEqual(url("https://openrouter.ai?x=1"), "https://openrouter.ai/api/v1/responses?x=1")
 
     def test_the_reported_cost_reads_byok_from_the_right_field(self) -> None:
         # Measured against the live relay on 2026-09-21. Under BYOK the

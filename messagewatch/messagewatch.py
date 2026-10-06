@@ -27,7 +27,7 @@ from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from itertools import islice
 from typing import Any, Iterable, Mapping, NamedTuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import discord
@@ -947,6 +947,24 @@ def _reported_nanodollars(usage: Mapping[str, Any]) -> int:
     return round(value * 1_000_000_000)
 
 
+def responses_url(api_base: str) -> str:
+    """The Responses endpoint under `api_base`.
+
+    A bare origin gets OpenRouter's layout, `/api/v1/responses`, the only
+    suffix this cog appended before. A base with any path gets only
+    `/responses`, which is how an OpenAI-style server such as CLIProxyAPI is
+    named: `http://192.168.1.2:8317/v1`. A path already ending in
+    `/responses` is used as given. Built from the parts, so a query stays
+    after the path. A stored base that already had a path changes URL under
+    this rule; the production value had none when this shipped.
+    """
+    parts = urlsplit(api_base)
+    path = parts.path.rstrip("/")
+    if not path.endswith("/responses"):
+        path += "/responses" if path else "/api/v1/responses"
+    return urlunsplit(parts._replace(path=path))
+
+
 def endpoint_is_allowed(value: str) -> bool:
     """Whether the vision endpoint may be stored.
 
@@ -1601,7 +1619,7 @@ class MessageWatch(commands.Cog):
                 timeout=timeout, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
             ) as session:
                 async with session.post(
-                    api_base.rstrip("/") + "/api/v1/responses",
+                    responses_url(api_base),
                     data=payload,
                     headers={"Authorization": f"Bearer {token}",
                              "Content-Type": "application/json"},
@@ -2601,7 +2619,8 @@ class MessageWatch(commands.Cog):
         open to the administrators who have to configure a channel around it.
         """
         fields = {
-            "api_base": ("image_api_base", "視覺模型的 API 根位址，例如 `https://openrouter.ai`"),
+            "api_base": ("image_api_base", "視覺模型的 API 根位址。只寫 origin（`https://openrouter.ai`）會接 `/api/v1/responses`；"
+                         "帶路徑（`http://192.168.1.2:8317/v1`）則只接 `/responses`；已以 `/responses` 結尾就原樣使用"),
             "model": ("image_model", "視覺模型名稱。沒有預設值——哪一個讀中文截圖最準還沒量過。"),
         }
         scope = self.config
@@ -2642,7 +2661,9 @@ class MessageWatch(commands.Cog):
             return
         await scope.set_raw(stored, value=value)
         await ctx.send(
-            f"`{key}` 設為 `{value}`。" if value else f"已清除 `{key}`。",
+            (f"`{key}` 設為 `{value}`。"
+             + (f"\n實際呼叫：`{responses_url(value)}`" if key == "api_base" else ""))
+            if value else f"已清除 `{key}`。",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
