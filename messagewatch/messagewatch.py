@@ -2661,7 +2661,9 @@ class MessageWatch(commands.Cog):
             return
         await scope.set_raw(stored, value=value)
         await ctx.send(
-            f"`{key}` 設為 `{value}`。" if value else f"已清除 `{key}`。",
+            (f"`{key}` 設為 `{value}`。"
+             + (f"\n實際呼叫：`{responses_url(value)}`" if key == "api_base" else ""))
+            if value else f"已清除 `{key}`。",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
