@@ -578,7 +578,7 @@ class TransactionTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_threads_share_rejections_never_send_or_suppress(self):
+    def test_threads_share_rejections_fall_back_to_provider_share_link(self):
         start = "https://threads.com/share/abc"
         cases = {
             "off-host": {
@@ -592,6 +592,9 @@ class TransactionTests(unittest.TestCase):
             },
             "port": {
                 start: _HTTPResponse(status=302, headers={"Location": "https://threads.com:443/@a/post/1"}),
+            },
+            "rate-limited": {
+                start: _HTTPResponse(status=429),
             },
             "invalid-terminal": {
                 start: _HTTPResponse(status=302, headers={"Location": "/not-a-thread"}),
@@ -617,8 +620,11 @@ class TransactionTests(unittest.TestCase):
             cog = _s3_cog(_TestConfig(), channel)
             cog._session = _HTTPSession(responses)
             await cog.on_message(source)
-            self.assertEqual(channel.sent, [])
-            self.assertEqual(source.edits, [])
+            self.assertEqual(
+                [message.embeds[0].url for message in channel.sent],
+                ["https://fixthreads.seria.moe/share/abc"],
+            )
+            self.assertEqual(source.edits, [{"suppress": True}])
             self.assertTrue(
                 all(kwargs == {"allow_redirects": False} for _url, kwargs in cog._session.calls)
             )
@@ -630,7 +636,7 @@ class TransactionTests(unittest.TestCase):
                 if name == "sixth-redirect":
                     self.assertEqual(call_count, 6)
 
-    def test_any_threads_share_resolution_failure_aborts_all_targets(self):
+    def test_failed_threads_share_falls_back_without_dropping_other_targets(self):
         async def scenario(failure):
             channel = _Channel()
             source = self._message(channel)
@@ -651,8 +657,15 @@ class TransactionTests(unittest.TestCase):
 
             cog._resolve_threads_share = resolve
             await cog.on_message(source)
-            self.assertEqual(channel.sent, [])
-            self.assertEqual(source.edits, [])
+            self.assertEqual(
+                [message.embeds[0].url for message in channel.sent],
+                [
+                    "https://fixthreads.seria.moe/@alice/post/1",
+                    "https://bskx.app/profile/alice/post/1",
+                    "https://fixthreads.seria.moe/share/b",
+                ],
+            )
+            self.assertEqual(source.edits, [{"suppress": True}])
 
         for name, failure in (("none", None), ("exception", RuntimeError("failed"))):
             with self.subTest(name=name):

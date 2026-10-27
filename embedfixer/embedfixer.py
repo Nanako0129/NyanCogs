@@ -2956,7 +2956,10 @@ class EmbedFixer(commands.Cog):
                         continue
                     canonical = resolutions[index]
                     if not isinstance(canonical, str):
-                        return False
+                        # Threads intermittently answers 429 to the bot host's IPv4;
+                        # FixThreads resolves /share/ paths itself (measured 2026-10-28).
+                        expanded_targets.append(target)
+                        continue
                     fixed_url = apply_fix(canonical, target.method, DomainId.THREADS)
                     if fixed_url is None:
                         return False
