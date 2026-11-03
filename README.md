@@ -11,6 +11,7 @@ Cogs for [Red Discord Bot](https://github.com/Cog-Creators/Red-DiscordBot).
 | [MessageWatch](#messagewatch) | Reports likely scams and hostile exchanges to a moderator channel |
 | [EmbedFixer](#embedfixer) | Replaces supported social links with provider-fixed links |
 | [SpotifyPlaylist](#spotifyplaylist) | Lets Audio play Spotify playlist links again |
+| [NetStat](#netstat) | Live connection metrics in Discord and a heartbeat for an external watchdog |
 
 Design notes for MessageWatch live in [`docs/`](docs/), in English and
 Traditional Chinese.
@@ -643,3 +644,42 @@ again.
 
 Audio must be loaded. When Audio is reloaded, the cog listens for it being
 added again and re-applies the wrapper to the freshly imported client.
+
+## NetStat
+
+NetStat shows the bot's connection health from the bot's side. `[p]netstat`
+posts an embed that refreshes every 5 seconds for 3 minutes (pass a number of
+seconds, 15–900, to change that):
+
+| Field | Source |
+|---|---|
+| Gateway | `bot.latency`, the discord.py heartbeat round trip |
+| Voice WS ping | `state.ping` of Lavalink's player updates; N/A when Lavalink does not send it |
+| Lavalink | node readiness and the number of players playing right now |
+| Frames | Lavalink `frameStats` sent / nulled / deficit; Lavalink only reports these while playing, once a minute |
+| UDP sent | the rate of `Udp: OutDatagrams` in `/proc/net/snmp`, next to the expected 50/s per playing player (Opus 20 ms frames) |
+
+The UDP rate counts every datagram the bot's network namespace sends, so it is
+only meaningful where the bot shares a namespace with Lavalink, as it does
+with the Lavalink that Red's Audio manages itself. Listener-side loss cannot be measured from
+the bot.
+
+With `[p]netstatset webhook <url>` set, the cog POSTs the same metrics as JSON
+every 60 seconds (`ts`, `gateway_ms`, `lavalink_ready`, `playing`,
+`voice_ping_ms`, `frames_sent`, `frames_nulled`, `frames_deficit`,
+`udp_out_per_s`; unknown values are `null`). `udp_out_per_s` averages the
+time since the previous beat (about 60 s) while `playing` is the count at send time, so a watchdog
+should only alert on a low rate that repeats over consecutive beats. A watchdog
+such as n8n can alert when the beats stop or the values go bad. The URL must be
+https, or plain http to a non-public IP address (LAN, loopback, tailnet). It is stored
+in Red's Config, and the bot deletes the command message carrying it, or says
+so when it cannot (always in DMs). Wrap the URL in `<>` so Discord does not
+fetch a link preview of it. `[p]netstatset webhook clear` stops
+the heartbeat. Both commands are owner-only.
+
+```text
+[p]cog install NyanCogs netstat
+[p]load netstat
+[p]netstat
+[p]netstatset webhook <https://n8n.example/webhook/<id>>
+```

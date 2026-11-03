@@ -1,0 +1,18 @@
+{
+    "name": "NetStat",
+    "author": [
+        "Nyanako"
+    ],
+    "short": "Live connection metrics and a watchdog heartbeat.",
+    "description": "`[p]netstat` shows gateway latency, the Lavalink voice WS ping and frame stats, and the UDP send rate in an embed that refreshes every 5 seconds. With a webhook set, the cog POSTs the same metrics every 60 seconds so an external watchdog (for example n8n) can alert when they go bad or stop arriving.",
+    "install_msg": "Load with `[p]load netstat`. Run `[p]netstat` while Audio plays; set a heartbeat target with `[p]netstatset webhook <url>`.",
+    "tags": [
+        "audio",
+        "monitoring",
+        "network"
+    ],
+    "min_bot_version": "3.5.24",
+    "min_python_version": [3, 11, 0],
+    "requirements": [],
+    "end_user_data_statement": "This cog stores no user data. It stores one owner-set webhook URL and sends bot-level metrics (latency, player counts, frame and UDP counters) to it."
+}
