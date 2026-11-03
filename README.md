@@ -673,12 +673,13 @@ should only alert on a low rate that repeats over consecutive beats. A watchdog
 such as n8n can alert when the beats stop or the values go bad. The URL must be
 https, or plain http to a non-public IP address (LAN, loopback, tailnet). It is stored
 in Red's Config, and the bot deletes the command message carrying it, or says
-so when it cannot (always in DMs). `[p]netstatset webhook clear` stops
+so when it cannot (always in DMs). Wrap the URL in `<>` so Discord does not
+fetch a link preview of it. `[p]netstatset webhook clear` stops
 the heartbeat. Both commands are owner-only.
 
 ```text
 [p]cog install NyanCogs netstat
 [p]load netstat
 [p]netstat
-[p]netstatset webhook https://n8n.example/webhook/<id>
+[p]netstatset webhook <https://n8n.example/webhook/<id>>
 ```

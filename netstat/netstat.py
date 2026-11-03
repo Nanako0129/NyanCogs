@@ -183,6 +183,17 @@ class NetStat(commands.Cog):
     def _snapshot(self) -> dict[str, Any]:
         return snapshot(self.bot.latency, self._pings, time.monotonic())
 
+    async def _beat(self, url: str, body: str) -> None:
+        async with self._session.post(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,  # a redirect would turn the POST into a bodiless GET
+        ) as resp:
+            if resp.status >= 300:
+                log.warning("Heartbeat rejected with HTTP %s", resp.status)
+
     async def _heartbeat(self) -> None:
         # Before ready, gateway and Lavalink read as down: a beat then would be a false alarm.
         await self.bot.wait_until_red_ready()
@@ -190,19 +201,12 @@ class NetStat(commands.Cog):
         while True:
             try:
                 url = await self.config.webhook()
-                cur = await udp_sample() if url else None
-                rate, prev = udp_rate(prev, cur), cur
                 if url:
-                    body = heartbeat_body(self._snapshot(), rate, int(time.time()))
-                    async with self._session.post(
-                        url,
-                        data=body,
-                        headers={"Content-Type": "application/json"},
-                        timeout=aiohttp.ClientTimeout(total=10),
-                        allow_redirects=False,  # a redirect would turn the POST into a bodiless GET
-                    ) as resp:
-                        if resp.status >= 300:
-                            log.warning("Heartbeat rejected with HTTP %s", resp.status)
+                    cur = await udp_sample()
+                    rate, prev = udp_rate(prev, cur), cur
+                    await self._beat(url, heartbeat_body(self._snapshot(), rate, int(time.time())))
+                else:
+                    prev = None  # the rate baseline restarts when the heartbeat is turned back on
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 # The exception text can carry the webhook URL, so only its type is logged.
                 log.warning("Heartbeat failed: %s", type(exc).__name__)
@@ -225,12 +229,16 @@ class NetStat(commands.Cog):
                 await message.edit(
                     embed=build_embed(self._snapshot(), udp_rate(prev, cur), end - time.monotonic())
                 )
-            except discord.HTTPException:  # deleted message, lost permission, Discord outage
+            except (discord.NotFound, discord.Forbidden):  # message deleted or permission lost
                 return
+            except discord.HTTPException:  # transient Discord error: skip this tick
+                continue
             prev = cur
         if self._closed:  # unloaded mid-run: don't leave a countdown that never finishes
+            embed = build_embed(self._snapshot(), None, 0)
+            embed.set_footer(text="Stopped: cog unloaded")
             with contextlib.suppress(discord.HTTPException):
-                await message.edit(embed=build_embed(self._snapshot(), None, 0))
+                await message.edit(embed=embed)
 
     @commands.is_owner()
     @commands.group()
@@ -239,7 +247,11 @@ class NetStat(commands.Cog):
 
     @netstatset.command(name="webhook")
     async def netstatset_webhook(self, ctx: commands.Context, url: str) -> None:
-        """POST a heartbeat to `url` every 60 s; `clear` stops it. Use the n8n production `/webhook/` URL."""
+        """POST a heartbeat to `url` every 60 s; `clear` stops it.
+
+        Use the n8n production `/webhook/` URL, wrapped in `<>` so Discord doesn't fetch a preview of it.
+        """
+        url = url.strip("<>")
         if url.lower() == "clear":
             await self.config.webhook.set(None)
             await ctx.send("Heartbeat stopped.")

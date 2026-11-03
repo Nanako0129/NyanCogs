@@ -465,11 +465,11 @@ NetStat 從 bot 這一端顯示連線狀況。`[p]netstat` 會發一則 embed，
 
 UDP 速率算的是 bot 所在網路命名空間送出的所有 datagram，所以只有 bot 與 Lavalink 共用命名空間時才有意義，例如由 Red Audio 自行管理的 Lavalink。收聽端的掉包從 bot 這端量不到。
 
-設定 `[p]netstatset webhook <url>` 後，cog 每 60 秒把同一組指標以 JSON POST 出去（`ts`、`gateway_ms`、`lavalink_ready`、`playing`、`voice_ping_ms`、`frames_sent`、`frames_nulled`、`frames_deficit`、`udp_out_per_s`；未知值為 `null`），讓 n8n 之類的監看服務在心跳中斷或數值異常時告警。`udp_out_per_s` 是距上一拍（約 60 秒）的平均，`playing` 卻是送出當下的數量，所以速率偏低要連續幾次心跳都成立才該告警。網址必須是 https，或指向非公網 IP（LAN、loopback、tailnet）的 http。網址存在 Red 的 Config，bot 會刪掉帶網址的指令訊息，刪不掉時會明講（DM 一定刪不掉）。`[p]netstatset webhook clear` 停止心跳。兩個指令都限 bot owner。
+設定 `[p]netstatset webhook <url>` 後，cog 每 60 秒把同一組指標以 JSON POST 出去（`ts`、`gateway_ms`、`lavalink_ready`、`playing`、`voice_ping_ms`、`frames_sent`、`frames_nulled`、`frames_deficit`、`udp_out_per_s`；未知值為 `null`），讓 n8n 之類的監看服務在心跳中斷或數值異常時告警。`udp_out_per_s` 是距上一拍（約 60 秒）的平均，`playing` 卻是送出當下的數量，所以速率偏低要連續幾次心跳都成立才該告警。網址必須是 https，或指向非公網 IP（LAN、loopback、tailnet）的 http。網址存在 Red 的 Config，bot 會刪掉帶網址的指令訊息，刪不掉時會明講（DM 一定刪不掉）。網址請用 `<>` 包起來，Discord 才不會抓連結預覽。`[p]netstatset webhook clear` 停止心跳。兩個指令都限 bot owner。
 
 ```text
 [p]cog install NyanCogs netstat
 [p]load netstat
 [p]netstat
-[p]netstatset webhook https://n8n.example/webhook/<id>
+[p]netstatset webhook <https://n8n.example/webhook/<id>>
 ```

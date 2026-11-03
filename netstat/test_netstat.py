@@ -157,7 +157,37 @@ class CogLifecycleTest(unittest.IsolatedAsyncioTestCase):
         a, b = lavalink_state([], [])
         with a, b, patch.object(ns.asyncio, "sleep", unload_during_sleep):
             await cog.netstat.callback(cog, ctx, 900)
-        self.assertEqual(message.edit.await_args.kwargs["embed"].footer.text, "Finished")
+        self.assertEqual(message.edit.await_args.kwargs["embed"].footer.text, "Stopped: cog unloaded")
+
+    async def test_netstat_skips_a_transient_edit_error(self):
+        cog = self.make_cog(latency=0.01)
+        outage = ns.discord.HTTPException(MagicMock(status=503), "unavailable")
+        edits = []
+
+        async def edit(**kwargs):
+            edits.append(kwargs)
+            if len(edits) == 1:
+                raise outage
+
+        message = SimpleNamespace(edit=edit)
+        ctx = SimpleNamespace(send=AsyncMock(return_value=message))
+        sleeps = 0
+
+        async def sleep(_):
+            nonlocal sleeps
+            sleeps += 1
+            cog._closed = sleeps >= 3  # three ticks, then stop
+
+        a, b = lavalink_state([], [])
+        with a, b, patch.object(ns.asyncio, "sleep", sleep):
+            await cog.netstat.callback(cog, ctx, 900)
+        self.assertEqual(len(edits), 4)  # the 503 tick, two more ticks, then the unload edit
+
+    async def test_angle_brackets_are_stripped(self):
+        cog = self.make_cog()
+        ctx = self.make_ctx()
+        await cog.netstatset_webhook.callback(cog, ctx, "<https://n8n.example/webhook/secret>")
+        cog.config.webhook.set.assert_awaited_once_with("https://n8n.example/webhook/secret")
 
     async def test_load_registers_listener_and_unload_stops_everything(self):
         cog = self.make_cog()
