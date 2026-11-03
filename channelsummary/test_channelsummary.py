@@ -691,8 +691,9 @@ class TestNetworkBoundary(unittest.IsolatedAsyncioTestCase):
             ("nan", 0, 2.0),
             ("not a date", 0, 2.0),
             ("", 0, 2.0),
-            # RFC 9110 allows an HTTP-date; a distant one is past the cap.
-            ("Wed, 21 Oct 2026 07:28:00 GMT", 0, None),
+            # RFC 9110 allows an HTTP-date; a distant one is past the cap. Computed, not
+            # written out: a fixed date (it was 21 Oct 2026) turns into a past one and passes 0.0.
+            (format_datetime(datetime.now(UTC) + timedelta(days=365), usegmt=True), 0, None),
             ("Mon, 01 Jan 2001 00:00:00 GMT", 0, 0.0),
         ):
             with self.subTest(header=header):
