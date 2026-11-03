@@ -667,9 +667,13 @@ the bot.
 With `[p]netstatset webhook <url>` set, the cog POSTs the same metrics as JSON
 every 60 seconds (`ts`, `gateway_ms`, `lavalink_ready`, `playing`,
 `voice_ping_ms`, `frames_sent`, `frames_nulled`, `frames_deficit`,
-`udp_out_per_s`; unknown values are `null`). A watchdog such as n8n can alert
-when the beats stop or the values go bad. The URL is stored in Red's Config and
-the command message carrying it is deleted. `[p]netstatset webhook clear` stops
+`udp_out_per_s`; unknown values are `null`). `udp_out_per_s` averages the
+whole 60 s window while `playing` is the count at send time, so a watchdog
+should only alert on a low rate that repeats over consecutive beats. A watchdog
+such as n8n can alert when the beats stop or the values go bad. The URL must be
+https, or plain http to a private, loopback or tailnet IP address. It is stored
+in Red's Config, and the bot deletes the command message carrying it (or says
+so when it cannot). `[p]netstatset webhook clear` stops
 the heartbeat. Both commands are owner-only.
 
 ```text

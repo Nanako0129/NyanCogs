@@ -62,7 +62,7 @@ class SnapshotTest(unittest.TestCase):
     def test_unknown_values_become_none_and_json_stays_valid(self):
         a, b = lavalink_state([node(sent=-1, nulled=-1, deficit=-1)], [player(1)])
         with a, b:
-            snap = ns.snapshot(float("inf"), {})
+            snap = ns.snapshot(float("inf"), {}, 0.0)
         self.assertIsNone(snap["gateway_ms"])
         self.assertIsNone(snap["frames_sent"])
         self.assertIsNone(snap["voice_ping_ms"])
@@ -72,7 +72,7 @@ class SnapshotTest(unittest.TestCase):
     def test_nan_latency_is_none(self):
         a, b = lavalink_state([], [])
         with a, b:
-            snap = ns.snapshot(float("nan"), {})
+            snap = ns.snapshot(float("nan"), {}, 0.0)
         self.assertEqual(snap, {
             "gateway_ms": None, "lavalink_ready": False, "playing": 0, "voice_ping_ms": None,
             "frames_sent": None, "frames_nulled": None, "frames_deficit": None,
@@ -81,16 +81,33 @@ class SnapshotTest(unittest.TestCase):
     def test_live_players_count_and_worst_ping(self):
         a, b = lavalink_state([node()], [player(1), player(2)])
         with a, b:
-            snap = ns.snapshot(0.0423, {1: 20, 2: 35, 3: 900})  # guild 3 stopped playing
+            snap = ns.snapshot(0.0423, {1: (20, 98.0), 2: (35, 99.0), 3: (900, 99.0)}, 100.0)  # guild 3 not playing
         self.assertEqual(snap["gateway_ms"], 42)
         self.assertEqual(snap["playing"], 2)
         self.assertEqual(snap["voice_ping_ms"], 35)
         self.assertEqual(snap["frames_sent"], 3000)
 
+    def test_stale_ping_and_disconnected_node_stats_are_ignored(self):
+        a, b = lavalink_state([node(ready=False, sent=3000), node(sent=2900)], [player(1)])
+        with a, b:
+            snap = ns.snapshot(0.01, {1: (900, 0.0)}, 16.0)  # ping from a past session
+        self.assertIsNone(snap["voice_ping_ms"])
+        self.assertEqual(snap["frames_sent"], 2900)  # the ready node, not the dead one's last stats
+        self.assertTrue(snap["lavalink_ready"])
+
+    def test_webhook_scheme_rules(self):
+        self.assertTrue(ns.webhook_allowed("https://n8n.example/webhook/x"))
+        self.assertTrue(ns.webhook_allowed("http://100.68.132.79:5678/webhook/x"))  # tailnet
+        self.assertTrue(ns.webhook_allowed("http://192.168.1.2/webhook/x"))
+        self.assertFalse(ns.webhook_allowed("http://n8n.example/webhook/x"))  # hostname over plain http
+        self.assertFalse(ns.webhook_allowed("http://8.8.8.8/webhook/x"))
+        self.assertFalse(ns.webhook_allowed("n8n.example/webhook/x"))
+        self.assertFalse(ns.webhook_allowed("https:///nohost"))
+
     def test_embed_shows_expected_rate_and_finish(self):
         a, b = lavalink_state([node()], [player(1)])
         with a, b:
-            snap = ns.snapshot(0.01, {})
+            snap = ns.snapshot(0.01, {}, 0.0)
         live = ns.build_embed(snap, 49.96, 120.4)
         fields = {f.name: f.value for f in live.fields}
         self.assertEqual(fields["UDP sent"], "50.0/s (expect 50/s)")
@@ -108,17 +125,28 @@ class CogLifecycleTest(unittest.IsolatedAsyncioTestCase):
         return cog
 
     async def test_load_registers_listener_and_unload_stops_everything(self):
-        cog = self.make_cog(webhook=None)
-        with patch.object(ns.asyncio, "sleep", AsyncMock(side_effect=asyncio.CancelledError)):
+        cog = self.make_cog()
+        response = MagicMock(status=200)
+        post = MagicMock()
+        post.return_value.__aenter__ = AsyncMock(return_value=response)
+        post.return_value.__aexit__ = AsyncMock(return_value=False)
+        a, b = lavalink_state([], [])
+        with a, b, patch.object(ns, "HEARTBEAT_EVERY", 0.01):
             await cog.cog_load()
+            session = cog._session
+            cog._session = SimpleNamespace(post=post, close=session.close)
             self.assertIn(cog._on_player_update, lavalink.lavalink._update_listeners)
             await cog._on_player_update(player(7), None, {"state": {"ping": 12}})
-            self.assertEqual(cog._pings, {7: 12})
+            self.assertEqual(cog._pings[7][0], 12)
+            await asyncio.sleep(0.05)
+            self.assertGreater(post.call_count, 1)  # the loop really beats
             await cog.cog_unload()
+            beats = post.call_count
+            await asyncio.sleep(0.05)
+        self.assertEqual(post.call_count, beats)  # and stops on unload
         self.assertNotIn(cog._on_player_update, lavalink.lavalink._update_listeners)
-        self.assertTrue(cog._session.closed)
-        with self.assertRaises(asyncio.CancelledError):
-            await cog._task
+        self.assertTrue(session.closed)
+        self.assertTrue(cog._task.cancelled())
 
     async def test_heartbeat_posts_valid_json_while_gateway_is_down(self):
         cog = self.make_cog()

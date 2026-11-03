@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
 import time
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 import discord
@@ -21,8 +23,10 @@ log = logging.getLogger("red.nyancogs.netstat")
 SNMP = Path("/proc/net/snmp")
 # One edit every 5 s keeps a live embed readable and far below Discord's edit rate limit.
 EDIT_EVERY = 5
-# The n8n watchdog alerts after 180 s without a beat, so three beats can be lost first.
+# Paired with the n8n watchdog's 180 s silence rule: one lost beat leaves a 120 s gap and never alerts.
 HEARTBEAT_EVERY = 60
+# Lavalink sends a playerUpdate every 5 s by default; an older ping belongs to a past session.
+PING_MAX_AGE = 15
 # Opus sends 20 ms frames, so one playing player emits 50 UDP datagrams/s
 # (measured on the Oracle host 2026-11-03: 200 of 200 100 ms windows held 5).
 OPUS_PER_SECOND = 50
@@ -76,12 +80,29 @@ def _frames(value: Any) -> Optional[int]:
     return value if isinstance(value, int) and value >= 0 else None
 
 
-def snapshot(latency: float, pings: dict[int, Optional[int]]) -> dict[str, Any]:
+def webhook_allowed(url: str) -> bool:
+    """https anywhere; plain http only to a non-public IP literal (LAN, loopback, tailnet)."""
+    parts = urlsplit(url)
+    if parts.scheme == "https" and parts.hostname:
+        return True
+    if parts.scheme != "http":
+        return False
+    try:
+        return not ipaddress.ip_address(parts.hostname or "").is_global
+    except ValueError:
+        return False
+
+
+def snapshot(
+    latency: float, pings: dict[int, tuple[Optional[int], float]], now: float
+) -> dict[str, Any]:
     """Current metrics; every unknown value is None so the JSON stays valid (no NaN/Infinity)."""
     nodes = lavalink.get_all_nodes()
-    stats = next((n.stats for n in nodes if n.stats is not None), None)
+    # Red-Lavalink never clears Node.stats on disconnect, so only a ready node's stats are current.
+    stats = next((n.stats for n in nodes if n.ready and n.stats is not None), None)
     players = lavalink.active_players()
-    voice = [p for p in (pings.get(pl.guild.id) for pl in players) if p is not None]
+    seen = [pings.get(pl.guild.id) for pl in players]
+    voice = [p for p, t in filter(None, seen) if p is not None and now - t <= PING_MAX_AGE]
     return {
         "gateway_ms": _ms(latency),
         "lavalink_ready": any(n.ready for n in nodes),
@@ -133,9 +154,10 @@ class NetStat(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=0x4E45_5453_0129, force_registration=True)
         self.config.register_global(webhook=None)
-        self._pings: dict[int, Optional[int]] = {}
+        self._pings: dict[int, tuple[Optional[int], float]] = {}  # guild -> (ping, monotonic)
         self._session: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
+        self._closed = False  # ends running [p]netstat loops on unload
 
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
         """Nothing to delete: this cog stores no per-user data."""
@@ -147,6 +169,7 @@ class NetStat(commands.Cog):
         self._task = asyncio.create_task(self._heartbeat())
 
     async def cog_unload(self) -> None:
+        self._closed = True
         lavalink.unregister_update_listener(self._on_player_update)
         if self._task:
             self._task.cancel()
@@ -154,17 +177,17 @@ class NetStat(commands.Cog):
             await self._session.close()
 
     async def _on_player_update(self, player: lavalink.Player, _position: Any, raw: dict) -> None:
-        self._pings[player.guild.id] = ping_from(raw)
+        self._pings[player.guild.id] = (ping_from(raw), time.monotonic())
 
     def _snapshot(self) -> dict[str, Any]:
-        return snapshot(self.bot.latency, self._pings)
+        return snapshot(self.bot.latency, self._pings, time.monotonic())
 
     async def _heartbeat(self) -> None:
         prev: Sample = None
         while True:
             try:
-                cur = await udp_sample()
                 url = await self.config.webhook()
+                cur = await udp_sample() if url else None
                 if url:
                     body = heartbeat_body(self._snapshot(), udp_rate(prev, cur), int(time.time()))
                     async with self._session.post(
@@ -172,6 +195,7 @@ class NetStat(commands.Cog):
                         data=body,
                         headers={"Content-Type": "application/json"},
                         timeout=aiohttp.ClientTimeout(total=10),
+                        allow_redirects=False,  # a redirect would turn the POST into a bodiless GET
                     ) as resp:
                         if resp.status >= 300:
                             log.warning("Heartbeat rejected with HTTP %s", resp.status)
@@ -191,7 +215,7 @@ class NetStat(commands.Cog):
         end = time.monotonic() + seconds
         prev = await udp_sample()
         message = await ctx.send(embed=build_embed(self._snapshot(), None, seconds))
-        while (left := end - time.monotonic()) > 0:
+        while not self._closed and (left := end - time.monotonic()) > 0:
             await asyncio.sleep(min(EDIT_EVERY, left))
             cur = await udp_sample()
             try:
@@ -214,12 +238,15 @@ class NetStat(commands.Cog):
             await self.config.webhook.set(None)
             await ctx.send("Heartbeat stopped.")
             return
-        if not url.startswith(("https://", "http://")):
-            await ctx.send("The webhook must be an http(s) URL.")
+        # The URL is the watchdog's only credential: take it off the channel before anything else.
+        note = ""
+        if ctx.guild is not None:
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                note = " I could not delete your message: delete it yourself, the URL is a secret."
+        if not webhook_allowed(url):
+            await ctx.send("Use an https URL, or http only to a private, loopback or tailnet IP." + note)
             return
         await self.config.webhook.set(url)
-        try:
-            await ctx.message.delete()  # the URL is the only credential the watchdog has
-        except discord.HTTPException:
-            pass
-        await ctx.send(f"Heartbeat set; first beat within {HEARTBEAT_EVERY} s.")
+        await ctx.send(f"Heartbeat set; first beat within {HEARTBEAT_EVERY} s." + note)
