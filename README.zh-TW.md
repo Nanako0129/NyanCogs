@@ -11,6 +11,7 @@
 | [MessageWatch](#messagewatch) | 監控並向管理頻道通報疑似詐騙與敵意衝突的對話 |
 | [EmbedFixer](#embedfixer) | 將支援的社群平台連結替換為第三方修復後的預覽連結 |
 | [SpotifyPlaylist](#spotifyplaylist) | 讓 Audio 重新能播 Spotify 歌單連結 |
+| [NetStat](#netstat) | 在 Discord 即時顯示連線指標，並送心跳給外部監看服務 |
 
 MessageWatch 的架構設計筆記收錄於 [`docs/`](docs/)，提供英文與繁體中文版本。
 
@@ -449,3 +450,26 @@ YouTube、排入佇列與快取仍由 Audio 自己處理。這個 cog 不儲存�
 ```
 
 需要先載入 Audio。Audio 重新載入時，這個 cog 會在 Audio 重新加入後，對新匯入的用戶端再套用一次。
+
+## NetStat
+
+NetStat 從 bot 這一端顯示連線狀況。`[p]netstat` 會發一則 embed，每 5 秒更新、持續 3 分鐘（可帶 15–900 的秒數調整）：
+
+| 欄位 | 來源 |
+|---|---|
+| Gateway | `bot.latency`，discord.py heartbeat 往返時間 |
+| Voice WS ping | Lavalink player update 的 `state.ping`；Lavalink 沒送時顯示 N/A |
+| Lavalink | 節點是否就緒，以及此刻正在播放的 player 數 |
+| Frames | Lavalink `frameStats` 的 sent／nulled／deficit；只在播放中回報，每分鐘一次 |
+| UDP sent | `/proc/net/snmp` 中 `Udp: OutDatagrams` 的速率，旁邊列出預期值：每個播放中的 player 50/s（Opus 20 ms frame） |
+
+UDP 速率算的是 bot 所在網路命名空間送出的所有 datagram，所以只有 bot 與 Lavalink 共用命名空間時才有意義，例如由 Red Audio 自行管理的 Lavalink。收聽端的掉包從 bot 這端量不到。
+
+設定 `[p]netstatset webhook <url>` 後，cog 每 60 秒把同一組指標以 JSON POST 出去（`ts`、`gateway_ms`、`lavalink_ready`、`playing`、`voice_ping_ms`、`frames_sent`、`frames_nulled`、`frames_deficit`、`udp_out_per_s`；未知值為 `null`），讓 n8n 之類的監看服務在心跳中斷或數值異常時告警。網址存在 Red 的 Config，帶網址的指令訊息會被刪除。`[p]netstatset webhook clear` 停止心跳。兩個指令都限 bot owner。
+
+```text
+[p]cog install NyanCogs netstat
+[p]load netstat
+[p]netstat
+[p]netstatset webhook https://n8n.example/webhook/<id>
+```
