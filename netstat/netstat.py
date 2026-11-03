@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import json
 import logging
@@ -23,7 +24,8 @@ log = logging.getLogger("red.nyancogs.netstat")
 SNMP = Path("/proc/net/snmp")
 # One edit every 5 s keeps a live embed readable and far below Discord's edit rate limit.
 EDIT_EVERY = 5
-# Paired with the n8n watchdog's 180 s silence rule: one lost beat leaves a 120 s gap and never alerts.
+# Paired with the n8n watchdog's 180 s silence rule: one lost beat leaves a gap of 120 s plus at
+# most two 10 s POST timeouts, so it never alerts.
 HEARTBEAT_EVERY = 60
 # Lavalink sends a playerUpdate every 5 s by default; an older ping belongs to a past session.
 PING_MAX_AGE = 15
@@ -82,13 +84,12 @@ def _frames(value: Any) -> Optional[int]:
 
 def webhook_allowed(url: str) -> bool:
     """https anywhere; plain http only to a non-public IP literal (LAN, loopback, tailnet)."""
-    parts = urlsplit(url)
-    if parts.scheme == "https" and parts.hostname:
-        return True
-    if parts.scheme != "http":
-        return False
     try:
-        return not ipaddress.ip_address(parts.hostname or "").is_global
+        parts = urlsplit(url)
+        parts.port  # raises ValueError when out of range
+        if parts.scheme == "https" and parts.hostname:
+            return True
+        return parts.scheme == "http" and not ipaddress.ip_address(parts.hostname or "").is_global
     except ValueError:
         return False
 
@@ -183,13 +184,16 @@ class NetStat(commands.Cog):
         return snapshot(self.bot.latency, self._pings, time.monotonic())
 
     async def _heartbeat(self) -> None:
+        # Before ready, gateway and Lavalink read as down: a beat then would be a false alarm.
+        await self.bot.wait_until_red_ready()
         prev: Sample = None
         while True:
             try:
                 url = await self.config.webhook()
                 cur = await udp_sample() if url else None
+                rate, prev = udp_rate(prev, cur), cur
                 if url:
-                    body = heartbeat_body(self._snapshot(), udp_rate(prev, cur), int(time.time()))
+                    body = heartbeat_body(self._snapshot(), rate, int(time.time()))
                     async with self._session.post(
                         url,
                         data=body,
@@ -199,7 +203,6 @@ class NetStat(commands.Cog):
                     ) as resp:
                         if resp.status >= 300:
                             log.warning("Heartbeat rejected with HTTP %s", resp.status)
-                prev = cur
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 # The exception text can carry the webhook URL, so only its type is logged.
                 log.warning("Heartbeat failed: %s", type(exc).__name__)
@@ -222,9 +225,12 @@ class NetStat(commands.Cog):
                 await message.edit(
                     embed=build_embed(self._snapshot(), udp_rate(prev, cur), end - time.monotonic())
                 )
-            except discord.NotFound:
+            except discord.HTTPException:  # deleted message, lost permission, Discord outage
                 return
             prev = cur
+        if self._closed:  # unloaded mid-run: don't leave a countdown that never finishes
+            with contextlib.suppress(discord.HTTPException):
+                await message.edit(embed=build_embed(self._snapshot(), None, 0))
 
     @commands.is_owner()
     @commands.group()
@@ -240,11 +246,10 @@ class NetStat(commands.Cog):
             return
         # The URL is the watchdog's only credential: take it off the channel before anything else.
         note = ""
-        if ctx.guild is not None:
-            try:
-                await ctx.message.delete()
-            except discord.HTTPException:
-                note = " I could not delete your message: delete it yourself, the URL is a secret."
+        try:
+            await ctx.message.delete()  # also fails in DMs, where a bot can't delete your messages
+        except discord.HTTPException:
+            note = " I could not delete your message: delete it yourself, the URL is a secret."
         if not webhook_allowed(url):
             await ctx.send("Use an https URL, or http only to a private, loopback or tailnet IP." + note)
             return

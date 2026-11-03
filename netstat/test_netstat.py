@@ -103,6 +103,8 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(ns.webhook_allowed("http://8.8.8.8/webhook/x"))
         self.assertFalse(ns.webhook_allowed("n8n.example/webhook/x"))
         self.assertFalse(ns.webhook_allowed("https:///nohost"))
+        self.assertFalse(ns.webhook_allowed("http://[::1/webhook/x"))  # urlsplit ValueError
+        self.assertFalse(ns.webhook_allowed("https://n8n.example:99999/x"))  # port out of range
 
     def test_embed_shows_expected_rate_and_finish(self):
         a, b = lavalink_state([node()], [player(1)])
@@ -117,12 +119,45 @@ class SnapshotTest(unittest.TestCase):
 
 
 class CogLifecycleTest(unittest.IsolatedAsyncioTestCase):
-    def make_cog(self, latency=float("inf"), webhook="http://n8n.test/webhook/x"):
+    def make_cog(self, latency=float("inf"), webhook="https://n8n.test/webhook/x"):
         with patch.object(ns, "Config") as config:
-            cog = ns.NetStat(SimpleNamespace(latency=latency))
+            cog = ns.NetStat(SimpleNamespace(latency=latency, wait_until_red_ready=AsyncMock()))
         cog.config = config.get_conf.return_value
         cog.config.webhook = AsyncMock(return_value=webhook)
+        cog.config.webhook.set = AsyncMock()
         return cog
+
+    def make_ctx(self, delete_error=None):
+        message = SimpleNamespace(delete=AsyncMock(side_effect=delete_error))
+        return SimpleNamespace(message=message, send=AsyncMock())
+
+    async def test_webhook_message_is_deleted_before_validation(self):
+        cog = self.make_cog()
+        ctx = self.make_ctx()
+        await cog.netstatset_webhook.callback(cog, ctx, "http://n8n.example/webhook/secret")
+        ctx.message.delete.assert_awaited_once()  # refused URL still leaves the channel
+        cog.config.webhook.set.assert_not_awaited()
+        self.assertIn("Use an https URL", ctx.send.call_args.args[0])
+
+    async def test_failed_delete_is_reported(self):
+        cog = self.make_cog()
+        ctx = self.make_ctx(delete_error=ns.discord.Forbidden(MagicMock(status=403), "no perms"))
+        await cog.netstatset_webhook.callback(cog, ctx, "https://n8n.example/webhook/secret")
+        cog.config.webhook.set.assert_awaited_once_with("https://n8n.example/webhook/secret")
+        self.assertIn("delete it yourself", ctx.send.call_args.args[0])
+
+    async def test_netstat_stops_and_finishes_on_unload(self):
+        cog = self.make_cog(latency=0.01)
+        message = SimpleNamespace(edit=AsyncMock())
+        ctx = SimpleNamespace(send=AsyncMock(return_value=message))
+
+        async def unload_during_sleep(_):
+            cog._closed = True
+
+        a, b = lavalink_state([], [])
+        with a, b, patch.object(ns.asyncio, "sleep", unload_during_sleep):
+            await cog.netstat.callback(cog, ctx, 900)
+        self.assertEqual(message.edit.await_args.kwargs["embed"].footer.text, "Finished")
 
     async def test_load_registers_listener_and_unload_stops_everything(self):
         cog = self.make_cog()
@@ -161,7 +196,9 @@ class CogLifecycleTest(unittest.IsolatedAsyncioTestCase):
                 await cog._heartbeat()
         url = post.call_args.args[0]
         body = json.loads(post.call_args.kwargs["data"])
-        self.assertEqual(url, "http://n8n.test/webhook/x")
+        self.assertEqual(url, "https://n8n.test/webhook/x")
+        self.assertIs(post.call_args.kwargs["allow_redirects"], False)
+        cog.bot.wait_until_red_ready.assert_awaited_once()
         self.assertIsNone(body["gateway_ms"])
         self.assertIsNone(body["udp_out_per_s"])  # first beat has no previous sample
         self.assertEqual(body["playing"], 1)
